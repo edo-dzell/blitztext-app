@@ -50,6 +50,12 @@ Cloud-Aufrufe laufen ausschließlich über **deinen eigenen API-Key** direkt zum
 kein eigenes Backend, keine Konten, keine Telemetrie. Schlüssel liegen lokal verschlüsselt
 (Windows DPAPI via Electron `safeStorage`), nie im Klartext.
 
+Beim Einfügen achtet Blitztext auf den Fokus: Wechselst du während der Verarbeitung das Fenster,
+wird der Text **nicht** blind irgendwohin getippt, sondern landet mit einem Hinweis in der
+Zwischenablage. Diktate werden zudem vom Windows-Zwischenablageverlauf ausgenommen, und schlägt ein
+Lauf am Netz oder Anbieter fehl, lässt er sich mit einem Klick erneut verarbeiten — ohne neu zu
+diktieren (das Audio bleibt dafür nur flüchtig im Arbeitsspeicher, nie auf der Platte).
+
 ## 🆚 Stark erweitert: Windows-Port vs. macOS-Original
 
 Das Original beschreibt sich selbst als „intentionally small and unfinished“. Dieser Port baut die
@@ -62,13 +68,16 @@ Idee zur Alltags-App aus:
 | **Lokale Transkription** | ✅ Keylose lokale Endpunkte (z. B. whisper.cpp, Speaches) — ganz ohne Cloud | WhisperKit/CoreML (Modell manuell installieren) |
 | **API-Key-Verwaltung** | ✅ Ein Key **pro Anbieter**, verschlüsselt per Windows DPAPI | Eigener OpenAI-Key |
 | **Workflows** | ✅ Die vier Klassiker **plus eigene Workflows** mit eigenen Prompts (z. B. Übersetzen DE → EN) | 4 feste Workflows |
-| **Sprachen** | ✅ Eingabe- und Ausgabesprache pro Workflow — auf Deutsch diktieren, z. B. auf Englisch einfügen | — |
+| **Sprachen** | ✅ Eingabe- und Ausgabesprache pro Workflow aus 23 Sprachen — auf Deutsch diktieren, z. B. auf Englisch einfügen | — |
 | **Ton & Emojis** | ✅ Pro Workflow regelbar: Ton (formal/neutral/locker) und Emoji-Dichte (aus–viel) | — |
 | **Prompt-Editor** | ✅ Prompts anpassen, mit Versions-Historie und Wiederherstellen | — |
-| **Verlauf** | ✅ Alle Diktate mit Kosten, Datum, Sortierung und Löschen | — |
+| **Verlauf** | ✅ Alle Diktate mit Kosten, Datum, Sortierung und Löschen — inkl. Prompt-Stand je Eintrag | — |
 | **Statistik** | ✅ Token-Summen und Kosten, mit editierbarer Preistabelle | — |
 | **Design** | ✅ Hell/Dunkel (nach System oder manuell), Tray-Icon folgt dem Theme | — |
-| **Diktier-UX** | ✅ Fokusfreie Status-Pille, Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar | Menubar-Icon |
+| **Diktier-UX** | ✅ Fokusfreie Status-Pille, Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar, Mikrofon wählbar | Menubar-Icon |
+| **Sicheres Einfügen** | ✅ Prüft vor dem Einfügen, ob noch dasselbe Fenster im Fokus ist — bei Fokuswechsel wird **nicht** blind getippt, sondern der Text landet in der Zwischenablage mit Hinweis. Steuerzeichen werden gefiltert; Diktate bleiben aus dem Windows-Zwischenablageverlauf | — |
+| **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte) | — |
+| **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis (kein Auto-Update, keine Telemetrie) | — |
 | **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* statt es umzuschreiben, und legt dann den Rohtext in die Zwischenablage statt falschen Text einzufügen), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 714 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
 
 <sup>Vergleich auf Basis des öffentlichen README des Originals (Stand Juni 2026).</sup>
@@ -92,28 +101,23 @@ Fertige, portable Windows-`.exe` — kein Installer, kein Admin nötig:
 
 ➡️ **[Neuestes Release herunterladen](https://github.com/edo-dzell/blitztext-app-windows/releases/latest)** → unter „Assets“ die `.exe`.
 
-> **Hinweis:** Die bisherigen Builds sind unsigniert — Signierung über die
-> [SignPath Foundation](https://signpath.org/) ist beantragt (siehe
+> **Hinweis:** Die Releases sind derzeit **unsigniert** (siehe
 > [Code-Signing](#-code-signing--datenschutz)). Beim ersten Start zeigt Windows SmartScreen ggf.
 > „Unbekannter Herausgeber“ → „Weitere Informationen“ → „Trotzdem ausführen“. Jedes Release enthält
 > `SHA256SUMS.txt` und eine GitHub-Build-Provenance zum Verifizieren.
 
 ## 🔏 Code-Signing & Datenschutz
 
-Dieses Projekt nutzt die SignPath Foundation für das Signieren seiner Windows-Releases:
+Die Releases sind aktuell **nicht code-signiert**. Windows zeigt beim ersten Start daher eine
+SmartScreen-Warnung („Unbekannter Herausgeber“); das ist zu erwarten und kein Fehler. Eine
+kostenlose Signierung für Open-Source-Projekte wird noch geprüft — bis dahin bleibt die Herkunft
+jedes Builds über die beiden folgenden Wege überprüfbar:
 
-> Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
-> [SignPath Foundation](https://signpath.org/).
-
-**Code-Signing-Richtlinie:**
-
-- Signiert werden ausschließlich die offiziellen Release-Artefakte (portable `.exe`), die
-  GitHub Actions auf GitHub-gehosteten Runnern aus diesem Repository baut
-  ([release.yml](.github/workflows/release.yml)) — keine manuell gebauten Binaries.
-- Jeder Signing-Request wird vom Maintainer ([@edo-dzell](https://github.com/edo-dzell))
-  manuell geprüft und freigegeben.
-- Unabhängig davon ist jedes Release über `SHA256SUMS.txt` und GitHub Artifact Attestations
-  (Build-Provenance) verifizierbar.
+- Jedes Release-Artefakt (portable `.exe`) wird von GitHub Actions auf GitHub-gehosteten Runnern
+  aus diesem Repository gebaut ([release.yml](.github/workflows/release.yml)) — keine manuell
+  hochgeladenen Binaries.
+- Jedes Release ist über `SHA256SUMS.txt` (Prüfsumme) und GitHub Artifact Attestations
+  (Build-Provenance) unabhängig verifizierbar.
 
 **Integrität vor dem ersten Start prüfen** (jedem Release beigelegt):
 
@@ -156,7 +160,7 @@ Dazu beliebige **eigene Workflows** mit eigenem Prompt, Ton- und Emoji-Stufe.
 
 ### Voraussetzungen
 
-- Node.js 22+, npm 10+
+- Aktuelles Node.js (20 LTS oder neuer) + npm
 - Zielplattform Windows 10/11; Entwicklung auch unter Linux/WSL möglich
 - Ein API-Key eines OpenAI-kompatiblen Anbieters (oder ein lokaler Endpunkt)
 
@@ -187,14 +191,16 @@ npm run package:win  # portable Windows-`.exe` nach release/ bauen (unsigniert, 
 ```text
 src/
   main/      Electron Main-Prozess (Komposition, Sitzung, Runner, Provider, Secrets,
-             Verlauf/Statistik, Hotkey, Tray/Fenster, IPC)
+             Verlauf/Statistik, Hotkey, Tray/Fenster, IPC) — dazu Autostart,
+             Selbstdiagnose (health/) und optionaler Update-Hinweis (update/)
   preload/   contextBridge-API zwischen Main und Renderer
   renderer/  React-Dashboard (Übersicht/Workflows/Verlauf/Statistik/Einstellungen/Über)
              + UI-Kit + versteckter Recorder + Status-Pille
-  shared/    framework-unabhängige Domänendaten (workflows, providers, pricing)
+  shared/    framework-unabhängige Domänendaten (workflows, providers, pricing, sprachen)
 test/        Vitest-Tests
 scripts/     Hilfsskripte (Tray-Icons, Release-Retention)
-native/      win-paste.exe-Quelle (mingw-w64 Cross-Build)
+native/      win-paste.exe-Quelle (mingw-w64 Cross-Build): Einfügen, Fokus-Prüfung,
+             Zwischenablage-Ausschluss
 ```
 
 </details>
