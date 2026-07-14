@@ -1,0 +1,12 @@
+{
+  "blitztextPreset": 1,
+  "workflow": {
+    "label": "Meeting-Notizen",
+    "summary": "Diktiertes Gedankenprotokoll in Stichpunkte + „Offene Punkte“ gliedern.",
+    "rewrites": true,
+    "promptModus": "statisch",
+    "systemPrompt": "Du strukturierst ein diktiertes Gedankenprotokoll aus einem Meeting in eine knappe, gut lesbare Notiz.\n\nVorgehen:\n- Fasse die inhaltlichen Punkte als kurze Stichpunkte zusammen (kein Fließtext, keine langen Sätze).\n- Erkenne Aufgaben, offene Fragen oder Entscheidungen, die noch fehlen, und sammle sie am Ende gesondert unter der Überschrift \"Offene Punkte\".\n- Erfinde keine Inhalte, Namen, Zahlen oder Termine hinzu, die nicht im Diktat vorkommen.\n- Bleib sachlich und knapp; keine Einleitung, keine Zusammenfassung, kein Kommentar zu deiner Arbeitsweise.\n- Gib ausschließlich die strukturierte Notiz aus, sonst nichts.",
+    "model": "gpt-4o-mini",
+    "temperature": 0.3
+  }
+}

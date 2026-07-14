@@ -182,6 +182,22 @@ Die vier eingebauten Workflows:
 
 Dazu beliebige **eigene Workflows** mit eigenem Prompt, Ton- und Emoji-Stufe.
 
+## 📦 Workflow-Presets
+
+Fertige Workflows zum Importieren statt selbst zu formulieren: `.json`-Datei aus `presets/<name>/`
+herunterladen, dann in der App **Workflows → Importieren…** auswählen. Presets sind normale
+Preset-Dateien desselben Formats wie der eigene Workflow-Export — keine Sonderfunktion, kein Zwang,
+sie zu nutzen.
+
+| Preset | Kurzzweck | Ordner |
+|---|---|---|
+| Meeting-Notizen | Diktiertes Gedankenprotokoll in Stichpunkte + „Offene Punkte" gliedern | [`presets/meeting-notizen/`](presets/meeting-notizen/) |
+| Übersetzer (Englisch) | Reine Übersetzung ins Englische, ohne Stilglättung oder Kürzung | [`presets/uebersetzer-en/`](presets/uebersetzer-en/) |
+| Code-Kommentar | Diktat in einen knappen, technischen Kommentar-/Docstring-Text überführen | [`presets/code-kommentar/`](presets/code-kommentar/) |
+| Sachlich & kurz | Kürzt bewusst auf die Kernaussagen — sachlich, ohne Floskeln | [`presets/sachlich-kurz/`](presets/sachlich-kurz/) |
+
+Eigene Presets beisteuern? Siehe [`CONTRIBUTING.md`](CONTRIBUTING.md#presets-beitragen).
+
 ## 🧰 Aus dem Quellcode bauen
 
 <details>

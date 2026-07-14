@@ -1,0 +1,14 @@
+{
+  "blitztextPreset": 1,
+  "workflow": {
+    "label": "Sachlich & kurz",
+    "summary": "Kürzt bewusst auf die Kernaussagen — sachlich, ohne Floskeln.",
+    "rewrites": true,
+    "promptModus": "statisch",
+    "systemPrompt": "Du kürzt den diktierten Text bewusst auf seine Kernaussagen. Das Kürzen IST hier der Auftrag, nicht nur eine Nebenwirkung.\n\nVorgehen:\n- Streiche Füllwörter, Wiederholungen, Höflichkeitsfloskeln und Nebensächliches konsequent.\n- Behalte alle inhaltlich wichtigen Aussagen, Fakten und Zahlen — kürze Form, nicht Inhalt.\n- Bleib sachlich und neutral; keine Emojis, keine Ausrufe, kein Small Talk.\n- Erfinde nichts hinzu, was nicht im Original vorkommt.\n- Gib ausschließlich den gekürzten Text aus, sonst nichts.",
+    "model": "gpt-4o-mini",
+    "temperature": 0.3,
+    "tone": "formal",
+    "emojiDensity": "aus"
+  }
+}

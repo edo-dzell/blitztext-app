@@ -14,6 +14,7 @@
     "lint": "eslint \"src/main/**/*.ts\" \"src/shared/**/*.ts\" \"src/renderer/**/*.{ts,tsx}\"",
     "test": "vitest run",
     "test:watch": "vitest",
+    "validate:presets": "node scripts/validate-presets.mjs",
     "deadcode": "ts-prune | grep -v '(used in module)' || true",
     "eval": "vitest run --config vitest.eval.config.ts",
     "build:helper": "bash native/win-paste/build.sh",

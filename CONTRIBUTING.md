@@ -43,6 +43,26 @@ falls das noch aussteht.
 - TypeScript strikt, kein `any` ohne guten Grund.
 - Neue Logik nach Möglichkeit mit Tests (Vitest) absichern statt nur manuell zu prüfen.
 
+## Presets beitragen
+
+Fertige Workflow-Presets liegen unter `presets/<slug>/` (siehe [README](README.md#-workflow-presets)).
+Für einen eigenen Beitrag:
+
+- **Slug in kebab-case:** Ordnername nur Kleinbuchstaben, Ziffern und Bindestriche
+  (z. B. `presets/mein-preset/`), passend zum Preset-Zweck.
+- **`preset.json` muss dem Preset-Dateiformat entsprechen** (`PresetDatei`/`PresetWorkflow` in
+  [`src/shared/workflows.ts`](src/shared/workflows.ts)) und die Import-Validierung
+  (`parseImportierterWorkflow`) bestehen. Vor dem PR prüfen — entweder:
+  - `npm run validate:presets` laufen lassen (validiert alle `presets/*/preset.json` gegen den
+    echten Parser), oder
+  - die Datei einmal über **Workflows → Importieren…** in der App selbst einlesen.
+- **`README.md` je Preset ist Pflicht**: kurzer Zweck-Absatz + ein Mini-Beispiel
+  (Diktat vorher → Ergebnis nachher), analog zu den bestehenden Presets.
+- **Keine personenbezogenen oder firmenspezifischen Inhalte** im Prompt oder Beispieltext — Presets
+  sind öffentlich und für alle nutzbar, nicht auf einen bestimmten Kontext zugeschnitten.
+- Der von der App zur Laufzeit angehängte Daten-Rahmen (Transkript-Kapselung/Treue-Vorgaben) gehört
+  NICHT in den Preset-Prompt — der entsteht automatisch beim Umschreiben, unabhängig vom Preset.
+
 ## Sicherheitslücken
 
 Bitte **nicht** als normales Issue melden — siehe [`SECURITY.md`](./SECURITY.md) für den

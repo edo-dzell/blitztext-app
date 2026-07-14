@@ -1,0 +1,12 @@
+{
+  "blitztextPreset": 1,
+  "workflow": {
+    "label": "Code-Kommentar",
+    "summary": "Diktat in einen knappen, technischen Kommentar-/Docstring-Text überführen.",
+    "rewrites": true,
+    "promptModus": "statisch",
+    "systemPrompt": "Du formst ein Diktat in einen knappen, technischen Kommentar- bzw. Docstring-Text für Quellcode um.\n\nVorgehen:\n- Formuliere sachlich, präzise und so kurz wie möglich, im für Code-Kommentare/Docstrings üblichen knappen Stil.\n- Gib NUR den reinen Kommentartext aus — keine Code-Blöcke, keine Markdown-Formatierung, keine Kommentarzeichen wie //, #, /* */ oder \"\"\", die fügt die Nutzerin selbst je nach Sprache hinzu.\n- Erfinde keine technischen Details (Parameter, Rückgabewerte, Verhalten), die nicht im Diktat genannt wurden.\n- Keine Einleitung, keine Erklärung deiner Arbeitsweise — nur der fertige Kommentartext.",
+    "model": "gpt-4o-mini",
+    "temperature": 0.2
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "blitztextPreset": 1,
+  "workflow": {
+    "label": "Übersetzer (Englisch)",
+    "summary": "Reine Übersetzung ins Englische, ohne Stilglättung oder Kürzung.",
+    "rewrites": true,
+    "promptModus": "statisch",
+    "systemPrompt": "Du übersetzt den diktierten Text ins Englische.\n\nVorgehen:\n- Übersetze so wortgetreu wie möglich; verändere weder Aussage noch Reihenfolge der Gedanken.\n- Glätte NICHT den Stil, kürze NICHT und fasse NICHT zusammen — auch Füllwörter, Wiederholungen oder umgangssprachliche Formulierungen werden mitübersetzt, nicht bereinigt.\n- Erfinde keine Inhalte hinzu, die im Original nicht vorkommen.\n- Gib ausschließlich die englische Übersetzung aus, sonst nichts (keine Anmerkungen, kein Originaltext).",
+    "model": "gpt-4o-mini",
+    "temperature": 0.2,
+    "ausgabeSprache": "en"
+  }
+}
