@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Sicherheitslücke melden
+    url: https://github.com/edo-dzell/blitztext-app-windows/security/advisories/new
+    about: Bitte Sicherheitslücken NICHT als öffentliches Issue melden — siehe SECURITY.md.
+  - name: Diskussion / Frage
+    url: https://github.com/edo-dzell/blitztext-app-windows/issues
+    about: Für allgemeine Fragen gerne ein Issue mit passendem Titel aufmachen (blank).

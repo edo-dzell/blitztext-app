@@ -102,7 +102,8 @@ Idee zur Alltags-App aus:
     <td align="center"><img src="assets/screenshots/statistik.png" alt="Statistik: Diktate, Audio-Minuten, Token-Summen und geschätzte Kosten je Workflow" width="420"></td>
   </tr>
 </table>
-<p align="center"><sup>Übersicht mit aktiven Hotkeys · Workflow-Editor · Nutzungs- und Kostenstatistik</sup></p>
+<p align="center"><sup>Übersicht mit aktiven Hotkeys · Workflow-Editor · Nutzungs- und Kostenstatistik<br>
+(Screenshots aus einer älteren Version — spiegeln nicht jedes neue Feature dieses Releases wider)</sup></p>
 
 ## ⬇️ Download & erster Start
 
@@ -169,7 +170,7 @@ Dazu beliebige **eigene Workflows** mit eigenem Prompt, Ton- und Emoji-Stufe.
 
 ### Voraussetzungen
 
-- Aktuelles Node.js (20 LTS oder neuer) + npm
+- Node.js 22 (wie in der CI, [release.yml](.github/workflows/release.yml)) oder neuer + npm
 - Zielplattform Windows 10/11; Entwicklung auch unter Linux/WSL möglich
 - Ein API-Key eines OpenAI-kompatiblen Anbieters (oder ein lokaler Endpunkt)
 
@@ -214,9 +215,54 @@ native/      win-paste.exe-Quelle (mingw-w64 Cross-Build): Einfügen, Fokus-Prü
 
 </details>
 
+## ❓ FAQ & Problembehebung
+
+<details>
+<summary><b>Windows SmartScreen zeigt „Unbekannter Herausgeber" — ist das gefährlich?</b></summary>
+
+Nein, das ist erwartbar: Die Releases sind (noch) nicht code-signiert (siehe
+[Code-Signing](#-code-signing--datenschutz)). Über „Weitere Informationen“ → „Trotzdem ausführen“
+lässt sich die `.exe` starten. Zur Verifikation liegt jedem Release `SHA256SUMS.txt` bei, und die
+Build-Provenance lässt sich per `gh attestation verify` gegen dieses Repository prüfen (siehe oben).
+
+</details>
+
+<details>
+<summary><b>Mein Antivirenprogramm schlägt bei der .exe Alarm — ist die Datei manipuliert?</b></summary>
+
+Unsignierte Electron-`.exe`s lösen bei manchen Virenscannern Fehlalarme aus, das ist ein bekanntes
+Muster bei unsignierten Windows-Binaries generell und kein Hinweis auf eine manipulierte Datei.
+Prüfe die Prüfsumme gegen `SHA256SUMS.txt` und die Build-Provenance (`gh attestation verify`, siehe
+oben) — beides bestätigt, dass die Datei unverändert aus dem CI-Lauf dieses Repositories stammt.
+
+</details>
+
+<details>
+<summary><b>Blitztext erkennt kein Mikrofon</b></summary>
+
+Prüfe zuerst die Windows-Mikrofonberechtigung für Desktop-Apps (Einstellungen → Datenschutz &
+Sicherheit → Mikrofon). Die App bringt außerdem eine Selbstdiagnose („Ampel“) in den Einstellungen
+mit, die Mikrofon, API-Key, Anbieter-Erreichbarkeit und Hotkey-Erkennung einzeln prüft und bei
+fehlendem oder nicht ermittelbarem Mikrofon einen konkreten Hinweis anzeigt.
+
+</details>
+
+<details>
+<summary><b>Autostart mit Windows funktioniert nach dem Verschieben der .exe nicht mehr</b></summary>
+
+Erwartbar bei einer portablen `.exe` ohne Installer: Der Autostart-Eintrag zeigt auf den exakten
+Pfad zum Zeitpunkt des Aktivierens. Wird die `.exe` danach verschoben oder umbenannt, erkennt die
+App den Eintrag als „verwaist“ statt ihn fälschlich als aktiv auszugeben — einfach in den
+Einstellungen einmal neu aktivieren, dann zeigt der Eintrag wieder auf den aktuellen Pfad.
+
+</details>
+
 ## 📄 Lizenz & Credits
 
 MIT — siehe [`LICENSE`](./LICENSE). Dieses Projekt ist ein eigenständiger Windows-Neuschrieb des
 macOS-Originals [`cmagnussen/blitztext-app`](https://github.com/cmagnussen/blitztext-app); dessen
 Urheberrechtsvermerk ist gemäß MIT-Lizenz im `LICENSE` erhalten. Danke an das Original für die
 Idee und die vier Workflow-Klassiker. ⚡
+
+Beiträge willkommen — siehe [`CONTRIBUTING.md`](./CONTRIBUTING.md). Sicherheitslücke gefunden?
+Bitte [`SECURITY.md`](./SECURITY.md) beachten (kein öffentliches Issue mit sensiblen Details).

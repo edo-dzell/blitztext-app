@@ -5,6 +5,28 @@
   "private": true,
   "author": "edo-dzell",
   "license": "MIT",
+  "homepage": "https://github.com/edo-dzell/blitztext-app-windows#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edo-dzell/blitztext-app-windows.git"
+  },
+  "bugs": {
+    "url": "https://github.com/edo-dzell/blitztext-app-windows/issues"
+  },
+  "keywords": [
+    "speech-to-text",
+    "dictation",
+    "electron",
+    "windows",
+    "whisper",
+    "hotkey",
+    "transcription",
+    "tray-app",
+    "openai",
+    "groq",
+    "mistral",
+    "local-asr"
+  ],
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
