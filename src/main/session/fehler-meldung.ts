@@ -19,8 +19,9 @@ export interface FehlerMeldung {
 
 /**
  * Nutzergerichtete Meldung für einen Teil-Erfolg (Rohtext liegt in der Zwischenablage). Der Grund
- * unterscheidet, WARUM nicht eingefügt wurde: Umschreib-Fehler vs. Treue-Befund (das Modell hat das
- * Diktat beantwortet, v0.4.5). Ehrlich + spezifisch, damit auch ein Fehlalarm verständlich bleibt.
+ * unterscheidet, WARUM nicht eingefügt wurde: Umschreib-Fehler, Treue-Befund (das Modell hat das
+ * Diktat beantwortet, v0.4.5), Token-Limit ODER Vollständigkeits-Befund (Aussagen weggelassen, v0.7.1).
+ * Ehrlich + spezifisch, damit auch ein Fehlalarm verständlich bleibt.
  */
 export function teilErfolgMeldung(grund: TeilErfolgGrund): FehlerMeldung {
   switch (grund) {
@@ -40,6 +41,12 @@ export function teilErfolgMeldung(grund: TeilErfolgGrund): FehlerMeldung {
         titel: 'Umschreiben abgeschnitten',
         koerper:
           'Die Antwort wurde vom Modell abgeschnitten (Token-Limit) — der Rohtext liegt in der Zwischenablage — mit Strg+V einfügen.'
+      }
+    case 'unvollstaendig':
+      return {
+        titel: 'Diktat nicht eingefügt',
+        koerper:
+          'Umschreiben hat Aussagen weggelassen — der Rohtext liegt in der Zwischenablage — mit Strg+V einfügen.'
       }
   }
 }

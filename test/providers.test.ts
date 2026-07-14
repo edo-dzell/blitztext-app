@@ -7,8 +7,8 @@ import {
 } from '@shared/providers'
 
 describe('Provider-Registry', () => {
-  it('enthält OpenAI, Groq, Mistral und custom', () => {
-    expect(PROVIDER.map((p) => p.id)).toEqual(['openai', 'groq', 'mistral', 'custom'])
+  it('enthält OpenAI, Groq, Mistral, lokal und custom', () => {
+    expect(PROVIDER.map((p) => p.id)).toEqual(['openai', 'groq', 'mistral', 'lokal', 'custom'])
   })
 
   it('liefert per id den Descriptor, sonst undefined', () => {
@@ -50,5 +50,28 @@ describe('Provider-Registry', () => {
   it('modelleFuerVorlage: unbekannte/eigene Vorlage → leere Listen', () => {
     expect(modelleFuerVorlage('custom')).toEqual({ asr: [], chat: [] })
     expect(modelleFuerVorlage('unbekannt')).toEqual({ asr: [], chat: [] })
+  })
+
+  // --- S4: lokales ASR als eigene Vorlage (kein API-Key nötig, kein Bundling) ---
+
+  it("'lokal' ist vorhanden, anpassbar und ohne Preis-Angabe (keine Kostenschätzung für lokal)", () => {
+    const lokal = getProvider('lokal')!
+    expect(lokal).toBeDefined()
+    expect(lokal.anpassbar).toBe(true)
+    expect(lokal.baseUrl).toBe('http://localhost:8000/v1')
+    expect(lokal.keyHinweis).toMatch(/kein api-key/i)
+    expect(lokal.chatModelle).toEqual([])
+    expect(lokal.asrModelle).toEqual([
+      { id: 'Systran/faster-whisper-small', label: 'faster-whisper small', empfohlen: true }
+    ])
+    for (const modell of [...lokal.asrModelle, ...lokal.chatModelle]) {
+      expect(modell.preis).toBeUndefined()
+    }
+  })
+
+  it("modelleFuerVorlage('lokal') liefert das faster-whisper-Modell, keine Chat-Modelle", () => {
+    const { asr, chat } = modelleFuerVorlage('lokal')
+    expect(asr.map((m) => m.id)).toEqual(['Systran/faster-whisper-small'])
+    expect(chat).toEqual([])
   })
 })

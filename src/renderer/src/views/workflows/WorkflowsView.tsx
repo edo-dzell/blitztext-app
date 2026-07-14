@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Plus } from 'lucide-react'
+import { Plus, Upload } from 'lucide-react'
 import type { BlitztextSettings } from '@main/settings/store'
 import {
   NEUER_WORKFLOW_TEMPERATUR,
@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import ZweiEbenenShell from '@/components/ZweiEbenenShell'
 import { useBestaetigung } from '@/components/Bestaetigung'
+import { useHinweis } from '@/components/Hinweis'
 import { useNavGuard } from '@/components/NavGuard'
 import { assistentSperrtAuswahl } from '@/lib/dirty'
 import { chordLabel } from '@/lib/hotkey-capture'
@@ -26,6 +27,7 @@ export default function WorkflowsView({ settings, speichern }: Props) {
   // ein Auswahl-Wechsel würde WorkflowEditor remounten (key={aktiv.id}) und die Antwort verwerfen.
   const [assistentBusy, setAssistentBusy] = useState(false)
   const bestaetige = useBestaetigung()
+  const zeige = useHinweis()
   const { versucheNavigation } = useNavGuard()
 
   // P2: immer ein gültiger Eintrag vorausgewählt (erster); nach Löschen/Listenänderung normalisieren.
@@ -54,6 +56,34 @@ export default function WorkflowsView({ settings, speichern }: Props) {
     }
     await speichern({ ...settings, workflows: [...settings.workflows, neu] })
     setAuswahl(id)
+  }
+
+  // Workflow-Import aus einer Preset-Datei. Vor der Übernahme eine Vorschau (Transparenz-Dialog, kein
+  // Vertrauensvorschuss auf fremde Prompts) — erst nach Bestätigung wird tatsächlich gespeichert.
+  async function importiereWorkflow() {
+    const ergebnis = await window.blitztext.workflow.import()
+    if (!ergebnis.ok) {
+      if (ergebnis.grund === 'ungueltig') {
+        zeige('Keine gültige Blitztext-Preset-Datei.', 'fehler')
+      }
+      return // 'abgebrochen' → still
+    }
+    const w = ergebnis.workflow
+    const promptAuszug =
+      w.systemPrompt.length > 200 ? `${w.systemPrompt.slice(0, 200)}…` : w.systemPrompt
+    const ok = await bestaetige({
+      titel: `„${w.label}" importieren?`,
+      text: `${promptAuszug || '(kein Prompt-Text)'} — Prompt bitte kurz prüfen.`,
+      bestaetigen: 'Importieren',
+      gefahr: false
+    })
+    if (!ok) return
+    // W3-F1: kein zusätzlicher Erfolgs-Toast hier — speichern() zeigt bereits „Gespeichert."
+    // bzw. (A4b) den ehrlichen Aufschub-Hinweis bei laufender Aufnahme; ein zweiter Toast würde
+    // Letzteren optisch verdrängen/verschleiern. Das Erfolgssignal ist die automatische Auswahl
+    // des neuen Workflows (setAuswahl unten) — die Bandliste springt sichtbar auf den Import.
+    await speichern({ ...settings, workflows: [...settings.workflows, w] })
+    setAuswahl(w.id)
   }
 
   async function aktualisiereWorkflow(naechste: WorkflowDefinition, hotkey?: string[]) {
@@ -121,9 +151,25 @@ export default function WorkflowsView({ settings, speichern }: Props) {
       }}
       bandKopf={
         <div className="flex flex-col gap-2">
-          <Button size="sm" className="w-full" onClick={neuerWorkflow} disabled={auswahlGesperrt}>
-            <Plus /> Neuer Workflow
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              className="flex-1"
+              onClick={neuerWorkflow}
+              disabled={auswahlGesperrt}
+            >
+              <Plus /> Neuer Workflow
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="flex-1"
+              onClick={importiereWorkflow}
+              disabled={auswahlGesperrt}
+            >
+              <Upload /> Importieren…
+            </Button>
+          </div>
           {auswahlGesperrt && (
             <p className="text-[11px] leading-tight text-muted-foreground">
               Prompt-Assistent entwirft … Auswahl ist währenddessen gesperrt, damit die Antwort nicht

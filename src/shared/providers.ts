@@ -135,6 +135,26 @@ export const PROVIDER: readonly ProviderDescriptor[] = [
     docsUrl: 'https://console.mistral.ai/api-keys'
   },
   {
+    id: 'lokal',
+    label: 'Lokal (kein API-Key nötig)',
+    // Port variiert je nach lokalem Server (Speaches-Default 8000) — `anpassbar` lässt die Base-URL
+    // dennoch editierbar (siehe unten).
+    baseUrl: 'http://localhost:8000/v1',
+    // BEWUSST OHNE preis-Feld: lokal = keine Kostenschätzung möglich, NICHT „0" (Konvention — ein
+    // fehlendes preis-Feld heißt „unbekannt/nicht bepreisbar", ein `{ asrProMinuteUsd: 0 }` würde
+    // fälschlich „kostenlos, geprüft" behaupten). Siehe pricing.ts: PREISE führt nur Modelle mit
+    // preis-Feld; ein hier ergänztes preis würde sofort real (getestet in pricing.test.ts).
+    asrModelle: [
+      { id: 'Systran/faster-whisper-small', label: 'faster-whisper small', empfohlen: true }
+    ],
+    // Reine ASR-Vorlage: kein Chat-Modell mitgeliefert (ein lokaler Whisper-Server schreibt nicht um).
+    chatModelle: [],
+    keyHinweis: 'Kein API-Key nötig — lokaler Server (z. B. Speaches)',
+    docsUrl: 'https://github.com/speaches-ai/speaches',
+    // Base-URL/Modelle bleiben editierbar (Port/Modellname variieren je nach lokalem Server).
+    anpassbar: true
+  },
+  {
     id: 'custom',
     label: 'Eigener Anbieter (OpenAI-kompatibel)',
     baseUrl: '',

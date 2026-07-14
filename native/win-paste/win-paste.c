@@ -27,6 +27,14 @@
  * Bekannte Grenze: Läuft das Vordergrundfenster als Administrator, nimmt es von einer
  * nicht-erhöhten App kein SendInput an → die Fallback-Kette (PowerShell/Hinweis) greift. Ein HWND
  * passt praktisch in 2^32 (Windows-Handle-Vergabe), daher als Dezimalzahl JS-sicher parsbar.
+ *
+ * Exit-Code-Katalog (gesamtes Programm):
+ *   0 = Erfolg (eingefügt/HWND ausgegeben/Zwischenablage gesetzt, je nach Kommando)
+ *   1 = --hwnd: kein Vordergrundfenster ermittelbar
+ *   2 = Drift-Gate (--paste <hwnd>): Vordergrund != erwartetes <hwnd> → NICHTS gesendet
+ *   3 = <hwnd>-Argument fehlt oder ist nicht als positive Ganzzahl parsbar
+ *   4 = --set-clip: stdin leer/nicht lesbar oder UTF-8→UTF-16-Konvertierung fehlgeschlagen
+ *   5 = --set-clip: OpenClipboard/SetClipboardData fehlgeschlagen
  */
 
 #include <windows.h>

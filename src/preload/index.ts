@@ -5,8 +5,19 @@ import type { VerlaufEintrag } from '@main/history/history-store'
 import type { StatsSummary } from '@main/stats/stats-store'
 import type { AutostartStatus } from '@main/autostart'
 import type { UpdateErgebnis } from '@main/update/update-hinweis'
-import type { DiagnoseErgebnis } from '@main/health'
+import type { DiagnoseErgebnis, HealthErgebnis } from '@main/health'
 import type { WorkflowPhase } from '@main/workflow/runner'
+import type { WorkflowDefinition } from '@shared/workflows'
+
+/** Ergebnis von workflow:export (Datei-Preset, siehe main/index.ts). */
+export type WorkflowExportErgebnis =
+  | { ok: true; pfad: string }
+  | { ok: false; grund: 'abgebrochen' | 'unbekannt' | 'schreibfehler' }
+
+/** Ergebnis von workflow:import (Datei-Preset, siehe main/index.ts). */
+export type WorkflowImportErgebnis =
+  | { ok: true; workflow: WorkflowDefinition }
+  | { ok: false; grund: 'abgebrochen' | 'ungueltig' | 'lesefehler' }
 
 const api = {
   /** Health-Check der IPC-Bridge zwischen Renderer und Main-Prozess. */
@@ -35,7 +46,13 @@ const api = {
   /** Prompt-Assistent: erzeugt einen System-Prompt-Entwurf (V2). */
   workflow: {
     assistEntwurf: (beschreibung: string, bestehend?: string): Promise<string> =>
-      ipcRenderer.invoke('workflow:assistEntwurf', beschreibung, bestehend)
+      ipcRenderer.invoke('workflow:assistEntwurf', beschreibung, bestehend),
+    /** Workflow als Preset-Datei exportieren (nativer Speichern-Dialog im Main). */
+    export: (workflowId: string): Promise<WorkflowExportErgebnis> =>
+      ipcRenderer.invoke('workflow:export', workflowId),
+    /** Preset-Datei importieren (nativer Öffnen-Dialog im Main). KEIN Store-Write hier — der
+     *  Aufrufer übernimmt das Ergebnis über settings.save. */
+    import: (): Promise<WorkflowImportErgebnis> => ipcRenderer.invoke('workflow:import')
   },
   /** Verlauf (opt-in, verschlüsselt) lesen/löschen (V2). */
   history: {
@@ -80,6 +97,12 @@ const api = {
     diagnose: (mikrofonAnzahl: number): Promise<DiagnoseErgebnis> =>
       ipcRenderer.invoke('health:diagnose', mikrofonAnzahl)
   },
+  /** S4: Erreichbarkeits-Check für EINEN bestimmten Anbieter (Einstellungen-Karte „Server prüfen",
+   *  v. a. fürs lokale ASR gedacht — Port/Server variiert dort je nach Setup). */
+  anbieter: {
+    pruefeErreichbarkeit: (anbieterId: string): Promise<HealthErgebnis> =>
+      ipcRenderer.invoke('anbieter:pruefeErreichbarkeit', anbieterId)
+  },
   /** C4: Live-Workflow-Phase fürs Settings-Fenster (Status-Indikator im Header). Gleiches
    *  Abmelde-Muster wie history.onChanged (Listener-Referenz HIER erfasst). */
   workflowStatus: {
@@ -88,6 +111,13 @@ const api = {
       ipcRenderer.on('workflow:status', listener)
       return () => ipcRenderer.removeListener('workflow:status', listener)
     }
+  },
+  /** W2-S8 (Onboarding-Wizard): manuelles Auslösen/Stoppen eines Workflows ohne Hotkey (Probe-Schritt).
+   *  Der Fortschritt kommt wie beim Hotkey über workflowStatus.onChanged — beide Aufrufe resolven sofort. */
+  sitzung: {
+    starteManuell: (workflowId: string): Promise<void> =>
+      ipcRenderer.invoke('sitzung:starteManuell', workflowId),
+    stoppeManuell: (): Promise<void> => ipcRenderer.invoke('sitzung:stoppeManuell')
   }
 }
 

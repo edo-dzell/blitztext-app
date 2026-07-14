@@ -31,7 +31,13 @@ import type { KeyEvent } from '@main/hotkey/matcher'
 import { findeAnbieter, standardAnbieterAus, type AnbieterKonfig } from '@shared/anbieter'
 import type { Autostart, AutostartStatus } from '@main/autostart'
 import { pruefeAufUpdate, type Holer, type UpdateCacheSpeicher, type UpdateErgebnis } from '@main/update/update-hinweis'
-import { fuehreDiagnose, type DiagnoseErgebnis, type ErreichbarkeitsPort } from '@main/health'
+import {
+  fuehreDiagnose,
+  pruefeErreichbarkeit,
+  type DiagnoseErgebnis,
+  type ErreichbarkeitsPort,
+  type HealthErgebnis
+} from '@main/health'
 
 /** Die OS-/GUI-nahen Ports, die nur Windows real erfüllen kann (HITL). */
 export interface NativePorts {
@@ -144,6 +150,12 @@ export interface MainComposition {
    * IPC mit — der Main-Prozess hat keinen direkten Medien-Geräte-Zugriff.
    */
   diagnose(mikrofonAnzahl: number): Promise<DiagnoseErgebnis>
+  /**
+   * S4 (lokales ASR „Server prüfen"): Erreichbarkeits-Check für EINEN bestimmten Anbieter (per id),
+   * unabhängig vom Standard-Anbieter — die Einstellungen-Karte prüft den gerade bearbeiteten Anbieter,
+   * nicht zwingend den Standard. Unbekannte id → definiertes Fehler-Ergebnis (kein Throw).
+   */
+  pruefeErreichbarkeitFuer(anbieterId: string): Promise<HealthErgebnis>
 }
 
 /** Mutierbare Provider-Config-Zelle: die Provider-Closures lesen sie pro Call (Live-Wechsel). */
@@ -153,6 +165,19 @@ function bindungenAus(settings: BlitztextSettings): Bindung[] {
     const chord = settings.hotkeys[w.id]
     return chord && chord.length > 0 ? [{ chord, workflow: w.id }] : []
   })
+}
+
+/**
+ * S4: reine Auflösung „anbieterId → { label, baseUrl } oder unbekannt" — der eigentliche
+ * Erreichbarkeits-Ping (Netz) bleibt in pruefeErreichbarkeit/den Ports; diese Funktion ist bewusst
+ * ohne jeden Seiteneffekt gehalten, damit sie ohne Main-Prozess-Umgebung testbar ist.
+ */
+export function loeseAnbieterFuerErreichbarkeit(
+  liste: readonly AnbieterKonfig[],
+  anbieterId: string
+): { label: string; baseUrl: string } | null {
+  const gefunden = findeAnbieter(liste, anbieterId)
+  return gefunden ? { label: gefunden.label, baseUrl: gefunden.baseUrl } : null
 }
 
 /** Reine Glue: ordnet eine Dispatch-Aktion der passenden Sitzung-Methode zu (Hotkey-Quelle). */
@@ -368,6 +393,26 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
         // Der Renderer speist die (nicht-negative, ganzzahlige) Geräteanzahl ein.
         mikrofon: { geraete: { anzahl: async () => Math.max(0, Math.trunc(mikrofonAnzahl)) } },
         hotkeyHook: { hook: { istAktiv: async () => hotkeyHookAktiv } }
+      })
+    },
+    async pruefeErreichbarkeitFuer(anbieterId) {
+      const aufgeloest = loeseAnbieterFuerErreichbarkeit(settings.anbieter, anbieterId)
+      if (!aufgeloest) {
+        return {
+          status: 'fehler',
+          titel: 'Anbieter-Erreichbarkeit',
+          detail: 'Unbekannter Anbieter — bitte Einstellungen neu laden.'
+        }
+      }
+      return pruefeErreichbarkeit({
+        // Ohne echten Port meldet der Check 'warnung' (Port wirft ⇒ nicht prüfbar) — gleiches Muster
+        // wie diagnose() oben.
+        holer: deps.erreichbarkeit ?? {
+          pingeAnbieter: async () => {
+            throw new Error('kein Erreichbarkeits-Port verdrahtet')
+          }
+        },
+        anbieter: aufgeloest
       })
     }
   }

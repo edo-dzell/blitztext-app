@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Trash2, RotateCcw } from 'lucide-react'
+import { Trash2, RotateCcw, Download } from 'lucide-react'
 import {
   TEMPERATUR_STUFEN,
   werksVerhalten,
@@ -22,6 +22,7 @@ import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Field, Separator } from '@/components/ui/field'
 import { useBestaetigung } from '@/components/Bestaetigung'
+import { useHinweis } from '@/components/Hinweis'
 import { useNavGuard } from '@/components/NavGuard'
 import { workflowEntwurfGeaendert, assistentSperrtAuswahl } from '@/lib/dirty'
 import {
@@ -78,6 +79,7 @@ export default function WorkflowEditor({
   const [assistentFehler, setAssistentFehler] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const bestaetige = useBestaetigung()
+  const zeige = useHinweis()
   const { registriereDirty } = useNavGuard()
 
   // P4: Speichern nur aktiv bei echter Änderung — über BEIDE Entwürfe (Definition UND Hotkey-Chord).
@@ -109,6 +111,18 @@ export default function WorkflowEditor({
     if (!ok) return
     const werk = werksVerhalten(e.id)
     if (werk) setE((prev) => ({ ...prev, ...werk }))
+  }
+
+  // Workflow-Export als Preset-Datei (für ALLE Workflows, auch eingebaute — der Export exportiert nur
+  // das VERHALTEN, siehe workflowZuPreset). Export bezieht sich auf den GESPEICHERTEN Stand (def.id) —
+  // Main liest über comp.einstellungen.load() selbst nach, der Renderer schickt nur die id.
+  async function exportiere() {
+    const ergebnis = await window.blitztext.workflow.export(def.id)
+    if (ergebnis.ok) {
+      zeige('Als Preset exportiert.', 'erfolg')
+    } else if (ergebnis.grund !== 'abgebrochen') {
+      zeige('Export fehlgeschlagen.', 'fehler')
+    }
   }
 
   // Beim Bearbeiten des Prompts wird ein eingebauter Workflow auf 'statisch' umgestellt
@@ -164,17 +178,22 @@ export default function WorkflowEditor({
       <CardContent className="flex flex-col gap-4 p-5">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-semibold">Workflow bearbeiten</h3>
-          {def.builtin
-            ? weichtVomWerkAb(def) && (
-                <Button variant="outline" size="sm" onClick={aufWerkZuruecksetzen}>
-                  <RotateCcw /> Auf Auslieferung zurücksetzen
-                </Button>
-              )
-            : onLoeschen && (
-                <Button variant="destructive" size="sm" onClick={onLoeschen}>
-                  <Trash2 /> Löschen
-                </Button>
-              )}
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={exportiere}>
+              <Download /> Exportieren
+            </Button>
+            {def.builtin
+              ? weichtVomWerkAb(def) && (
+                  <Button variant="outline" size="sm" onClick={aufWerkZuruecksetzen}>
+                    <RotateCcw /> Auf Auslieferung zurücksetzen
+                  </Button>
+                )
+              : onLoeschen && (
+                  <Button variant="destructive" size="sm" onClick={onLoeschen}>
+                    <Trash2 /> Löschen
+                  </Button>
+                )}
+          </div>
         </div>
 
         <Field label="Name" hint="Anzeigename des Workflows.">

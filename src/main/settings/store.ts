@@ -14,6 +14,7 @@ import {
 import type { AnbieterKonfig } from '@shared/anbieter'
 import { getProvider } from '@shared/providers'
 import { EUR_PRO_USD, type PreisOverrides, type ModellPreis } from '@shared/pricing'
+import { normalisiereBegriffe } from '@shared/begriffe'
 import type { RecordingMode } from '@main/hotkey/matcher'
 
 /** Recency-Status eines API-Keys (P1): „zuletzt erfolgreich getestet". NUR im Main verwaltet. */
@@ -60,6 +61,14 @@ export interface BlitztextSettings {
   updateHinweisAktiv: boolean
   /** Sortierrichtung im Verlauf (C2). Default 'neuesteZuerst'. Migration wie `theme` (includes-Check). */
   verlaufSortierung: 'neuesteZuerst' | 'aeltesteZuerst'
+  /**
+   * W2-S8: hat der Nutzer den Onboarding-Wizard abgeschlossen (oder übersprungen)? Default AUS (neue
+   * Installation zeigt den Wizard). Migration bei fehlendem Feld (alte Settings-Datei ohne dieses
+   * Feld = Bestandsnutzer, KEIN Neuling): Heuristik in parseSettings setzt es auf true, wenn bereits
+   * ein API-Key getestet wurde ODER mehr als die vier eingebauten Workflows existieren — beides sind
+   * Spuren echter Vornutzung, die ein frisch installierter Wizard-Kandidat nicht haben kann.
+   */
+  onboardingAbgeschlossen: boolean
 }
 
 // Default-Anbieter = OpenAI. ASR auf die moderne Generation `gpt-4o-mini-transcribe` (v0.2.4, per
@@ -106,7 +115,8 @@ export function defaultSettings(): BlitztextSettings {
     autostart: false,
     mikrofonDeviceId: '',
     updateHinweisAktiv: false,
-    verlaufSortierung: 'neuesteZuerst'
+    verlaufSortierung: 'neuesteZuerst',
+    onboardingAbgeschlossen: false
   }
 }
 
@@ -225,14 +235,19 @@ function parseEinAnbieter(raw: unknown): AnbieterKonfig | null {
   const o = raw as Record<string, unknown>
   if (typeof o.id !== 'string' || o.id.trim() === '') return null
   const descriptor = getProvider(strOder(o.vorlage, o.id))
+  const vorlage = descriptor ? descriptor.id : 'custom'
+  // 'lokal'-Vorlage: fehlendes keinKeyNoetig-Feld → Default true (robust auch bei manuell editierter
+  // Datei — die Vorlage IST der keylose lokale Server). Ein explizites `false` wird respektiert (der
+  // Nutzer kann einen lokalen Server mit eigenem Auth-Schema bewusst wieder auf „Key nötig" stellen).
+  const keinKeyNoetigDefault = vorlage === 'lokal' && o.keinKeyNoetig === undefined
   return {
     id: o.id,
-    vorlage: descriptor ? descriptor.id : 'custom',
+    vorlage,
     label: strOder(o.label, descriptor?.label ?? o.id),
     baseUrl: strOder(o.baseUrl, descriptor?.baseUrl ?? DEFAULT_ANBIETER.baseUrl),
     asrModell: strOder(o.asrModell, DEFAULT_ANBIETER.asrModell),
     chatModell: strOder(o.chatModell, DEFAULT_ANBIETER.chatModell),
-    ...(o.keinKeyNoetig === true ? { keinKeyNoetig: true as const } : {})
+    ...(o.keinKeyNoetig === true || keinKeyNoetigDefault ? { keinKeyNoetig: true as const } : {})
   }
 }
 
@@ -294,9 +309,14 @@ function parseSettings(raw: unknown): BlitztextSettings {
 
   return {
     language: typeof o.language === 'string' && o.language.trim() !== '' ? o.language : d.language,
-    customTerms: Array.isArray(o.customTerms)
-      ? o.customTerms.filter((t): t is string => typeof t === 'string')
-      : d.customTerms,
+    // Terms-Kern: nach dem Typ-Filter zusätzlich normalisieren (trim/leer raus/Dedupe
+    // case-insensitive) — verhindert Leerstring-Artefakte wie „Acme, , GmbH" aus alten/kaputten
+    // Einstellungsdateien, die vor der Normalisierung gespeichert wurden.
+    customTerms: normalisiereBegriffe(
+      Array.isArray(o.customTerms)
+        ? o.customTerms.filter((t): t is string => typeof t === 'string')
+        : d.customTerms
+    ),
     tone: TONES.includes(o.tone as BlitztextSettings['tone']) ? (o.tone as BlitztextSettings['tone']) : d.tone,
     emojiDensity: DENSITIES.includes(o.emojiDensity as BlitztextSettings['emojiDensity'])
       ? (o.emojiDensity as BlitztextSettings['emojiDensity'])
@@ -328,7 +348,18 @@ function parseSettings(raw: unknown): BlitztextSettings {
       o.verlaufSortierung as never
     )
       ? (o.verlaufSortierung as BlitztextSettings['verlaufSortierung'])
-      : d.verlaufSortierung
+      : d.verlaufSortierung,
+    // W2-S8 (Onboarding-Wizard): explizit gesetzter boolean wird respektiert (auch `false` — ein
+    // Nutzer, der den Wizard bewusst übersprungen/neu gestartet hat, soll ihn nicht wiedersehen).
+    // Fehlt das Feld GANZ (alte Settings-Datei von vor diesem Feature), greift die Bestandsnutzer-
+    // Heuristik: true, wenn bereits ein API-Key getestet wurde (apiKeyStatus nicht leer) ODER mehr als
+    // die vier eingebauten Workflows existieren (>4 = der Nutzer hat mindestens einen eigenen
+    // angelegt) — beides sind Spuren echter Vornutzung, die eine frische Installation nicht hat.
+    // Ein FEHLENDES Feld ohne diese Spuren (frische Installation) bleibt false → der Wizard erscheint.
+    onboardingAbgeschlossen:
+      typeof o.onboardingAbgeschlossen === 'boolean'
+        ? o.onboardingAbgeschlossen
+        : Object.keys(parseApiKeyStatus(o.apiKeyStatus)).length > 0 || workflows.length > 4
   }
 }
 
@@ -346,7 +377,11 @@ export function createSettingsStore({ file }: { file: SettingsFile }): SettingsS
       return parseSettings(parsed)
     },
     async save(settings) {
-      await file.write(JSON.stringify(settings))
+      // Zweite Verteidigungslinie (defense-in-depth): normalisiert auch dann, wenn ein künftiger
+      // Aufrufer (z. B. IPC-Handler) ungeprüfte customTerms direkt an save() durchreicht, ohne den
+      // load()-Pfad zu durchlaufen.
+      const normalisiert = { ...settings, customTerms: normalisiereBegriffe(settings.customTerms) }
+      await file.write(JSON.stringify(normalisiert))
     }
   }
 }

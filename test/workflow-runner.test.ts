@@ -508,6 +508,103 @@ describe('createWorkflowRunner', () => {
     expect(terminal).toEqual({ status: 'fertig', text: 'sauber poliert' })
   })
 
+  // --- v0.7.1 Stufe 3: Vollständigkeits-Detektor (5. Vorfallsklasse „Weglassen") ---
+
+  const ROHTEXT_VORFALL =
+    'Der sagt zwar keine Aufnahme erkannt, aber ich bin jetzt mal gespannt, was jetzt funktioniert.'
+
+  it('Vollständigkeits-Detektor: improve + realer Vorfallssatz mit weggelassenem Teilsatz → teilErfolg grund=unvollstaendig', async () => {
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: { async transcribe() { return ROHTEXT_VORFALL } },
+        rewrite: { async rewrite() { return { text: 'Ich bin jetzt gespannt, was jetzt funktioniert.' } } }
+      })
+    )
+
+    runner.start({ def: def('improve'), chatModell: 'gpt-4o-mini' })
+    const terminal = await runner.stop()
+
+    expect(terminal).toMatchObject({ status: 'teilErfolg', grund: 'unvollstaendig' })
+    expect(terminal).toMatchObject({ rohtext: ROHTEXT_VORFALL })
+    expect(runner.letzteMetrik).toMatchObject({ umgeschrieben: false })
+  })
+
+  it('Vollständigkeits-Detektor: emoji + vollständiger Endtext → normaler fertig-Abschluss', async () => {
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: { async transcribe() { return ROHTEXT_VORFALL } },
+        rewrite: {
+          async rewrite() {
+            return {
+              text: 'Er sagt zwar „keine Aufnahme erkannt" 🙈, aber ich bin jetzt gespannt, was funktioniert 🚀.'
+            }
+          }
+        }
+      })
+    )
+
+    runner.start({ def: def('emoji'), chatModell: 'gpt-4o-mini' })
+    const terminal = await runner.stop()
+
+    expect(terminal.status).toBe('fertig')
+  })
+
+  it('Vollständigkeits-Detektor: calm bleibt AUSGESCHLOSSEN, obwohl Inhaltswörter fehlen (Verdichten ist beabsichtigt)', async () => {
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: { async transcribe() { return ROHTEXT_VORFALL } },
+        rewrite: { async rewrite() { return { text: 'Ich bin jetzt gespannt, was jetzt funktioniert.' } } }
+      })
+    )
+
+    runner.start({ def: def('calm'), chatModell: 'gpt-4o-mini' })
+    const terminal = await runner.stop()
+
+    expect(terminal.status).toBe('fertig')
+  })
+
+  it('Vollständigkeits-Detektor: bei gesetzter ausgabeSprache AUSGESCHLOSSEN (Übersetzung matcht Wörter nie)', async () => {
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: { async transcribe() { return ROHTEXT_VORFALL } },
+        rewrite: {
+          async rewrite() {
+            return { text: 'I am now curious what will work.' }
+          }
+        }
+      })
+    )
+
+    runner.start({
+      def: { ...def('improve'), ausgabeSprache: 'en' },
+      chatModell: 'gpt-4o-mini'
+    })
+    const terminal = await runner.stop()
+
+    expect(terminal.status).toBe('fertig')
+  })
+
+  it('Vollständigkeits-Detektor: custom-Workflow (statisch) bleibt AUSGESCHLOSSEN — Nutzer-Prompts dürfen kürzen', async () => {
+    const customDef = {
+      ...def('improve'),
+      id: 'mein-stichpunkt-workflow',
+      builtin: false,
+      promptModus: 'statisch' as const,
+      systemPrompt: 'Fasse den Text in Stichpunkten zusammen.'
+    }
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: { async transcribe() { return ROHTEXT_VORFALL } },
+        rewrite: { async rewrite() { return { text: 'Gespannt, was funktioniert.' } } }
+      })
+    )
+
+    runner.start({ def: customDef, chatModell: 'gpt-4o-mini' })
+    const terminal = await runner.stop()
+
+    expect(terminal.status).toBe('fertig')
+  })
+
   // --- W1-D: finish_reason='length' (abgeschnitten) → Teil-Erfolg statt vollem Erfolg ---
 
   it('Provider meldet abgeschnitten:true → teilErfolg grund=abgeschnitten (Rohtext gerettet, kein Einfügen)', async () => {

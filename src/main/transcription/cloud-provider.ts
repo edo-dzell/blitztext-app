@@ -8,6 +8,7 @@
 import { asrUnterstuetztTextFormat } from '@shared/providers'
 import { leseFehlerDetail, type AnbieterFehler } from '@main/workflow/fehler-klassifikation'
 import { pruefeAnbieterUrlSicherheit } from '@shared/anbieter-url-guard'
+import { asrPromptText, begriffeFuerAsrPrompt } from '@shared/begriffe'
 
 export interface TranscribeOptions {
   language?: string
@@ -98,9 +99,10 @@ export function createCloudTranscriptionProvider(deps: {
       if (options.language && options.language.trim() !== '') {
         form.append('language', options.language.trim())
       }
-      if (options.vocabularyHints && options.vocabularyHints.length > 0) {
-        form.append('prompt', `Eigennamen und Begriffe: ${options.vocabularyHints.join(', ')}`)
-      }
+      // Terms-Kern: Budget-Guard (Whisper schneidet den prompt-Parameter serverseitig still ab)
+      // + Normalisierung liegen in @shared/begriffe, EINE Quelle für alle Aufrufer.
+      const promptText = asrPromptText(begriffeFuerAsrPrompt(options.vocabularyHints ?? []))
+      if (promptText) form.append('prompt', promptText)
 
       // Eigener Fetch-Timeout (W1-F, unter dem 90s-Runner-Watchdog): kombiniert mit einem etwaig
       // durchgereichten Abbruch-Signal (Nutzer-Abbruch oder Watchdog des Aufrufers), sodass BEIDE

@@ -109,3 +109,81 @@ describe('preload workflowStatus.onChanged (C4, gleiches Muster wie history.onCh
     expect(cb).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('preload sitzung.starteManuell/stoppeManuell (W2-S8, Onboarding-Wizard-Probe)', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    ;(globalThis as unknown as { process: { contextIsolated: boolean } }).process = {
+      ...process,
+      contextIsolated: false
+    }
+  })
+
+  it('starteManuell reicht die workflowId an sitzung:starteManuell weiter', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      sitzung: { starteManuell: (id: string) => Promise<void>; stoppeManuell: () => Promise<void> }
+    }
+
+    await api.sitzung.starteManuell('transcribe')
+
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('sitzung:starteManuell', 'transcribe')
+  })
+
+  it('stoppeManuell ruft sitzung:stoppeManuell ohne Argumente auf', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      sitzung: { starteManuell: (id: string) => Promise<void>; stoppeManuell: () => Promise<void> }
+    }
+
+    await api.sitzung.stoppeManuell()
+
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('sitzung:stoppeManuell')
+  })
+})
+
+describe('preload workflow.export/import (Preset-Datei)', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    ;(globalThis as unknown as { process: { contextIsolated: boolean } }).process = {
+      ...process,
+      contextIsolated: false
+    }
+  })
+
+  it('registriert workflow.export und workflow.import als Funktionen', async () => {
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      workflow: { export: unknown; import: unknown }
+    }
+
+    expect(typeof api.workflow.export).toBe('function')
+    expect(typeof api.workflow.import).toBe('function')
+  })
+
+  it('export reicht die workflowId an workflow:export weiter', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      workflow: { export: (id: string) => Promise<unknown> }
+    }
+
+    await api.workflow.export('custom-123')
+
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('workflow:export', 'custom-123')
+  })
+
+  it('import ruft workflow:import ohne Argumente auf', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      workflow: { import: () => Promise<unknown> }
+    }
+
+    await api.workflow.import()
+
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('workflow:import')
+  })
+})

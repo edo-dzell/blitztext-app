@@ -8,11 +8,13 @@
 // die vier eingebauten Workflows liefern über ihre Seeds exakt die alten Werte (Verhalten unverändert).
 
 import { promptKennungFuer, type WorkflowDefinition } from '@shared/workflows'
+import { begriffeFuerAsrPrompt } from '@shared/begriffe'
 import type { TranscriptionProvider } from '@main/transcription/cloud-provider'
 import type { RewriteProvider } from '@main/rewrite/cloud-provider'
 import type { resolveSystemPrompt, RewriteSettings } from '@main/rewrite/prompt-builder'
 import { kapsleTranskript, entferneTranskriptMarken } from '@main/rewrite/prompt-builder'
 import type { TreueDetektor } from '@main/rewrite/treue-detektor'
+import { wirktUnvollstaendig } from '@shared/vollstaendigkeit'
 import { klassifiziere, type FehlerArt } from '@main/workflow/fehler-klassifikation'
 import { mitRetry } from '@main/workflow/retry'
 
@@ -109,10 +111,11 @@ export interface RunMetrik {
 export type { FehlerArt }
 
 // Warum es zum Teil-Erfolg kam (CONTEXT.md): ein Umschreib-Fehler (Anbieter scheiterte), ein
-// Treue-Befund (das Modell hat das Diktat beantwortet, v0.4.5) ODER der Anbieter hat die Antwort am
-// Token-Limit abgeschnitten (finish_reason='length', W1-D). Alle drei retten den Rohtext, aber die
-// Sitzung meldet sie unterschiedlich (siehe sitzung.ts).
-export type TeilErfolgGrund = 'umschreibfehler' | 'beantwortet' | 'abgeschnitten'
+// Treue-Befund (das Modell hat das Diktat beantwortet, v0.4.5), der Anbieter hat die Antwort am
+// Token-Limit abgeschnitten (finish_reason='length', W1-D) ODER der Vollständigkeits-Detektor hat
+// einen satten Aussagen-Verlust erkannt (v0.7.1 Stufe 3, 5. Vorfallsklasse „Weglassen"). Alle vier
+// retten den Rohtext, aber die Sitzung meldet sie unterschiedlich (siehe sitzung.ts).
+export type TeilErfolgGrund = 'umschreibfehler' | 'beantwortet' | 'abgeschnitten' | 'unvollstaendig'
 
 export type WorkflowPhase =
   | { status: 'idle' }
@@ -167,6 +170,18 @@ const DAUERT_LAENGER_MS = 25_000
 const BEANTWORTET_WARNUNG = 'Endtext wirkt wie eine Antwort auf das Diktat, nicht wie dessen Bearbeitung.'
 // Interner Grund-Vermerk, wenn der Anbieter am Token-Limit abgeschnitten hat (finish_reason='length').
 const ABGESCHNITTEN_WARNUNG = 'Umschreiben wurde vom Modell abgeschnitten (Token-Limit erreicht).'
+// Interner Grund-Vermerk, wenn der Vollständigkeits-Detektor einen Aussagen-Verlust erkannt hat
+// (v0.7.1 Stufe 3, 5. Vorfallsklasse „Weglassen").
+const UNVOLLSTAENDIG_WARNUNG = 'Umschreiben hat Aussagen des Diktats weggelassen.'
+
+// v0.7.1 Stufe 3: Workflow-ids, bei denen der Vollständigkeits-Detektor greift — reine Polier-Semantik
+// (improve glättet nur, emoji poliert „originalgetreu" + Emojis). BEWUSST AUSGESCHLOSSEN: calm hat einen
+// expliziten Verdichtungsauftrag (Tirade → knappe, ruhige Nachricht; Rhetorik/Wiederholung darf
+// schrumpfen) — die Wort-Abdeckungs-Heuristik kann das nicht von echtem Weglassen unterscheiden und
+// würde auf calm eine hohe Fehlalarm-Rate haben. custom/statische Workflows sind ebenfalls ausgeschlossen:
+// ein nutzerdefinierter Prompt darf explizit auf Kürzen/Zusammenfassen zielen (z. B. ein Stichpunkt-
+// Formatierer) — der Detektor kennt diese Nutzer-Absicht nicht und würde legitime Kürzung als Fehler werten.
+const VOLLSTAENDIGKEIT_WORKFLOW_IDS: ReadonlySet<string> = new Set(['improve', 'emoji'])
 
 // Steuerzeichen-Filter (MAL-1, Security-P1, W2-B): Modell-/Transkriptions-Output geht ungefiltert in
 // Zwischenablage + Auto-Paste. Landet der Fokus in einem Terminal, können eingebettete Escape-Sequenzen
@@ -383,8 +398,12 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       // (Erfolg, Fehler, Abbruch), sonst Leak/Fehlfeuern in eine andere Phase (finally deckt alle Pfade ab).
       const stoppeZwischenmeldung = starteZwischenmeldung('transkribieren', istWiederholung)
       try {
-        // Eigennamen nur bei ausreichend langer Aufnahme mitschicken (≥ 0,9 s), wie im Original.
-        const vocabularyHints = recording.durationSeconds >= 0.9 ? input?.customTerms ?? [] : []
+        // Eigennamen nur bei ausreichend langer Aufnahme mitschicken (≥ 0,9 s): ein zusätzlicher
+        // konservativer Guard oberhalb der 0,8s-Artefakt-Staffel aus quality.ts — Whisper kann
+        // Prompt-Vokabular in sehr kurze/stille Clips hineinhalluzinieren. Der Budget-Guard greift
+        // schon hier (defense-in-depth, idempotent — cloud-provider.ts wendet ihn ohnehin nochmal an).
+        const vocabularyHints =
+          recording.durationSeconds >= 0.9 ? begriffeFuerAsrPrompt(input?.customTerms ?? []) : []
         const raw = await mitRetry(
           () =>
             deps.transcription.transcribe(recording.audio, {
@@ -437,6 +456,17 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         // bearbeiten? Dann den (geglückten) Rohtext retten statt falschen Text einzufügen.
         if (deps.treueDetektor?.wirktBeantwortet(rohtext, endtext)) {
           return teilErfolg(rohtext, recording.durationSeconds, BEANTWORTET_WARNUNG, 'beantwortet')
+        }
+        // Vollständigkeits-Detektor (v0.7.1 Stufe 3, 5. Vorfallsklasse „Weglassen"): NUR für die
+        // Polier-Workflows improve/emoji (siehe VOLLSTAENDIGKEIT_WORKFLOW_IDS-Kommentar), NIE bei
+        // gesetzter Ausgabesprache (eine Übersetzung matcht Rohtext-Wörter naturgemäß nie gegen den
+        // fremdsprachigen Endtext — das wäre ein garantierter Fehlalarm, kein Treffer).
+        if (
+          VOLLSTAENDIGKEIT_WORKFLOW_IDS.has(def.id) &&
+          (!def.ausgabeSprache || def.ausgabeSprache.trim() === '') &&
+          wirktUnvollstaendig(rohtext, endtext)
+        ) {
+          return teilErfolg(rohtext, recording.durationSeconds, UNVOLLSTAENDIG_WARNUNG, 'unvollstaendig')
         }
         // V5: Kennung des Prompt-Stands, der DIESEN Endtext erzeugt hat — NUR hier (Umschreib-Erfolg),
         // reine Transkription (unten) bleibt ohne System-Prompt und damit ohne Kennung.
@@ -539,7 +569,8 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   }
 
   // Teil-Erfolg (CONTEXT.md): die Transkription gelang, aber das Umschreiben scheiterte
-  // (grund='umschreibfehler') ODER der Treue-Detektor verwarf den Endtext (grund='beantwortet', v0.4.5).
+  // (grund='umschreibfehler'), der Treue-Detektor verwarf den Endtext (grund='beantwortet', v0.4.5)
+  // ODER der Vollständigkeits-Detektor erkannte einen Aussagen-Verlust (grund='unvollstaendig', v0.7.1).
   // Wie ein fertiger Lauf protokolliert (umgeschrieben=false, endtext=rohtext), aber als eigener
   // Terminal-Zustand, den die Sitzung NICHT einfügt, sondern in die Zwischenablage legt.
   function teilErfolg(

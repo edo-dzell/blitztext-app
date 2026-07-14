@@ -257,6 +257,151 @@ export function promptKennungFuer(
   return `custom:${kurzHash(aufgeloesterPrompt)}`
 }
 
+// --- Workflow-Export/Import als Preset-Datei (später auch Grundlage der Fork-Presets). Bewusst KEINE
+// In-App-Galerie (Nutzer-Entscheid) — nur Datei-Export/Import über einen nativen Speichern/Öffnen-Dialog.
+//
+// W3-F1: Die Hüllen-Typen (`PresetWorkflow`, `PresetDatei`) + `BLITZTEXT_PRESET_VERSION` bleiben HIER
+// in shared (reine Daten, keine @main-Abhängigkeit). Die Export-FUNKTION `workflowZuPreset` lebt aber
+// NICHT hier, sondern in `src/main/rewrite/prompt-builder.ts`. Grund: Ein unveränderter Built-in hat
+// `promptModus==='berechnet'` UND `systemPrompt===''` (der Prompt entsteht erst zur Laufzeit über
+// `berechneterPrompt`/`buildSystemPrompt`). Ein Export MUSS den aufgelösten Klartext mitgeben (Presets
+// sind self-contained; 'berechnet' ist eine Built-in-Eigenschaft, keine portable Prompt-Quelle) — dafür
+// braucht die Export-Funktion `berechneterPrompt`, das in @main/rewrite/prompt-builder sitzt. `shared/`
+// ist laut eslint.config.mjs (D4-Block) richtungsunabhängig und darf @main nicht als WERT importieren
+// (nur Typ-Importe) — ein Import von dort nach hier wäre also ein Lint-Fehler/eine Schichtverletzung.
+// `parseImportierterWorkflow` (Import/Validierung) bleibt HIER in shared, da es ohne prompt-builder
+// auskommt und so auch ohne @main testbar/nutzbar bleibt.
+
+/** Version des Preset-Dateiformats. Erhöhen, falls sich die Hülle/das Feld-Set inkompatibel ändert. */
+export const BLITZTEXT_PRESET_VERSION = 1
+
+/**
+ * Portable Projektion eines Workflows für den Datei-Export. Enthält NUR Felder, die auf einer anderen
+ * Maschine/Installation sinnvoll sind. Absichtlich AUSGESCHLOSSEN:
+ * - id (wird beim Import frisch vergeben, sonst Kollisionsgefahr)
+ * - builtin (ein Import ist nie „eingebaut")
+ * - anbieterId (Anbieter-Konfiguration ist maschinenspezifisch, z. B. eigene Base-URL/API-Keys)
+ * - promptHistorie (rein lokale Bearbeitungshistorie, kein Teil des Presets)
+ * Hotkeys leben in `settings.hotkeys` (Record<WorkflowId, string[]>) und werden bewusst NIE
+ * exportiert — sie sind maschinenspezifisch (Kollisionen mit anderen Chords je Installation).
+ *
+ * W3-F1: `promptModus` ist HIER bewusst nicht mehr Teil des Feld-Sets, das direkt vom Workflow
+ * übernommen wird — `workflowZuPreset` (in @main/rewrite/prompt-builder) erzwingt beim Export IMMER
+ * 'statisch' + den aufgelösten Klartext. Der Typ lässt `PromptModus` trotzdem zu (statt hart auf
+ * 'statisch' zu verengen), weil ältere/fremde Preset-Dateien beim Import (`parseImportierterWorkflow`)
+ * auch 'berechnet' enthalten könnten — das ist eine Lese-/Validierungsfrage, keine Schreib-Garantie.
+ */
+export interface PresetWorkflow {
+  label: string
+  summary: string
+  rewrites: boolean
+  promptModus: PromptModus
+  systemPrompt: string
+  model: string
+  temperature: number
+  language?: string
+  ausgabeSprache?: string
+  tone?: 'formal' | 'neutral' | 'casual'
+  emojiDensity?: 'aus' | 'wenig' | 'mittel' | 'viel'
+}
+
+/** Hülle der Preset-Datei (`*.blitztext.json`). */
+export interface PresetDatei {
+  blitztextPreset: typeof BLITZTEXT_PRESET_VERSION
+  workflow: PresetWorkflow
+}
+
+/**
+ * Erzeugt aus einem Label + der Liste bereits vorhandener Labels ein eindeutiges Label. Frei →
+ * unverändert. Kollision → Suffix „ (importiert)", bei weiterer Kollision „ (importiert 2)", „ (importiert 3)" …
+ */
+export function eindeutigesLabel(label: string, vorhandene: string[]): string {
+  if (!vorhandene.includes(label)) return label
+  const basis = `${label} (importiert)`
+  if (!vorhandene.includes(basis)) return basis
+  let n = 2
+  while (vorhandene.includes(`${label} (importiert ${n})`)) n++
+  return `${label} (importiert ${n})`
+}
+
+// Temperatur-Grenzen für importierte Presets (großzügiger als TEMPERATUR_STUFEN, das nur die
+// Editor-Dropdown-Stufen sind — ein Preset könnte einen abweichenden, aber dennoch gültigen Wert
+// mitbringen). Gängiger Chat-Completion-Bereich ist 0–2.
+const PRESET_TEMPERATUR_MIN = 0
+const PRESET_TEMPERATUR_MAX = 2
+
+function clampTemperatur(t: number): number {
+  if (!Number.isFinite(t)) return NEUER_WORKFLOW_TEMPERATUR
+  return Math.min(PRESET_TEMPERATUR_MAX, Math.max(PRESET_TEMPERATUR_MIN, t))
+}
+
+/**
+ * Validiert eine rohe (untrusted, aus einer Datei gelesene) Preset-Struktur und baut daraus einen
+ * frischen, importierbaren `WorkflowDefinition`. Feldweise defensiv, nach dem Muster von
+ * `parseWorkflow` in `src/main/settings/store.ts` (dort MAIN-lokal, hier eigenständig nachgebaut, da
+ * `shared/` framework-/schichtunabhängig bleibt). Liefert `null`, wenn die Hülle nicht passt
+ * (`blitztextPreset` nicht exakt `BLITZTEXT_PRESET_VERSION`, `workflow` fehlt/kein Objekt) oder gar
+ * kein Objekt hereinkommt.
+ *
+ * - `id`: immer frisch (`custom-<uuid>`) — ein Import ist nie identisch mit einem bestehenden Workflow.
+ * - `builtin`: immer `false` — ein importierter Workflow ist nie „eingebaut".
+ * - `promptModus`: W3-F1 (Gürtel+Hosenträger) — IMMER `'statisch'`, unabhängig davon, was die Datei
+ *   trägt. Ein importierter Workflow ist nie „eingebaut" (s.o.) und `'berechnet'` ist NUR für die vier
+ *   eingebauten Built-ins definiert (`buildSystemPrompt` wirft im default-Zweig bei jeder anderen id) —
+ *   ein `promptModus==='berechnet'` an einem frisch importierten `custom-…`-Workflow würde beim
+ *   nächsten Auflösen abstürzen. Der korrekte Export (`workflowZuPreset`, @main/rewrite/prompt-builder)
+ *   liefert ohnehin immer `'statisch'` + aufgelösten Text; diese Zwangs-Normalisierung fängt zusätzlich
+ *   ältere/kaputte/fremde Preset-Dateien ab (Defense-in-depth, nicht nur Vertrauen in den Schreiber).
+ * - Validierung: `rewrites===true` UND `systemPrompt` fehlt/leer/nur Whitespace → `null` (die Datei
+ *   verspricht einen Umschreibeschritt, kann ihn aber mangels Prompt-Text nicht liefern — genau das
+ *   Muster der alten, kaputten Built-in-Exporte aus dem Fenster vor diesem Fix). Eine Datei mit
+ *   `rewrites===false` (reine Transkription) braucht dagegen keinen Prompt-Text.
+ * - `label`: über `eindeutigesLabel` gegen `vorhandeneLabels` entschärft (Kollisionsschutz).
+ * - `rewrites`: Default `true` (wie `parseWorkflow`: nur ein explizites `false` schaltet reine
+ *   Transkription ein).
+ * - `temperature`: auf `[0, 2]` geclampt; nicht-endliche/fehlende Werte → `NEUER_WORKFLOW_TEMPERATUR`.
+ */
+export function parseImportierterWorkflow(
+  raw: unknown,
+  vorhandeneLabels: string[]
+): WorkflowDefinition | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const huelle = raw as Record<string, unknown>
+  if (huelle.blitztextPreset !== BLITZTEXT_PRESET_VERSION) return null
+  if (typeof huelle.workflow !== 'object' || huelle.workflow === null) return null
+  const o = huelle.workflow as Record<string, unknown>
+
+  const rewrites = o.rewrites !== false
+  const systemPrompt = typeof o.systemPrompt === 'string' ? o.systemPrompt : ''
+  // Gürtel+Hosenträger: ein Umschreibe-Workflow ohne (nutzbaren) Prompt-Text ist eine kaputte/alte
+  // Preset-Datei — sauber ablehnen statt einen Workflow zu erzeugen, der beim ersten Lauf abstürzt.
+  if (rewrites && systemPrompt.trim() === '') return null
+
+  const rohLabel = typeof o.label === 'string' && o.label.trim() !== '' ? o.label : 'Importierter Workflow'
+
+  return {
+    id: `custom-${globalThis.crypto.randomUUID()}`,
+    label: eindeutigesLabel(rohLabel, vorhandeneLabels),
+    summary: typeof o.summary === 'string' ? o.summary : '',
+    builtin: false,
+    rewrites,
+    // Immer 'statisch' — siehe Doku-Kommentar oben (W3-F1).
+    promptModus: 'statisch',
+    systemPrompt,
+    model: typeof o.model === 'string' ? o.model : '',
+    temperature:
+      typeof o.temperature === 'number' ? clampTemperatur(o.temperature) : NEUER_WORKFLOW_TEMPERATUR,
+    language: typeof o.language === 'string' ? o.language : '',
+    ausgabeSprache: typeof o.ausgabeSprache === 'string' ? o.ausgabeSprache : '',
+    ...(['formal', 'neutral', 'casual'].includes(o.tone as string)
+      ? { tone: o.tone as WorkflowDefinition['tone'] }
+      : {}),
+    ...(['aus', 'wenig', 'mittel', 'viel'].includes(o.emojiDensity as string)
+      ? { emojiDensity: o.emojiDensity as WorkflowDefinition['emojiDensity'] }
+      : {})
+  }
+}
+
 /** Weicht ein EINGEBAUTER Workflow in einem Verhaltensfeld vom Werkszustand ab? (steuert Reset-Sichtbarkeit) */
 export function weichtVomWerkAb(w: WorkflowDefinition): boolean {
   if (!w.builtin) return false

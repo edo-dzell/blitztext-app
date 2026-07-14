@@ -12,7 +12,7 @@
 ![Electron](https://img.shields.io/badge/Electron-33-47848F?style=flat-square&logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-087EA4?style=flat-square&logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strikt-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-811%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-949%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
 
 [**⬇️ Download**](https://github.com/edo-dzell/blitztext-app-windows/releases/latest) ·
 [Vergleich zum Original](#-stark-erweitert-windows-port-vs-macos-original) ·
@@ -88,7 +88,12 @@ Idee zur Alltags-App aus:
 | **Sicheres Einfügen** | ✅ Prüft vor dem Einfügen, ob noch dasselbe Fenster im Fokus ist — bei Fokuswechsel wird **nicht** blind getippt, sondern der Text landet in der Zwischenablage mit Hinweis. Steuerzeichen werden gefiltert; Diktate bleiben aus dem Windows-Zwischenablageverlauf | — |
 | **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte) | — |
 | **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis im Tray (kein Auto-Update, keine Telemetrie), ehrlicher Hinweis beim Speichern während einer laufenden Aufnahme | — |
-| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* statt es umzuschreiben, und legt dann den Rohtext in die Zwischenablage statt falschen Text einzufügen), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 811 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* oder stillschweigend Aussagen weglässt statt es originalgetreu umzuschreiben, und weist ehrlich darauf hin statt den Verlust zu verschleiern), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 949 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Wörterbuch** | ✅ Eigene Begriffe (Namen, Fachwörter) per Chips-Editor hinterlegen, damit die Transkription sie korrekt schreibt — inkl. Budget-Anzeige; ein Begriff lässt sich direkt aus dem Verlauf heraus übernehmen | — |
+| **Verlauf: Änderungen zeigen** | ✅ Auf Wunsch ein Wortvergleich zwischen Rohdiktat und umgeschriebenem Text je Verlaufseintrag | — |
+| **Einrichtung** | ✅ Einrichtungs-Assistent führt beim allerersten Start durch Anbieterwahl und API-Key | Manuelle Konfiguration |
+| **Lokale Transkription** | ✅ Eigene Anbieter-Vorlage „Lokal (kein API-Key)“ mit Server-Ampel (zeigt, ob der lokale Endpunkt erreichbar ist) | — |
+| **Workflows teilen** | ✅ Eigene Workflows als Preset-Datei exportieren und bei anderen Installationen wieder importieren | — |
 
 <sup>Vergleich auf Basis des öffentlichen README des Originals (Stand Juni 2026).</sup>
 

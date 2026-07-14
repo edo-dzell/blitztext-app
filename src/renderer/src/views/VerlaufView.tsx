@@ -1,16 +1,20 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { ArrowDownUp } from 'lucide-react'
 import type { BlitztextSettings } from '@main/settings/store'
 import type { VerlaufEintrag } from '@main/history/history-store'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
+import { Field } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
 import ZweiEbenenShell from '@/components/ZweiEbenenShell'
 import { useBestaetigung } from '@/components/Bestaetigung'
 import { useHinweis } from '@/components/Hinweis'
 import { naechsteAuswahl } from '@/lib/verlauf-auswahl'
 import { istNeuesteZuerst, toggleSortierung } from '@/lib/verlauf-sortierung'
+import { wortDiff } from '@/lib/wort-diff'
 import { laufKosten } from '@shared/pricing'
+import { normalisiereBegriffe } from '@shared/begriffe'
 
 interface Props {
   settings: BlitztextSettings
@@ -24,6 +28,15 @@ export default function VerlaufView({ settings, speichern }: Props) {
   // C2: Initial-State aus den persistierten Einstellungen; Umschalten aktualisiert lokal + speichert
   // still (kein Toast bei jedem Klick).
   const [neuesteZuerst, setNeuesteZuerst] = useState(() => istNeuesteZuerst(settings.verlaufSortierung))
+  // Feature #1: Wort-Diff-Toggle im Detail — Default AUS (Nutzer-Entscheid: Standard ist die
+  // klassische Original-vs-Bearbeitet-Ansicht, Diff nur auf Wunsch), pro Eintrag zurückgesetzt
+  // (Reset bei Auswahlwechsel unten), damit eine eingeschaltete Diff-Ansicht nicht "durchsickert",
+  // wenn man einen anderen Eintrag anklickt.
+  const [diffAnzeigen, setDiffAnzeigen] = useState(false)
+  // Korrektur-Loop: Eingabefeld „Begriff ins Wörterbuch" — pro Eintrag zurückgesetzt (gleiches
+  // Muster wie diffAnzeigen oben), damit ein angefangener Begriff nicht am nächsten Eintrag kleben
+  // bleibt.
+  const [begriffEingabe, setBegriffEingabe] = useState('')
   const gesperrt = settings.verlaufGesperrt
   const bestaetige = useBestaetigung()
   const zeige = useHinweis()
@@ -45,6 +58,16 @@ export default function VerlaufView({ settings, speichern }: Props) {
     const abmelden = window.blitztext.history.onChanged(() => void laden())
     return abmelden
   }, [])
+
+  // Diff-Toggle pro Eintrag zurücksetzen (Default: klassische Ansicht, Diff aus).
+  useEffect(() => {
+    setDiffAnzeigen(false)
+  }, [auswahl])
+
+  // Korrektur-Loop: angefangene Wörterbuch-Eingabe pro Eintrag zurücksetzen.
+  useEffect(() => {
+    setBegriffEingabe('')
+  }, [auswahl])
 
   async function umschalten(v: boolean) {
     await speichern({ ...settings, verlaufAktiv: v })
@@ -77,7 +100,36 @@ export default function VerlaufView({ settings, speichern }: Props) {
     zeige('Eintrag gelöscht.', 'erfolg')
   }
 
+  // Korrektur-Loop: falsch erkannten Begriff direkt aus dem Verlauf ins Wörterbuch übernehmen.
+  // Duplikat-Check ist ein trivialer Längenvergleich vor/nach normalisiereBegriffe (case-insensitive,
+  // Erstschreibweise gewinnt — siehe shared/begriffe.ts), kein separater Lookup nötig.
+  async function begriffUebernehmen() {
+    const eingabe = begriffEingabe.trim()
+    if (eingabe === '') return
+    const normalisiert = normalisiereBegriffe([...settings.customTerms, eingabe])
+    if (normalisiert.length === settings.customTerms.length) {
+      zeige(`„${eingabe}" ist bereits im Wörterbuch.`, 'info')
+      return
+    }
+    await speichern({ ...settings, customTerms: normalisiert })
+    zeige(`„${eingabe}" zum Wörterbuch hinzugefügt.`, 'erfolg')
+    setBegriffEingabe('')
+  }
+
   const aktiv = eintraege.find((e) => e.id === auswahl) ?? null
+
+  // W3-F2 (Review-Befund D): wortDiff ist ein O(n·m)-DP über Token-Paare (bis 4000×4000 ≈ 64 MB Uint32Array,
+  // s. MAX_DIFF_TOKENS) — ohne Memoisierung würde JEDER Re-Render von VerlaufView (z. B. durch das
+  // begriffEingabe-Tippen im Feld weiter unten) den Diff neu berechnen, obwohl sich weder der Eintrag noch
+  // der Toggle geändert haben. Nur berechnen, wenn diffAnzeigen an ist UND Roh-/Endtext sich unterscheiden
+  // (sonst ist der Aufruf ohnehin sinnlos, s. Render-Zweig unten); Abhängigkeiten bewusst auf die
+  // Primitiv-Felder beschränkt (nicht das ganze `aktiv`-Objekt), damit ein Referenzwechsel ohne Inhalts-
+  // änderung (z. B. durch `laden()`, das bei jedem Push-Event ein neues Array/Objekt baut) keine
+  // Neuberechnung auslöst.
+  const diff = useMemo(() => {
+    if (!aktiv || !diffAnzeigen || aktiv.rohtext === aktiv.endtext) return null
+    return wortDiff(aktiv.rohtext, aktiv.endtext)
+  }, [aktiv?.id, aktiv?.rohtext, aktiv?.endtext, diffAnzeigen])
   // Der Store liefert neueste zuerst; bei „Älteste zuerst" umdrehen.
   const sortiert = neuesteZuerst ? eintraege : [...eintraege].reverse()
   const band = sortiert.map((e) => ({
@@ -198,20 +250,94 @@ export default function VerlaufView({ settings, speichern }: Props) {
                 </p>
               )
             })()}
-            <div>
-              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Endtext
-              </p>
-              <p className="whitespace-pre-wrap text-sm">{aktiv.endtext}</p>
-            </div>
-            {aktiv.rohtext !== aktiv.endtext && (
+            {aktiv.rohtext !== aktiv.endtext ? (
+              // Nutzer-Entscheid nach HITL (K2, v0.7.1): Standard ist die klassische Zwei-Block-Ansicht
+              // (Endtext + Rohtext) — der Wort-Diff (Feature #1) wird nur auf Wunsch eingeblendet.
+              // `diff` kommt aus dem useMemo oben und ist nur bei diffAnzeigen && Ungleichheit gefüllt.
+              <>
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    {diff ? 'Änderungen' : 'Endtext'}
+                  </p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-xs text-muted-foreground"
+                    onClick={() => setDiffAnzeigen(!diffAnzeigen)}
+                  >
+                    {diff ? 'Änderungen ausblenden' : 'Änderungen zeigen'}
+                  </Button>
+                </div>
+                {diff ? (
+                  <p className="whitespace-pre-wrap text-sm">
+                    {diff.map((tok, idx) => {
+                      if (tok.art === 'gleich') {
+                        return <span key={idx}>{tok.text}</span>
+                      }
+                      if (tok.art === 'entfernt') {
+                        return (
+                          <del key={idx} className="bg-destructive/15 text-destructive line-through">
+                            {tok.text}
+                          </del>
+                        )
+                      }
+                      return (
+                        <ins key={idx} className="bg-success/15 text-success no-underline">
+                          {tok.text}
+                        </ins>
+                      )
+                    })}
+                  </p>
+                ) : (
+                  <>
+                    <p className="whitespace-pre-wrap text-sm">{aktiv.endtext}</p>
+                    <div className="mt-3">
+                      <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        Rohtext
+                      </p>
+                      <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+                        {aktiv.rohtext}
+                      </p>
+                    </div>
+                  </>
+                )}
+              </>
+            ) : (
               <div>
                 <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Rohtext
+                  Endtext
                 </p>
-                <p className="whitespace-pre-wrap text-sm text-muted-foreground">{aktiv.rohtext}</p>
+                <p className="whitespace-pre-wrap text-sm">{aktiv.endtext}</p>
               </div>
             )}
+            {/* Korrektur-Loop: falsch transkribierte Fachbegriffe direkt hier ins Wörterbuch
+                übernehmen — bewusst OHNE Kopier-/Re-Run-/Popover-Mechanik, nur der Wörterbuch-Eintrag
+                selbst (Nutzer-Entscheid). Klar abgesetzt von Diff/Text oben und vom Lösch-Button unten. */}
+            <div className="mt-1 border-t pt-3">
+              <Field
+                label="Begriff ins Wörterbuch"
+                hint="Korrekte Schreibweise eines falsch erkannten Begriffs — wird bei künftigen Aufnahmen berücksichtigt."
+              >
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={begriffEingabe}
+                    placeholder="z. B. Produktname, Eigenname, Fachbegriff"
+                    onChange={(e) => setBegriffEingabe(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') void begriffUebernehmen()
+                    }}
+                  />
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={begriffEingabe.trim() === ''}
+                    onClick={begriffUebernehmen}
+                  >
+                    Hinzufügen
+                  </Button>
+                </div>
+              </Field>
+            </div>
             <div className="pt-1">
               <Button variant="destructive" size="sm" onClick={() => loescheEintrag(aktiv.id)}>
                 Diesen Eintrag löschen

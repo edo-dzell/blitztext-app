@@ -80,6 +80,34 @@ describe('createCloudTranscriptionProvider', () => {
     expect(body?.get('prompt')).toBeNull()
   })
 
+  it('Terms-Kern: Leerstrings/Duplikate in vocabularyHints erzeugen keinen ", ,"-String im prompt', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response('ok', { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({ getApiKey: async () => 'sk', fetchFn })
+
+    await provider.transcribe(audioBlob(), {
+      vocabularyHints: ['Acme', '', '  ', 'GmbH', 'acme']
+    })
+
+    expect(body?.get('prompt')).toBe('Eigennamen und Begriffe: Acme, GmbH')
+  })
+
+  it('lässt den prompt weg, wenn vocabularyHints nur aus Leerstrings besteht', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response('ok', { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({ getApiKey: async () => 'sk', fetchFn })
+
+    await provider.transcribe(audioBlob(), { vocabularyHints: ['', '   '] })
+
+    expect(body?.get('prompt')).toBeNull()
+  })
+
   it('wirft ohne API-Key und ruft fetch gar nicht erst auf', async () => {
     let called = false
     const fetchFn = (async () => {

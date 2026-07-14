@@ -22,6 +22,7 @@ import WorkflowsView from './views/workflows/WorkflowsView'
 import VerlaufView from './views/VerlaufView'
 import StatistikView from './views/StatistikView'
 import HilfeView from './views/HilfeView'
+import OnboardingWizard from './components/OnboardingWizard'
 
 // Dashboard-Shell (ADR-0009, V2): Sidebar-Navigation + Inhaltsbereich, dark-first. Lädt die
 // Einstellungen einmal und reicht sie (samt Speichern) an die Bereiche; Speichern persistiert über IPC
@@ -48,6 +49,13 @@ export default function App() {
   const [section, setSection] = useState<Section>('home')
   const [settings, setSettings] = useState<BlitztextSettings | null>(null)
   const [hilfeTopic, setHilfeTopic] = useState<string | undefined>(undefined)
+  // W3-F2 (Review-Befund B): solange der Onboarding-Wizard sichtbar ist, liegt die restliche Shell
+  // (Sidebar + Inhaltsbereich) VERDECKT darunter, ist aber weiterhin im DOM und damit Tab-erreichbar —
+  // ohne Schutz wandert Tab aus dem Wizard-Overlay heraus in die verdeckte Sidebar. `inert` ist hier der
+  // einfachste Fix (statt einer manuellen Tab-Falle wie in Bestaetigung.tsx/fokus-falle.ts): es entfernt
+  // die Shell komplett aus der Tab-Reihenfolge UND aus der Accessibility-Tree, solange der Wizard offen
+  // ist. Wird unten VOR dem Rendern von OnboardingWizard ausgewertet.
+  const wizardSichtbar = settings !== null && !settings.onboardingAbgeschlossen
 
   useTheme(settings?.theme)
   const workflowStatus = useWorkflowStatus()
@@ -120,7 +128,10 @@ export default function App() {
 
   return (
     <div className="flex h-full bg-background text-foreground">
-      <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
+      <aside
+        inert={wizardSichtbar}
+        className="flex w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground"
+      >
         <div className="px-5 py-5 text-lg font-semibold tracking-tight">
           Blitztext <span className="text-sm font-normal text-muted-foreground">für Windows</span>
         </div>
@@ -128,7 +139,7 @@ export default function App() {
         <nav className="flex flex-col gap-1 px-2 pb-3">{renderNav(NAV_BOTTOM)}</nav>
       </aside>
 
-      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main inert={wizardSichtbar} className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex shrink-0 items-center justify-between border-b px-8 py-5">
           <h1 className="text-xl font-semibold tracking-tight">{TITEL[section]}</h1>
           <div className="flex items-center gap-3">
@@ -186,6 +197,15 @@ export default function App() {
           </div>
         )}
       </main>
+      {/* W2-S8: Fullscreen-Overlay, solange der Wizard nicht abgeschlossen/übersprungen wurde. Minimal-
+          invasiv über der bestehenden Shell gerendert (KEINE neue Sidebar-Section). */}
+      {wizardSichtbar && (
+        <OnboardingWizard
+          settings={settings}
+          speichern={speichern}
+          onAbschluss={() => void speichern({ ...settings, onboardingAbgeschlossen: true })}
+        />
+      )}
     </div>
   )
 }

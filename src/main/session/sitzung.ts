@@ -1,7 +1,7 @@
 // Die Sitzung (CONTEXT.md): app-langlebige zentrale Steuerung. Nimmt eine Auslösung
 // (Workflow + Auslösequelle) entgegen, führt damit genau einen Workflow über den workflow-runner
 // aus und routet das Ergebnis — bei Hotkey ins Einfügen, bei manueller Quelle in die Anzeige.
-// Pendant zu macOS AppState, aber ohne UI/OS-Wissen: Ausgabe + Eingang liegen hinter Nähten.
+// Pendant zu macOS AppState, aber ohne UI/OS-Wissen: die Ausgabe liegt hinter einer Naht.
 
 import { findWorkflow, type WorkflowId } from '@shared/workflows'
 import { aufloeseWorkflowLauf, type AnbieterKonfig } from '@shared/anbieter'
@@ -196,6 +196,7 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       if (veraltet()) return
       aktiverFokusKontext =
         quelle === 'hotkey' ? { fokusRueckkehr: settings.fokusRueckkehr, erfasstesHwnd } : null
+
       deps.runner.start({
         def,
         chatModell: lauf.chatModell,
@@ -269,14 +270,20 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   }
 
   // Routet einen Terminal-Zustand des Runners auf die Ausgabe. Von stoppe() (frischer Lauf) UND
-  // erneutVersuchen() (W3-B, gehaltenes Audio) geteilt — identisches Verhalten. Merkt den Lauf für
-  // einen etwaigen Retry (letzterLauf); ein 'fertig' verwirft die Audio-Basis (Runner räumt selbst).
+  // erneutVersuchen() (W3-B, gehaltenes Audio) geteilt — identisches Verhalten. Guard (defensiv):
+  // NUR bei einer echten Terminal-Phase weiterlaufen — 'aufnehmen'/'transkribieren'/'umschreiben'/
+  // 'idle' sind hier kein gültiger Abschluss (der Phantom-Stop-Schutz im Runner kann sonst einfach die
+  // AKTUELLE, noch nicht-terminale Phase zurückliefern). Merkt den Lauf für einen etwaigen Retry
+  // (letzterLauf); ein 'fertig' verwirft die Audio-Basis (Runner räumt selbst).
   function verarbeiteTerminal(
     terminal: WorkflowPhase,
     quelle: Auslösequelle,
     kontext: { label: string; asrModell: string; chatModell: string } | null,
     fokusKontext: EinfügeKontext | null
   ): void {
+    if (terminal.status !== 'fertig' && terminal.status !== 'teilErfolg' && terminal.status !== 'fehler') {
+      return
+    }
     letzterLauf = { quelle, kontext, fokusKontext }
     if (terminal.status === 'fertig') {
       // Weg B (W3-A): beim Hotkey den Fokus-Kontext mitreichen → der Adapter degradiert bei Drift.

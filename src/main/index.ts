@@ -9,10 +9,12 @@ import {
   screen,
   nativeTheme,
   powerMonitor,
-  shell
+  shell,
+  dialog
 } from 'electron'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
+import { writeFile, readFile } from 'node:fs/promises'
 import { validateApiKey } from './secrets'
 import {
   createApiKeyVault,
@@ -42,6 +44,11 @@ import { pillenStatus } from '@main/window/pill-status'
 import { istAbbruchOderTimeout } from '@main/session/abbruch-guard'
 import { createSettingsStore, type BlitztextSettings, type ApiKeyStatus } from '@main/settings/store'
 import { sendeAn } from '@main/window/send-to-window'
+// W3-F1: `workflowZuPreset` zog von @shared/workflows nach @main/rewrite/prompt-builder um (braucht
+// `berechneterPrompt`, um den Prompt-Text eines unveränderten Built-ins aufzulösen statt '' zu
+// exportieren — shared darf @main nicht als Wert importieren, siehe Kommentar in workflows.ts).
+import { workflowZuPreset } from '@main/rewrite/prompt-builder'
+import { parseImportierterWorkflow } from '@shared/workflows'
 
 // Prozessweiter Wächter (#03): ein abgebrochener/getimeouteter Anbieter-fetch (undici) kann eine
 // unhandledRejection erzeugen (RESEARCH R1). NUR Abbruch/Timeout schlucken — echte Bugs eskalieren
@@ -398,6 +405,107 @@ function registerIpc(apiKeys: ApiKeyVault, comp: MainComposition): void {
         : 0
     return comp.diagnose(anzahl)
   })
+
+  // S4 (lokales ASR „Server prüfen"): Erreichbarkeits-Check für einen bestimmten Anbieter (Einstellungen-
+  // Karte). Eingabe defensiv validieren (untrusted Renderer), gleiches Muster wie health:diagnose oben.
+  ipcMain.handle('anbieter:pruefeErreichbarkeit', (_event, anbieterId: unknown) => {
+    if (typeof anbieterId !== 'string' || anbieterId.trim() === '') {
+      return {
+        status: 'fehler' as const,
+        titel: 'Anbieter-Erreichbarkeit',
+        detail: 'Unbekannter Anbieter — bitte Einstellungen neu laden.'
+      }
+    }
+    return comp.pruefeErreichbarkeitFuer(anbieterId)
+  })
+
+  // W2-S8 (Onboarding-Wizard, Probe-Schritt): manuelles Auslösen/Stoppen eines Workflows über IPC statt
+  // Hotkey — der Wizard hat keinen Zugriff auf den globalen uiohook-Kanal. Eingabe defensiv validieren
+  // (untrusted Renderer); der eigentliche Fortschritt kommt wie beim Hotkey über workflow:status
+  // (comp.sitzung.onStatus, oben verdrahtet) — beide Handler resolven daher sofort (void), ohne auf den
+  // Lauf zu warten (analog zum bisherigen Tray-„Abbrechen"/manuellen Auslösen).
+  ipcMain.handle('sitzung:starteManuell', (_event, workflowId: unknown) => {
+    if (typeof workflowId !== 'string' || workflowId.trim() === '') return
+    void comp.sitzung.starteWorkflow(workflowId, 'manuell')
+  })
+  ipcMain.handle('sitzung:stoppeManuell', () => {
+    void comp.sitzung.stoppe()
+  })
+
+  // Workflow-Export/Import als Preset-Datei (*.blitztext.json). Bewusst KEINE In-App-Galerie
+  // (Nutzer-Entscheid) — nur Datei-Export/Import über native Speichern/Öffnen-Dialoge. Der Renderer
+  // schickt beim Export nur die id (nicht das ganze Objekt) — Main hat über comp.einstellungen.load()
+  // die Wahrheit über den aktuellen Workflow-Stand. KEIN Store-Write in diesen Handlern: der Renderer
+  // übernimmt einen importierten Workflow über den normalen settings:save-Weg (Live-Reconfigure-Schutz
+  // bleibt an einer Stelle gebündelt, statt hier einen zweiten Schreibpfad aufzumachen).
+  ipcMain.handle('workflow:export', async (_event, workflowId: unknown) => {
+    if (typeof workflowId !== 'string' || workflowId.trim() === '') {
+      return { ok: false as const, grund: 'unbekannt' as const }
+    }
+    const settings = await comp.einstellungen.load()
+    const workflow = settings.workflows.find((w) => w.id === workflowId)
+    if (!workflow) return { ok: false as const, grund: 'unbekannt' as const }
+
+    const preset = workflowZuPreset(workflow)
+    const dateiname = `${sanitisiereDateiname(workflow.label) || 'workflow'}.blitztext.json`
+    const dialogOptionen = {
+      defaultPath: dateiname,
+      filters: [{ name: 'Blitztext-Preset', extensions: ['json'] }]
+    }
+    const result = settingsWindow
+      ? await dialog.showSaveDialog(settingsWindow, dialogOptionen)
+      : await dialog.showSaveDialog(dialogOptionen)
+    if (result.canceled || !result.filePath) {
+      return { ok: false as const, grund: 'abgebrochen' as const }
+    }
+    try {
+      await writeFile(result.filePath, JSON.stringify(preset, null, 2), 'utf-8')
+      return { ok: true as const, pfad: result.filePath }
+    } catch {
+      return { ok: false as const, grund: 'schreibfehler' as const }
+    }
+  })
+
+  ipcMain.handle('workflow:import', async () => {
+    const dialogOptionen: Electron.OpenDialogOptions = {
+      properties: ['openFile'],
+      filters: [{ name: 'Blitztext-Preset', extensions: ['json'] }]
+    }
+    const result = settingsWindow
+      ? await dialog.showOpenDialog(settingsWindow, dialogOptionen)
+      : await dialog.showOpenDialog(dialogOptionen)
+    if (result.canceled || result.filePaths.length === 0) {
+      return { ok: false as const, grund: 'abgebrochen' as const }
+    }
+    let inhalt: string
+    try {
+      inhalt = await readFile(result.filePaths[0]!, 'utf-8')
+    } catch {
+      return { ok: false as const, grund: 'lesefehler' as const }
+    }
+    let rohdaten: unknown
+    try {
+      rohdaten = JSON.parse(inhalt)
+    } catch {
+      return { ok: false as const, grund: 'ungueltig' as const }
+    }
+    const settings = await comp.einstellungen.load()
+    const vorhandeneLabels = settings.workflows.map((w) => w.label)
+    const workflow = parseImportierterWorkflow(rohdaten, vorhandeneLabels)
+    if (!workflow) return { ok: false as const, grund: 'ungueltig' as const }
+    return { ok: true as const, workflow }
+  })
+}
+
+// Für den Preset-Dateinamen: Label auf ein dateisystemsicheres Zeichenrepertoire reduzieren
+// (Windows verbietet u. a. \/:*?"<>|). Mehrfach-Whitespace/Trenner zu einem einzelnen Bindestrich,
+// führende/folgende Bindestriche weg. Leeres Ergebnis wird vom Aufrufer auf 'workflow' zurückgefallen.
+function sanitisiereDateiname(label: string): string {
+  return label
+    .replace(/[\\/:*?"<>|]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
 }
 
 const gotTheLock = app.requestSingleInstanceLock()

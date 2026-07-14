@@ -191,4 +191,12 @@ describe('pricing', () => {
       expect(registryIds.has(id)).toBe(true)
     }
   })
+
+  // --- S4: lokales ASR ('lokal'-Vorlage) ist bewusst OHNE Preis-Angabe — Regressionsschutz gegen
+  // einen versehentlich ergänzten Preis (lokal = "keine Schätzung möglich", nicht "kostenlos"). ---
+
+  it("PREISE enthält 'Systran/faster-whisper-small' NICHT (lokal = keine Kostenschätzung)", () => {
+    expect(PREISE['Systran/faster-whisper-small']).toBeUndefined()
+    expect(asrKostenUsd('Systran/faster-whisper-small', 60)).toBeNull()
+  })
 })

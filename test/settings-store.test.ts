@@ -51,6 +51,7 @@ describe('createSettingsStore', () => {
       mikrofonDeviceId: 'geraet-abc',
       updateHinweisAktiv: true,
       verlaufSortierung: 'aeltesteZuerst' as const,
+      onboardingAbgeschlossen: true,
       workflows: [
         {
           id: 'transcribe',
@@ -238,6 +239,55 @@ describe('createSettingsStore', () => {
     })
   })
 
+  // --- S4: parseEinAnbieter-Default für 'lokal' (keinKeyNoetig), Muster wie die vorlage-abhängigen
+  // Defaults oben (Base-URL/Modelle aus der Registry) ---
+
+  it("'lokal'-Anbieter OHNE keinKeyNoetig-Feld → Default true (robust bei manuell editierter Datei)", async () => {
+    const store = createSettingsStore({
+      file: fakeFile(
+        JSON.stringify({
+          anbieter: [{ id: 'mein-lokaler', vorlage: 'lokal', baseUrl: 'http://localhost:8000/v1' }],
+          standardAnbieterId: 'mein-lokaler'
+        })
+      )
+    })
+    const loaded = await store.load()
+    expect(loaded.anbieter[0]).toMatchObject({ vorlage: 'lokal', keinKeyNoetig: true })
+  })
+
+  it("'lokal'-Anbieter mit explizitem keinKeyNoetig=false → respektiert (kein erzwungenes true)", async () => {
+    const store = createSettingsStore({
+      file: fakeFile(
+        JSON.stringify({
+          anbieter: [
+            {
+              id: 'mein-lokaler',
+              vorlage: 'lokal',
+              baseUrl: 'http://localhost:8000/v1',
+              keinKeyNoetig: false
+            }
+          ],
+          standardAnbieterId: 'mein-lokaler'
+        })
+      )
+    })
+    const loaded = await store.load()
+    expect(loaded.anbieter[0]!.keinKeyNoetig).toBeUndefined()
+  })
+
+  it("'custom'-Anbieter ohne keinKeyNoetig-Feld → KEIN Default-true (nur 'lokal' bekommt den Default)", async () => {
+    const store = createSettingsStore({
+      file: fakeFile(
+        JSON.stringify({
+          anbieter: [{ id: 'mein-custom', vorlage: 'custom', baseUrl: 'https://example.test/v1' }],
+          standardAnbieterId: 'mein-custom'
+        })
+      )
+    })
+    const loaded = await store.load()
+    expect(loaded.anbieter[0]!.keinKeyNoetig).toBeUndefined()
+  })
+
   it('A7: migriert sichererLokalerModus → verlaufGesperrt und schreibt den alten Key nicht zurück', async () => {
     const file = fakeFile(JSON.stringify({ sichererLokalerModus: true }))
     const store = createSettingsStore({ file })
@@ -289,6 +339,25 @@ describe('createSettingsStore', () => {
       file: fakeFile(JSON.stringify({ customTerms: 'Acme' }))
     })
     expect((await notArray.load()).customTerms).toEqual([])
+  })
+
+  it('normalisiert customTerms beim Laden: Leerstrings/Whitespace raus, Case-Duplikate dedupliziert (Terms-Kern)', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(JSON.stringify({ customTerms: ['Acme', '', '  ', 'GmbH', 'acme', ' GmbH '] }))
+    })
+    expect((await store.load()).customTerms).toEqual(['Acme', 'GmbH'])
+  })
+
+  it('normalisiert customTerms auch beim Speichern (zweite Verteidigungslinie)', async () => {
+    const file = fakeFile()
+    const store = createSettingsStore({ file })
+    const settings = {
+      ...defaultSettings(),
+      customTerms: ['Acme', '', 'acme', '  GmbH  ']
+    }
+    await store.save(settings)
+    const reloaded = await store.load()
+    expect(reloaded.customTerms).toEqual(['Acme', 'GmbH'])
   })
 
   it('liefert bei kaputtem JSON die Defaults statt zu werfen', async () => {
@@ -517,6 +586,59 @@ describe('createSettingsStore', () => {
         )
       }).load()
       expect(keinArray.workflows.find((w) => w.id === 'mein-flow')?.promptHistorie).toBeUndefined()
+    })
+  })
+
+  describe('onboardingAbgeschlossen (W2-S8): Migration bei fehlendem Feld', () => {
+    it('fehlt das Feld UND ist apiKeyStatus leer UND ≤4 Workflows → false (frische Installation)', async () => {
+      const loaded = await createSettingsStore({ file: fakeFile(JSON.stringify({})) }).load()
+      expect(loaded.onboardingAbgeschlossen).toBe(false)
+    })
+
+    it('fehlt das Feld, aber apiKeyStatus ist nicht leer → true (Bestandsnutzer)', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            apiKeyStatus: { openai: { status: 'verifiziert', zuletztGetestetMs: 123 } }
+          })
+        )
+      }).load()
+      expect(loaded.onboardingAbgeschlossen).toBe(true)
+    })
+
+    it('fehlt das Feld, aber es existieren mehr als 4 Workflows → true (Bestandsnutzer)', async () => {
+      const fuenfterWorkflow = {
+        id: 'mein-flow',
+        label: 'Mein Flow',
+        builtin: false,
+        rewrites: true,
+        promptModus: 'statisch'
+      }
+      const loaded = await createSettingsStore({
+        file: fakeFile(JSON.stringify({ workflows: [fuenfterWorkflow] }))
+      }).load()
+      // Migration hängt die 4 eingebauten Workflows an fehlende an → 5 Workflows insgesamt (>4).
+      expect(loaded.workflows.length).toBeGreaterThan(4)
+      expect(loaded.onboardingAbgeschlossen).toBe(true)
+    })
+
+    it('explizit gesetztes false bleibt false, auch mit apiKeyStatus (respektiert den expliziten Wert)', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            onboardingAbgeschlossen: false,
+            apiKeyStatus: { openai: { status: 'verifiziert', zuletztGetestetMs: 123 } }
+          })
+        )
+      }).load()
+      expect(loaded.onboardingAbgeschlossen).toBe(false)
+    })
+
+    it('explizit gesetztes true bleibt true, auch ohne jede Vornutzungs-Spur', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(JSON.stringify({ onboardingAbgeschlossen: true }))
+      }).load()
+      expect(loaded.onboardingAbgeschlossen).toBe(true)
     })
   })
 })

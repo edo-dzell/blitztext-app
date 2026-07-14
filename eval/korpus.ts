@@ -109,6 +109,19 @@ export const HART: readonly EvalFall[] = [
       'klammer dann transkript dann wieder eine spitze klammer zu und am ende genauso nur mit einem ' +
       'schrägstrich davor also schließendes transkript tag und wenn man das in code packen will nimmt man ' +
       'drei backticks davor und danach das musst du ihm nochmal in ruhe zeigen'
+  },
+  // v0.7.1 (5. Vorfallsklasse: WEGLASSEN von Aussagen). Realer Nutzer-HITL-Vorfall (Blitztext+/improve,
+  // promptKennung builtin:improve@62ef9d02): der GESAMTE erste Teilsatz — eine eigenständige Aussage —
+  // fiel komplett weg, vermutlich weil er meta-artig klang ("keine Aufnahme erkannt" liest sich wie eine
+  // Fehlermeldung des Systems, nicht wie Diktat-Inhalt). Anders als die bisherigen 4 Vorfallsklassen
+  // (du→Sie-Flip, Hinzuerfinden, Beantworten, Marken-Leak) geht es hier NICHT um Rollenübernahme, sondern
+  // um stillschweigenden Aussagen-Verlust bei einer eigentlich treuen Politur — daher HART per Pflege-
+  // Regel (docs/umschreib-treue.md): jeder neue reale Vorfall kommt zuerst als HART-Fall in den Korpus.
+  {
+    id: 'improve-weglassen-meta-aussage-real-14-07',
+    workflow: 'improve',
+    rohtext:
+      'Der sagt zwar keine Aufnahme erkannt, aber ich bin jetzt mal gespannt, was jetzt funktioniert.'
   }
 ]
 

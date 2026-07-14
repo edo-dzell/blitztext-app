@@ -84,7 +84,9 @@ describe('createProtokoll', () => {
         dauerSekunden: 2.5,
         asrModell: 'whisper-1',
         chatModell: 'gpt-4o-mini',
-        usage: { promptTokens: 10, completionTokens: 20 }
+        usage: { promptTokens: 10, completionTokens: 20 },
+        // V5: durchgereichte Prompt-Kennung (hier keine, da `basis` sie nicht setzt).
+        promptKennung: undefined
       }
     ])
     expect(s.nutzungen).toEqual([

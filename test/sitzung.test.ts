@@ -880,4 +880,14 @@ describe('createSitzung', () => {
     sitzung.brichAb()
     await stopP
   })
+
+  it('verarbeiteTerminal-Guard: eine nicht-terminale Phase (z. B. umschreiben) löst NICHTS aus', async () => {
+    // Regressionsschutz für den Guard in verarbeiteTerminal (nur fertig/teilErfolg/fehler laufen durch).
+    // Simuliert über den normalen stoppe()-Pfad: Desync-Schutz + Guard zusammen bedeuten, dass ein
+    // stoppe() ohne aktiven Lauf (aktiveQuelle bereits null) gar nicht erst bis verarbeiteTerminal kommt.
+    const { sitzung, calls } = makeSitzung({ transcript: 'hallo' })
+    await sitzung.stoppe() // kein aktiver Lauf → Desync-Guard greift zuerst
+    expect(calls.einfügen).toEqual([])
+    expect(calls.anzeigen).toEqual([])
+  })
 })

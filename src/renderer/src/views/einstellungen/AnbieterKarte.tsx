@@ -2,11 +2,13 @@ import { useEffect, useState } from 'react'
 import { Trash2 } from 'lucide-react'
 import type { AnbieterKonfig } from '@shared/anbieter'
 import { getProvider, modelleFuerVorlage } from '@shared/providers'
+import type { HealthErgebnis } from '@main/health'
 import { istSichereAnbieterUrl } from '@/lib/anbieter-url-guard'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
 import { Field, Separator } from '@/components/ui/field'
 import { useHinweis } from '@/components/Hinweis'
 import { useNavGuard } from '@/components/NavGuard'
@@ -35,7 +37,20 @@ export default function AnbieterKarte({
   const [keyInput, setKeyInput] = useState('')
   const [keyBusy, setKeyBusy] = useState(false)
   const [keyFehler, setKeyFehler] = useState<string | null>(null)
+  // S4 (lokales ASR „Server prüfen"): Erreichbarkeits-Ampel für DIESEN Anbieter, unabhängig vom
+  // Standard-Anbieter (die Selbstdiagnose auf der Übersicht prüft nur den Standard).
+  const [erreichbarkeit, setErreichbarkeit] = useState<HealthErgebnis | null>(null)
+  const [erreichbarkeitBusy, setErreichbarkeitBusy] = useState(false)
   const { registriereDirty } = useNavGuard()
+
+  async function pruefeServer() {
+    setErreichbarkeitBusy(true)
+    setErreichbarkeit(await window.blitztext.anbieter.pruefeErreichbarkeit(anbieter.id))
+    setErreichbarkeitBusy(false)
+  }
+
+  const ampelFarbe = (s: HealthErgebnis['status']) =>
+    s === 'ok' ? 'bg-emerald-500' : s === 'warnung' ? 'bg-amber-500' : 'bg-red-500'
 
   useEffect(() => {
     void window.blitztext.apiKey.maske(anbieter.id).then(setMaske)
@@ -120,6 +135,18 @@ export default function AnbieterKarte({
         </Field>
       )}
 
+      {istCustom && (
+        <Field
+          label="Kein API-Key nötig"
+          hint="Für lokale/keylose Server (z. B. Speaches, whisper.cpp) — sendet keinen Authorization-Header."
+        >
+          <Switch
+            checked={anbieter.keinKeyNoetig === true}
+            onCheckedChange={(checked) => aendere({ keinKeyNoetig: checked })}
+          />
+        </Field>
+      )}
+
       <div className="grid grid-cols-2 gap-4">
         <Field label="ASR-Modell" hint="Modell für die Transkription (Sprache → Text).">
           {asr.length > 0 ? (
@@ -158,27 +185,45 @@ export default function AnbieterKarte({
       </div>
 
       <Separator />
-      <Field
-        label="API-Key"
-        hint={maske ? `Gespeichert: ${maske}…` : 'Wird verschlüsselt im Benutzerprofil gespeichert (DPAPI).'}
-      >
+      {anbieter.keinKeyNoetig !== true && (
+        <Field
+          label="API-Key"
+          hint={maske ? `Gespeichert: ${maske}…` : 'Wird verschlüsselt im Benutzerprofil gespeichert (DPAPI).'}
+        >
+          <div className="flex items-center gap-2">
+            <Input
+              type="password"
+              placeholder={maske ? 'Neuen Key eingeben (ersetzt)' : 'sk-…'}
+              value={keyInput}
+              onChange={(e) => {
+                setKeyInput(e.target.value)
+                setKeyFehler(null)
+              }}
+              disabled={keyBusy}
+            />
+            <Button size="sm" onClick={speichereKey} disabled={keyBusy || keyInput.trim() === ''}>
+              {keyBusy ? 'Teste…' : 'Testen & speichern'}
+            </Button>
+          </div>
+        </Field>
+      )}
+      {keyFehler && <p className="text-xs text-destructive">{keyFehler}</p>}
+
+      {/* S4: Erreichbarkeits-Ampel für DIESEN Anbieter — v. a. fürs lokale ASR gedacht (Server evtl.
+          nicht gestartet), aber für jeden Anbieter nutzbar. */}
+      <Field label="Erreichbarkeit" hint="Prüft, ob der Server unter der Base-URL antwortet.">
         <div className="flex items-center gap-2">
-          <Input
-            type="password"
-            placeholder={maske ? 'Neuen Key eingeben (ersetzt)' : 'sk-…'}
-            value={keyInput}
-            onChange={(e) => {
-              setKeyInput(e.target.value)
-              setKeyFehler(null)
-            }}
-            disabled={keyBusy}
-          />
-          <Button size="sm" onClick={speichereKey} disabled={keyBusy || keyInput.trim() === ''}>
-            {keyBusy ? 'Teste…' : 'Testen & speichern'}
+          <Button size="sm" variant="secondary" onClick={pruefeServer} disabled={erreichbarkeitBusy}>
+            {erreichbarkeitBusy ? 'Prüfe…' : 'Server prüfen'}
           </Button>
+          {erreichbarkeit && (
+            <span className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span className={`size-2.5 shrink-0 rounded-full ${ampelFarbe(erreichbarkeit.status)}`} />
+              {erreichbarkeit.detail}
+            </span>
+          )}
         </div>
       </Field>
-      {keyFehler && <p className="text-xs text-destructive">{keyFehler}</p>}
     </div>
   )
 }

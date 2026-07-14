@@ -60,7 +60,8 @@ const INHALTE: Record<string, Inhalt> = {
     titel: 'Einstellungen',
     absaetze: [
       'Hier verwaltest du Anbieter und API-Keys, Sprache und eigene Begriffe, den Aufnahmemodus, den Datenschutz (Sicherer Lokaler Modus) und das Farbschema.',
-      'Änderungen werden mit „Einstellungen speichern" übernommen. API-Keys werden je Anbieter sofort und separat gespeichert (verschlüsselt im Benutzerprofil).'
+      'Änderungen werden mit „Einstellungen speichern" übernommen. API-Keys werden je Anbieter sofort und separat gespeichert (verschlüsselt im Benutzerprofil).',
+      'Lokales ASR (ohne Cloud): Vorlage „Lokal" wählen, den lokalen Server starten (z. B. Speaches, Standard-Adresse localhost:8000, Modell faster-whisper-small), dann auf „Server prüfen" klicken — zeigt grün, sobald der Server antwortet. Lokal deckt nur die Transkription ab: fürs Umschreiben braucht der Workflow weiterhin einen Chat-fähigen Anbieter.'
     ],
     punkte: [
       'Verlässt du eine Seite mit ungespeicherten Änderungen, fragt Blitztext nach.',

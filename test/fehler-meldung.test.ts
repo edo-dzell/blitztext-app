@@ -45,6 +45,14 @@ describe('teilErfolgMeldung (v0.4.5)', () => {
     expect(m.koerper).toContain('Zwischenablage')
     expect(m.aktion).toBeUndefined()
   })
+
+  // v0.7.1 Stufe 3 (5. Vorfallsklasse „Weglassen"): Vollständigkeits-Detektor.
+  it('unvollstaendig → benennt das Weglassen, verweist auf die Zwischenablage', () => {
+    const m = teilErfolgMeldung('unvollstaendig')
+    expect(m.koerper).toContain('weggelassen')
+    expect(m.koerper).toContain('Zwischenablage')
+    expect(m.aktion).toBeUndefined()
+  })
 })
 
 describe('fokusDriftMeldung (W3-A, ADR-0011 Weg B)', () => {

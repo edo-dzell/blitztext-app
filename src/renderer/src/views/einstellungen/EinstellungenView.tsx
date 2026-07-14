@@ -6,7 +6,6 @@ import { PROVIDER, getProvider } from '@shared/providers'
 import { SPRACHEN } from '@shared/sprachen'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Field } from '@/components/ui/field'
@@ -16,6 +15,7 @@ import { useNavGuard } from '@/components/NavGuard'
 import { einstellungenGeaendert } from '@/lib/dirty'
 import AnbieterKarte from './AnbieterKarte'
 import MikrofonFeld from './MikrofonFeld'
+import BegriffeFeld from './BegriffeFeld'
 import AutostartKarte from './AutostartKarte'
 import UpdateKarte from './UpdateKarte'
 import DiagnoseKarte from './DiagnoseKarte'
@@ -164,20 +164,11 @@ export default function EinstellungenView({ settings, speichern }: Props) {
           </Field>
           <Field
             label="Eigene Begriffe"
-            hint="Eigennamen/Fachbegriffe, durch Komma getrennt — verbessert Transkription und Umschreiben."
+            hint="Enter oder Komma fügt hinzu. Eigennamen/Fachbegriffe verbessern Transkription und Umschreiben."
           >
-            <Input
-              value={entwurf.customTerms.join(', ')}
-              placeholder="z. B. Produktname, Eigenname, Fachbegriff"
-              onChange={(e) =>
-                setEntwurf({
-                  ...entwurf,
-                  customTerms: e.target.value
-                    .split(',')
-                    .map((t) => t.trim())
-                    .filter((t) => t !== '')
-                })
-              }
+            <BegriffeFeld
+              begriffe={entwurf.customTerms}
+              aendere={(customTerms) => setEntwurf({ ...entwurf, customTerms })}
             />
           </Field>
           <Field
