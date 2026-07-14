@@ -30,7 +30,11 @@ import {
 } from '@main/secrets/ciphertext-file'
 import { createStatsFile } from '@main/stats/stats-file'
 import { starteUiohookQuelle } from '@main/hotkey/uiohook-source'
-import { spiegleStatus } from '@main/window/tray-status'
+import { createDefaultAutostart } from '@main/autostart'
+import { createUpdateHoler } from '@main/update/update-holer'
+import { createUpdateCacheFile } from '@main/update/update-cache-file'
+import { createErreichbarkeitsAdapter } from '@main/health/erreichbarkeit-adapter'
+import { spiegleStatus, baueTrayMenuTemplate } from '@main/window/tray-status'
 import { pillenPosition } from '@main/window/pillen-position'
 import { pillenStatus } from '@main/window/pill-status'
 import { istAbbruchOderTimeout } from '@main/session/abbruch-guard'
@@ -195,7 +199,7 @@ function createPillWindow(): BrowserWindow {
 // Unten mittig über der Taskleiste, auf dem Display unter dem Cursor (dort wurde der Hotkey ausgelöst).
 function positioniertePille(window: BrowserWindow): void {
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
-  const [pw, ph] = window.getSize()
+  const [pw = 0, ph = 0] = window.getSize()
   // A8: Wunschposition (unten zentriert) + harter Clamp in die sichtbaren Bounds gegen off-screen.
   const { x, y } = pillenPosition(display.workArea, { width: pw, height: ph })
   window.setBounds({ x, y, width: pw, height: ph })
@@ -207,29 +211,52 @@ function createTray(): void {
   tray.on('click', showSettings)
 }
 
-// Tray-Menü mit „Abbrechen" (aktiv nur bei laufendem Workflow). Bei jedem onStatus neu bauen (#04).
+// Tray-Menü mit „Abbrechen" (aktiv nur bei laufendem Workflow) + „Letzte Aufnahme erneut verarbeiten"
+// (F1, aktiv nur wenn ein Retry möglich ist). Bei jedem onStatus neu bauen (#04). Das Template ist rein
+// (baueTrayMenuTemplate, testbar); hier nur die Electron-Anbindung.
 function baueTrayMenu(comp: MainComposition): void {
   if (!tray) return
   tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: 'Einstellungen öffnen…', click: showSettings },
-      { label: 'Abbrechen', enabled: comp.beschaeftigt(), click: () => comp.brichAb() },
-      { type: 'separator' },
-      {
-        label: 'Beenden',
-        click: () => {
-          isQuitting = true
-          app.quit()
+    Menu.buildFromTemplate(
+      baueTrayMenuTemplate(
+        { beschaeftigt: comp.beschaeftigt(), kannErneutVersuchen: comp.kannErneutVersuchen() },
+        {
+          einstellungenOeffnen: showSettings,
+          abbrechen: () => comp.brichAb(),
+          erneutVersuchen: () => comp.erneutVersuchen(),
+          beenden: () => {
+            isQuitting = true
+            app.quit()
+          }
         }
-      }
-    ])
+      )
+    )
   )
 }
 
-function benachrichtige(titel: string, koerper: string, onClick?: () => void): void {
+// Optionale Windows-Toast-Aktion (F1): ein beschrifteter Button in der Notification (nicht nur der
+// Klick auf die Benachrichtigung selbst). `on('action')` liefert den Button-Index. HITL: die native
+// Toast-Action-Darstellung ist Windows-abhängig — headless nicht verifizierbar.
+interface ToastAktion {
+  text: string
+  aufAktion: () => void
+}
+
+function benachrichtige(
+  titel: string,
+  koerper: string,
+  onClick?: () => void,
+  aktion?: ToastAktion
+): void {
   if (!Notification.isSupported()) return
-  const n = new Notification({ title: titel, body: koerper })
+  const n = new Notification({
+    title: titel,
+    body: koerper,
+    ...(aktion ? { actions: [{ type: 'button', text: aktion.text }] } : {})
+  })
   if (onClick) n.on('click', onClick)
+  // Der Notification-Aktions-Button feuert 'action' mit dem Button-Index (hier nur Button 0).
+  if (aktion) n.on('action', (_event, index) => index === 0 && aktion.aufAktion())
   n.show()
 }
 
@@ -309,6 +336,18 @@ function registerIpc(apiKeys: ApiKeyVault, comp: MainComposition): void {
   )
   ipcMain.handle('stats:zusammenfassung', () => comp.stats.zusammenfassung())
   ipcMain.handle('stats:loeschen', () => comp.stats.loeschen())
+
+  // W3-γ/δ/ε: Autostart-Status, Opt-in-Update-Prüfung, Selbstdiagnose.
+  ipcMain.handle('autostart:status', () => comp.autostartStatus())
+  ipcMain.handle('update:pruefe', () => comp.pruefeUpdate())
+  ipcMain.handle('health:diagnose', (_event, mikrofonAnzahl: unknown) => {
+    // Eingabe validieren (untrusted Renderer): nur eine endliche, nicht-negative Zahl; sonst 0.
+    const anzahl =
+      typeof mikrofonAnzahl === 'number' && Number.isFinite(mikrofonAnzahl) && mikrofonAnzahl >= 0
+        ? mikrofonAnzahl
+        : 0
+    return comp.diagnose(anzahl)
+  })
 }
 
 const gotTheLock = app.requestSingleInstanceLock()
@@ -350,15 +389,20 @@ if (!gotTheLock) {
         zeigeManuellenHinweis: () =>
           benachrichtige('Blitztext', 'In Zwischenablage kopiert — bitte mit Strg+V einfügen.'),
         // Lauf-Fehler/Teil-Erfolg: Notification (OS-announced = auch barrierefrei); bei 'einstellungen'
-        // führt der Klick in die Einstellungen.
-        melde: (fehler) =>
+        // führt der Klick in die Einstellungen. F1 (W3-B): bei einem retrybaren Fehler reicht die
+        // Sitzung `aktionen.erneut` durch → als Notification-Aktions-Button „Erneut versuchen".
+        melde: (fehler, aktionen) =>
           benachrichtige(
             fehler.titel,
             fehler.koerper,
-            fehler.aktion === 'einstellungen' ? showSettings : undefined
+            fehler.aktion === 'einstellungen' ? showSettings : undefined,
+            aktionen?.erneut ? { text: 'Erneut versuchen', aufAktion: aktionen.erneut } : undefined
           )
       }
     })
+
+    // Lazy-Verweis auf den Standard-Anbieter (für den Erreichbarkeits-Ping); nach comp-Bau gesetzt.
+    let holeStandardAnbieterId: () => string = () => ''
 
     const comp = await createMainComposition({
       recorder: createRecorder(recorderWindow),
@@ -371,8 +415,22 @@ if (!gotTheLock) {
       statsFile: createStatsFile(),
       // P5b: nach erfolgtem Verlauf-Schreiben das Dashboard zum Neuladen anstoßen (race-frei, da das
       // Event erst nach dem aufgelösten Schreibvorgang feuert). sendeAn prüft null/isDestroyed.
-      onHistoryChanged: () => sendeAn(settingsWindow, 'history:changed')
+      onHistoryChanged: () => sendeAn(settingsWindow, 'history:changed'),
+      // W3-γ: Autostart über den HKCU-Run-Key (portable .exe). `process.execPath` = die laufende .exe.
+      autostart: createDefaultAutostart(),
+      exePfad: process.execPath,
+      // W3-δ: echte Ports für den Opt-in-Update-Hinweis (Netz nur bei aktivierter Einstellung).
+      updateHoler: createUpdateHoler(),
+      updateCache: createUpdateCacheFile(join(app.getPath('userData'), 'update-cache.json')),
+      appVersion: app.getVersion(),
+      // W3-ε: leichter Anbieter-Ping für die Selbstdiagnose (Key des Standard-Anbieters mitschicken →
+      // 401/403 wird verlässlich als „Key falsch" erkannt). Der Getter liest den Standard-Anbieter erst
+      // zur Diagnose-Zeit über den Verweis in `holeStandardAnbieterId` (nach comp-Zuweisung gesetzt).
+      erreichbarkeit: createErreichbarkeitsAdapter({
+        getApiKey: () => apiKeys.get(holeStandardAnbieterId())
+      })
     })
+    holeStandardAnbieterId = () => comp.standardAnbieterId()
 
     // IPC erst nach dem Bau der Komposition registrieren (Handler brauchen comp), dann Fenster zeigen.
     registerIpc(apiKeys, comp)
@@ -412,7 +470,15 @@ if (!gotTheLock) {
     }
 
     // Globaler Hotkey über uiohook → verarbeiteTaste → Sitzung (ersetzt den globalShortcut-Platzhalter).
-    stopUiohook = starteUiohookQuelle({ verarbeiteTaste: comp.verarbeiteTaste })
+    // onStatus speist den Start-Erfolg in den Health-Check „Hotkey-Erkennung" (W3-ε).
+    stopUiohook = starteUiohookQuelle({
+      verarbeiteTaste: comp.verarbeiteTaste,
+      onStatus: (aktiv) => comp.setzeHotkeyHookAktiv(aktiv)
+    })
+
+    // W3-γ: Registry-Autostart-Eintrag an das gespeicherte `autostart`-Feld angleichen (heilt einen
+    // verwaisten Eintrag nach dem Verschieben der .exe). Best effort — Fehler werden intern geschluckt.
+    void comp.syncAutostartBeimStart()
 
     // Sperre/Standby verschlucken Keyups (Win+L → Secure Desktop, RESEARCH §3): Tasten-Tracking
     // zurücksetzen, sonst bleibt z. B. die Win-Taste „gedrückt" und LinksStrg allein startet die

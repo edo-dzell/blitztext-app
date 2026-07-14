@@ -3,11 +3,13 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode
 } from 'react'
 import { Button } from '@/components/ui/button'
 import { enterDarfBestaetigen } from '@/lib/dialog-enter'
+import { naechstesFokusZiel } from '@/lib/fokus-falle'
 
 // Themed Bestätigungs-Dialog (statt nativem window.confirm) — für ALLE destruktiven Aktionen, damit
 // nichts versehentlich gelöscht wird. Nutzung: const bestaetige = useBestaetigung(); if (await
@@ -48,13 +50,42 @@ export function BestaetigungsProvider({ children }: { children: ReactNode }) {
     [state]
   )
 
+  // S21-Rest (Fokus-Falle, Persona-Review): die zwei Buttons in fester Reihenfolge — Index 0 =
+  // Abbrechen, 1 = Bestätigen. Autofokus geht auf „Bestätigen" (Index 1); Enter bestätigt bei
+  // gefährlichen Dialogen ohnehin nicht global (A9) — Tab/Shift+Tab bleibt in der Falle.
+  const abbrechenRef = useRef<HTMLButtonElement>(null)
+  const bestaetigenRef = useRef<HTMLButtonElement>(null)
+  const fokusZiele = [abbrechenRef, bestaetigenRef]
+
+  useEffect(() => {
+    if (!state) return
+    // Autofokus beim Öffnen — sonst bleibt der Fokus im Hintergrund (Trigger-Element) und Tab
+    // verlässt den Dialog nach draußen.
+    bestaetigenRef.current?.focus()
+  }, [state])
+
   useEffect(() => {
     if (!state) return
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') schliesse(false)
+      if (e.key === 'Escape') {
+        schliesse(false)
+        return
+      }
       // A9: destruktive Dialoge NICHT per globalem Enter bestätigen (verhindert versehentliches Löschen);
       // harmlose Dialoge behalten Enter-zum-Bestätigen.
-      if (e.key === 'Enter' && enterDarfBestaetigen(state.o.gefahr === true)) schliesse(true)
+      if (e.key === 'Enter' && enterDarfBestaetigen(state.o.gefahr === true)) {
+        schliesse(true)
+        return
+      }
+      if (e.key === 'Tab') {
+        // Tab-Trap: Fokus bleibt innerhalb der Falle (verhindert Tabben hinter den Dialog).
+        const aktuell = fokusZiele.findIndex((r) => r.current === document.activeElement)
+        const naechster = naechstesFokusZiel(fokusZiele.length, aktuell, e.shiftKey)
+        if (naechster >= 0) {
+          e.preventDefault()
+          fokusZiele[naechster]?.current?.focus()
+        }
+      }
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
@@ -77,10 +108,11 @@ export function BestaetigungsProvider({ children }: { children: ReactNode }) {
             <p className="text-sm font-semibold">{state.o.titel}</p>
             {state.o.text && <p className="mt-1 text-sm text-muted-foreground">{state.o.text}</p>}
             <div className="mt-4 flex justify-end gap-2">
-              <Button variant="outline" size="sm" onClick={() => schliesse(false)}>
+              <Button ref={abbrechenRef} variant="outline" size="sm" onClick={() => schliesse(false)}>
                 Abbrechen
               </Button>
               <Button
+                ref={bestaetigenRef}
                 variant={state.o.gefahr ? 'destructive' : 'default'}
                 size="sm"
                 onClick={() => schliesse(true)}

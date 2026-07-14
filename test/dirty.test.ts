@@ -2,12 +2,14 @@ import { describe, it, expect } from 'vitest'
 import {
   tiefGleich,
   workflowEntwurfGeaendert,
-  einstellungenGeaendert
+  einstellungenGeaendert,
+  apiKeyEntwurfGeaendert,
+  assistentSperrtAuswahl
 } from '@renderer/lib/dirty'
 import { defaultSettings } from '@main/settings/store'
 import { BUILTIN_WORKFLOWS } from '@shared/workflows'
 
-const def = { ...BUILTIN_WORKFLOWS[1] } // 'improve' (rewrites=true)
+const def = { ...BUILTIN_WORKFLOWS[1]! } // 'improve' (rewrites=true)
 
 describe('tiefGleich', () => {
   it('gleich für strukturell identische Werte', () => {
@@ -46,5 +48,29 @@ describe('einstellungenGeaendert (P8)', () => {
       apiKeyStatus: { openai: { status: 'verifiziert', zuletztGetestetMs: 1 } }
     } as unknown as ReturnType<typeof defaultSettings>
     expect(einstellungenGeaendert(mitStatus, defaultSettings())).toBe(false)
+  })
+})
+
+describe('apiKeyEntwurfGeaendert (W1-E — ungespeicherter API-Key als Dirty-Quelle)', () => {
+  it('false bei leerem Eingabefeld', () => {
+    expect(apiKeyEntwurfGeaendert('')).toBe(false)
+  })
+  it('false bei reinem Whitespace', () => {
+    expect(apiKeyEntwurfGeaendert('   ')).toBe(false)
+  })
+  it('true bei nicht-leerem, ungespeichertem Key-Text', () => {
+    expect(apiKeyEntwurfGeaendert('sk-abc123')).toBe(true)
+  })
+  it('true auch mit umgebendem Whitespace, solange Inhalt übrig bleibt', () => {
+    expect(apiKeyEntwurfGeaendert('  sk-abc123  ')).toBe(true)
+  })
+})
+
+describe('assistentSperrtAuswahl (W1-E — laufende Assistent-Anfrage sperrt Workflow-Wechsel)', () => {
+  it('false wenn keine Anfrage läuft', () => {
+    expect(assistentSperrtAuswahl(false)).toBe(false)
+  })
+  it('true während eine Anfrage läuft', () => {
+    expect(assistentSperrtAuswahl(true)).toBe(true)
   })
 })

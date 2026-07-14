@@ -116,3 +116,97 @@ describe('createPasteService', () => {
     expect(zwischenablage.lies()).toBe('etwas anderes vom Nutzer') // NICHT überschrieben (Inhalts-Guard)
   })
 })
+
+// W3-A (ADR-0011 Weg B, verify-or-degrade): vor dem Einfügen prüft der Service, ob der Fokus vom
+// erfassten Paste-Ziel weggewandert ist. Kein Drift → einfügen wie bisher. Drift → NICHT tippen,
+// sondern nur die Zwischenablage setzen + Drift-Meldung. Der HWND-Provider ist ein injizierter Port.
+describe('createPasteService — Fokus-Drift (Weg B)', () => {
+  function baseDeps(currentHwnd: number | null) {
+    const zwischenablage = fakeZwischenablage('alt')
+    const helfer = strategie('helfer', true)
+    const drift: number[] = []
+    return {
+      zwischenablage,
+      helfer,
+      drift,
+      deps: {
+        zwischenablage,
+        strategien: [helfer.s],
+        zeigeManuellenHinweis: () => {},
+        aktuellesFenster: () => currentHwnd,
+        zeigeDriftHinweis: () => drift.push(1)
+      }
+    }
+  }
+
+  it('kein Drift (erfasstes == aktuelles Fenster): fügt wie bisher ein', async () => {
+    const { deps, zwischenablage, helfer, drift } = baseDeps(100)
+    const service = createPasteService(deps)
+
+    const ergebnis = await service.einfügen('text', { fokusRueckkehr: true, erfasstesHwnd: 100 })
+
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(ergebnis).toMatchObject({ erfolg: true })
+    expect(zwischenablage.lies()).toBe('text')
+    expect(drift).toEqual([])
+  })
+
+  it('Drift (erfasstes != aktuelles Fenster): kein Paste, Text in Zwischenablage, Drift-Hinweis', async () => {
+    const { deps, zwischenablage, helfer, drift } = baseDeps(200)
+    const service = createPasteService(deps)
+
+    const ergebnis = await service.einfügen('text', { fokusRueckkehr: true, erfasstesHwnd: 100 })
+
+    expect(helfer.spy.aufrufe).toBe(0) // keine Strategie ausgeführt (nicht ins fremde Fenster tippen)
+    expect(ergebnis).toEqual({ erfolg: false, drift: true })
+    expect(zwischenablage.lies()).toBe('text') // Text liegt zum manuellen Einfügen bereit
+    expect(drift).toEqual([1])
+  })
+
+  it('Feature aus: fügt trotz Drift ein (kein Weg-B-Eingriff)', async () => {
+    const { deps, helfer, drift } = baseDeps(200)
+    const service = createPasteService(deps)
+
+    const ergebnis = await service.einfügen('text', { fokusRueckkehr: false, erfasstesHwnd: 100 })
+
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(ergebnis).toMatchObject({ erfolg: true })
+    expect(drift).toEqual([])
+  })
+
+  it('Helfer liefert kein HWND (Provider null): Fallback = einfügen wie bisher (nicht schlechter)', async () => {
+    const { deps, helfer, drift } = baseDeps(null)
+    const service = createPasteService(deps)
+
+    const ergebnis = await service.einfügen('text', { fokusRueckkehr: true, erfasstesHwnd: 100 })
+
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(ergebnis).toMatchObject({ erfolg: true })
+    expect(drift).toEqual([])
+  })
+
+  it('kein erfasstes HWND (Provider konnte beim Start nichts merken): Fallback = einfügen', async () => {
+    const { deps, helfer, drift } = baseDeps(200)
+    const service = createPasteService(deps)
+
+    const ergebnis = await service.einfügen('text', { fokusRueckkehr: true, erfasstesHwnd: null })
+
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(ergebnis).toMatchObject({ erfolg: true })
+    expect(drift).toEqual([])
+  })
+
+  it('rückwärtskompatibel: einfügen ohne Fokus-Optionen fügt wie bisher ein', async () => {
+    const zwischenablage = fakeZwischenablage('alt')
+    const helfer = strategie('helfer', true)
+    const service = createPasteService({
+      zwischenablage,
+      strategien: [helfer.s],
+      zeigeManuellenHinweis: () => {}
+    })
+
+    const ergebnis = await service.einfügen('text')
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(ergebnis).toMatchObject({ erfolg: true })
+  })
+})

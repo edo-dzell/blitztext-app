@@ -8,7 +8,17 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const RELEASE_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'release')
-const BEHALTEN = 2 // aktuelle + vorherige Version
+
+// Wie viele Artefakte behalten. Überschreibbar via ENV `RETAIN_RELEASES` oder erstem CLI-Argument
+// (Argument gewinnt vor ENV); Default 2 (aktuelle + vorherige Version). Ungültige/negative Werte
+// (nicht-numerisch, <0) fallen auf den Default zurück.
+function leseBehalten() {
+  const roh = process.argv[2] ?? process.env.RETAIN_RELEASES
+  if (roh === undefined || roh === '') return 2
+  const n = Number(roh)
+  return Number.isInteger(n) && n >= 0 ? n : 2
+}
+const BEHALTEN = leseBehalten()
 const istArtefakt = (name) => name.endsWith('.exe') || name.endsWith('.zip')
 
 function main() {

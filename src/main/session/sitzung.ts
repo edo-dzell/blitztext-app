@@ -11,15 +11,36 @@ import { fehlerMeldung, teilErfolgMeldung, type FehlerMeldung } from '@main/sess
 
 export type Auslösequelle = 'hotkey' | 'manuell'
 
+/** Fokus-Kontext fürs Einfügen (Weg B, ADR-0011): erfasstes Ziel + Feature-Schalter. */
+export interface EinfügeKontext {
+  fokusRueckkehr: boolean
+  erfasstesHwnd: number | null
+}
+
 /** Downstream-Naht: was die Sitzung mit dem Endtext tut. Adapter (win-paste/Fenster) sind HITL. */
 export interface Ausgabe {
-  einfügen(text: string): void
+  /**
+   * Endtext ins Paste-Ziel einfügen. `kontext` (Weg B, W3-A) trägt das beim Auslösen erfasste HWND +
+   * den fokusRueckkehr-Schalter: bei Drift fügt der Adapter NICHT ins fremde Fenster ein, sondern legt
+   * den Text in die Zwischenablage + zeigt die Drift-Meldung. Ohne Kontext = bisheriges Verhalten.
+   */
+  einfügen(text: string, kontext?: EinfügeKontext): void
   anzeigen(text: string): void
   zeigeEinstellungen(): void
-  /** Einen fehlgeschlagenen Lauf dem Nutzer melden (Hintergrund: Windows-Notification, OS-announced). */
-  melde(fehler: FehlerMeldung): void
+  /**
+   * Einen fehlgeschlagenen Lauf dem Nutzer melden (Hintergrund: Windows-Notification, OS-announced).
+   * `aktionen.erneut` (F1, W3-B): bei retrybaren Fehlern (aktion:'erneut') ein Callback, den der
+   * Adapter an einen Notification-Aktions-Button „Erneut versuchen" hängt — Klick löst den erneuten
+   * Versuch aus (kein neues Diktat). Fehlt der Callback, bietet der Adapter keine Retry-Aktion an.
+   */
+  melde(fehler: FehlerMeldung, aktionen?: { erneut?: () => void }): void
   /** Text in die Zwischenablage legen, OHNE einzufügen (Teil-Erfolg: Rohtext retten). */
   inZwischenablage(text: string): void
+  /**
+   * Vordergrundfenster-Handle beim Auslösen der Aufnahme erfassen (Weg B, W3-A), nativ via
+   * win-paste.exe --hwnd. null = konnte nicht erfasst werden (Fallback aufs bisherige Einfügen).
+   */
+  erfasseFenster(): number | null
 }
 
 /** Abschluss-Daten eines fertigen Laufs für Verlauf + Statistik (Strang D). */
@@ -33,6 +54,12 @@ export interface Abschlussdaten {
   chatModell: string
   usage?: { promptTokens: number; completionTokens: number }
   umgeschrieben: boolean
+  /**
+   * V5 (W3-μ): Kennung des Prompt-Stands, der den Endtext erzeugt hat (`promptKennungFuer`,
+   * shared/workflows.ts) — kommt unverändert aus `runner.letzteMetrik.promptKennung` durch. NUR bei
+   * Umschreib-Workflows gesetzt (rewrite lief); reine Transkription liefert `undefined`.
+   */
+  promptKennung?: string
 }
 
 /** Protokoll-Naht: zeichnet einen Abschluss auf. Der Adapter splittet in Verlauf (Text) + Stats
@@ -58,6 +85,18 @@ export interface Sitzung {
   starteWorkflow(workflow: WorkflowId, quelle: Auslösequelle): Promise<void>
   stoppe(): Promise<void>
   brichAb(): void
+  /**
+   * W3-B (Audio-Retry): verarbeitet das zuletzt gehaltene Audio erneut ab der Transkription, ohne neues
+   * Diktat. Für die Meldungs-Aktion `aktion:'erneut'` gedacht (Staffel 3.2 UI verbindet sie hiermit).
+   * No-Op, wenn kein Audio gehalten wird (nach Erfolg/Abbruch) oder gerade ein Lauf aktiv ist.
+   */
+  erneutVersuchen(): Promise<void>
+  /**
+   * F1 (W3-B): true, wenn ein erneuter Versuch möglich ist (der Runner hält noch das Audio eines
+   * transient gescheiterten Laufs). Spiegelt `runner.kannErneutVersuchen()`. Auslöser-UI (Tray-Eintrag
+   * „Letzte Aufnahme erneut verarbeiten") nutzt es für den Aktiv-/Sichtbar-Zustand.
+   */
+  kannErneutVersuchen(): boolean
   /** true, solange ein Lauf aktiv ist (für den Live-Reconfigure-Guard der Komposition). */
   beschaeftigt(): boolean
   onStatus?: (phase: WorkflowPhase) => void
@@ -67,14 +106,49 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   let aktiveQuelle: Auslösequelle | null = null
   // Kontext des laufenden Workflows für das Protokoll beim Abschluss (Label + genutzte Modelle).
   let aktiverKontext: { label: string; asrModell: string; chatModell: string } | null = null
+  // Weg B (W3-A): das beim Auslösen erfasste Fenster + fokusRueckkehr-Schalter, an einfügen durchgereicht.
+  let aktiverFokusKontext: EinfügeKontext | null = null
+  // W3-B (Audio-Retry): Kontext des ZULETZT verarbeiteten Laufs, damit ein erneutVersuchen() den
+  // Terminal-Zustand identisch routen kann (gleiche Quelle/Label/Modelle/Fokus), ohne aktive Reservierung.
+  let letzterLauf: {
+    quelle: Auslösequelle
+    kontext: { label: string; asrModell: string; chatModell: string } | null
+    fokusKontext: EinfügeKontext | null
+  } | null = null
+  // W2-A: Generationszähler gegen zwei Start-Races. starteWorkflow hat vor runner.start() zwei awaits
+  // (load, apiKeys.has); die Reservierung `aktiveQuelle` allein reicht nicht:
+  //  (1) Doppel-Start: die Reservierung erfolgt jetzt SOFORT beim Eintritt (vor dem ersten await),
+  //      sodass ein zweiter, quasi-gleichzeitiger Aufruf am Guard scheitert.
+  //  (2) Verlorener Abbruch: brichAb() während der Awaits setzte nur aktiveQuelle=null (der Runner ist
+  //      noch idle → abbrechen() ist ein No-Op) — starteWorkflow lief danach weiter und startete doch.
+  //      Jeder Start bucht eine Generation; brichAb()/stoppe() erhöhen sie. Nach jedem await prüft der
+  //      Start, ob SEINE Generation noch aktuell ist — sonst steigt er aus, ohne runner.start().
+  let laufGeneration = 0
 
   const sitzung: Sitzung = {
     async starteWorkflow(workflow, quelle) {
       if (aktiveQuelle !== null) return // ein Lauf zur Zeit; während aktiv neue Auslösungen ignorieren
+      // Reservierung SOFORT, synchron, vor dem ersten await → schließt das Doppel-Start-Fenster (1).
+      aktiveQuelle = quelle
+      const meineGeneration = ++laufGeneration
+      // True, sobald dieser Lauf inzwischen entwertet wurde (Abbruch (2) oder eine spätere Reservierung).
+      const veraltet = (): boolean => laufGeneration !== meineGeneration
+      // Reservierung nur zurücknehmen, wenn sie noch MIR gehört — sonst ein späterer Lauf leer räumen.
+      const gibReservierungFrei = (): void => {
+        if (!veraltet()) {
+          aktiveQuelle = null
+          aktiverKontext = null
+        }
+      }
+
       const settings = await deps.einstellungen.load()
+      // (2) Abbruch während des load-Awaits: sauber aussteigen, ohne runner.start(). brichAb() hat die
+      // Reservierung bereits geräumt und die Generation erhöht → nichts weiter zu tun.
+      if (veraltet()) return
       // Workflow-Definition auflösen; unbekannte Id (z. B. verwaister Hotkey) → still abbrechen.
       const def = findWorkflow(workflow, settings.workflows)
       if (!def) {
+        gibReservierungFrei()
         if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
         return
       }
@@ -86,9 +160,15 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       })
       // Gate: ohne Key des AUFGELÖSTEN Anbieters gar nicht erst aufnehmen (Cloud-only, ADR-0001).
       // L1: key-loser lokaler Anbieter braucht kein Gate; sonst ohne Key gar nicht erst aufnehmen.
-      if (!lauf.anbieter.keinKeyNoetig && !(await deps.apiKeys.has(lauf.anbieter.id))) {
-        if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
-        return // Hotkey: still abbrechen
+      if (!lauf.anbieter.keinKeyNoetig) {
+        const hatKey = await deps.apiKeys.has(lauf.anbieter.id)
+        // (2) Abbruch während des has-Awaits: aussteigen, ohne runner.start().
+        if (veraltet()) return
+        if (!hatKey) {
+          gibReservierungFrei()
+          if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
+          return // Hotkey: still abbrechen
+        }
       }
       // v0.4.5 (ADR-0018): ehrlich statt still. Wurde ein Umschreib-Workflow auf den Anbieter-Standard
       // ABGEWERTET (gepinntes, dem Anbieter fremdes Modell), den Nutzer bei MANUELLER Auslösung
@@ -99,13 +179,18 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
           koerper: `Das gewählte Modell ist bei „${lauf.anbieter.label}" nicht verfügbar — es läuft „${lauf.chatModell}".`
         })
       }
-      aktiveQuelle = quelle
       deps.aktiviereAnbieter?.(lauf.anbieter)
       aktiverKontext = {
         label: def.label,
         asrModell: lauf.asrModell,
         chatModell: lauf.chatModell
       }
+      // Weg B (W3-A): NUR bei Hotkey (das Ergebnis wird eingefügt) das aktuelle Vordergrundfenster
+      // erfassen — das ist das Paste-Ziel. Bei manueller Quelle wird angezeigt, nicht getippt → egal.
+      aktiverFokusKontext =
+        quelle === 'hotkey'
+          ? { fokusRueckkehr: settings.fokusRueckkehr, erfasstesHwnd: deps.ausgabe.erfasseFenster() }
+          : null
       deps.runner.start({
         def,
         chatModell: lauf.chatModell,
@@ -122,33 +207,98 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       if (aktiveQuelle === null) return
       const quelle = aktiveQuelle
       const kontext = aktiverKontext
+      const fokusKontext = aktiverFokusKontext
       const terminal = await deps.runner.stop()
       aktiveQuelle = null
       aktiverKontext = null
-      if (terminal.status === 'fertig') {
-        if (quelle === 'hotkey') deps.ausgabe.einfügen(terminal.text)
-        else deps.ausgabe.anzeigen(terminal.text)
-        // Fire-and-forget: das Einfügen ist bereits erfolgt; das Protokoll schreibt asynchron und
-        // feuert danach onHistoryChanged. stoppe() bleibt Promise<void> (Kontext als Closure-Arg).
-        void protokolliere(kontext)
-      } else if (terminal.status === 'teilErfolg') {
-        // Teil-Erfolg: Rohtext in die Zwischenablage, NIE auto-einfügen (bei De-Eskalation wäre der
-        // Originaltext das Gegenteil der Absicht; bei einem Treue-Befund wäre der Endtext schlicht
-        // falsch). Die Meldung unterscheidet den Grund (Umschreib-Fehler vs. „beantwortet", v0.4.5).
-        deps.ausgabe.inZwischenablage(terminal.rohtext)
-        deps.ausgabe.melde(teilErfolgMeldung(terminal.grund))
-        void protokolliere(kontext)
-      } else if (terminal.status === 'fehler') {
-        deps.ausgabe.melde(fehlerMeldung(terminal.art, terminal.message))
+      aktiverFokusKontext = null
+      verarbeiteTerminal(terminal, quelle, kontext, fokusKontext)
+    },
+    async erneutVersuchen() {
+      // W3-B: nur sinnvoll, wenn kein Lauf aktiv ist UND der Runner noch Audio hält (transienter
+      // Fehler/Teil-Erfolg). Sonst No-Op. Den Terminal-Zustand wie den letzten Lauf routen.
+      if (aktiveQuelle !== null) return
+      if (!deps.runner.kannErneutVersuchen()) return
+      const vorlage = letzterLauf
+      if (!vorlage) return
+      // F1 (P1-latent): Reservierung SOFORT, synchron, vor dem await auf runner.erneutVersuchen() —
+      // dieselbe W2-A-Disziplin wie starteWorkflow/stoppe. Ohne sie meldete die Sitzung während des
+      // awaiteten Retrys `beschaeftigt()===false`, und ein gleichzeitiger starteWorkflow(...,'hotkey')
+      // passierte den Guard und riefe runner.start() auf demselben Runner ⇒ Doppel-Run-Korruption.
+      // Quelle des ursprünglichen Laufs übernehmen (der Terminal-Zustand wird identisch geroutet).
+      aktiveQuelle = vorlage.quelle
+      const meineGeneration = ++laufGeneration
+      const veraltet = (): boolean => laufGeneration !== meineGeneration
+      const gibReservierungFrei = (): void => {
+        if (!veraltet()) {
+          aktiveQuelle = null
+          aktiverKontext = null
+        }
       }
+      const terminal = await deps.runner.erneutVersuchen()
+      // Ein brichAb() während des Retrys hat die Generation erhöht + die Reservierung geräumt und das
+      // Audio verworfen → still aussteigen, ohne den (abgebrochenen) Terminal-Zustand zu routen.
+      if (veraltet()) return
+      gibReservierungFrei()
+      verarbeiteTerminal(terminal, vorlage.quelle, vorlage.kontext, vorlage.fokusKontext)
+    },
+    kannErneutVersuchen() {
+      // Kein Retry mitten in einem aktiven Lauf anbieten (der Runner hielte evtl. noch altes Audio).
+      return aktiveQuelle === null && deps.runner.kannErneutVersuchen()
     },
     brichAb() {
+      // Generation erhöhen: entwertet einen Start, der gerade zwischen seinen Awaits hängt (2) — er
+      // erkennt das nach dem nächsten await und steigt aus, ohne runner.start(). Danach räumen; die
+      // Freigabe des in-flight Starts (gibReservierungFrei) greift durch veraltet() dann nicht mehr.
+      laufGeneration++
       deps.runner.abbrechen()
       aktiveQuelle = null
       aktiverKontext = null
+      aktiverFokusKontext = null
+      // W3-B: nach Abbruch kein Retry auf verworfenem Audio (der Runner verwirft es ebenfalls).
+      letzterLauf = null
     },
     beschaeftigt() {
       return aktiveQuelle !== null
+    }
+  }
+
+  // Routet einen Terminal-Zustand des Runners auf die Ausgabe. Von stoppe() (frischer Lauf) UND
+  // erneutVersuchen() (W3-B, gehaltenes Audio) geteilt — identisches Verhalten. Merkt den Lauf für
+  // einen etwaigen Retry (letzterLauf); ein 'fertig' verwirft die Audio-Basis (Runner räumt selbst).
+  function verarbeiteTerminal(
+    terminal: WorkflowPhase,
+    quelle: Auslösequelle,
+    kontext: { label: string; asrModell: string; chatModell: string } | null,
+    fokusKontext: EinfügeKontext | null
+  ): void {
+    letzterLauf = { quelle, kontext, fokusKontext }
+    if (terminal.status === 'fertig') {
+      // Weg B (W3-A): beim Hotkey den Fokus-Kontext mitreichen → der Adapter degradiert bei Drift.
+      if (quelle === 'hotkey') deps.ausgabe.einfügen(terminal.text, fokusKontext ?? undefined)
+      else deps.ausgabe.anzeigen(terminal.text)
+      // Fire-and-forget: das Einfügen ist bereits erfolgt; das Protokoll schreibt asynchron und
+      // feuert danach onHistoryChanged. stoppe() bleibt Promise<void> (Kontext als Closure-Arg).
+      void protokolliere(kontext)
+    } else if (terminal.status === 'teilErfolg') {
+      // Teil-Erfolg: Rohtext in die Zwischenablage, NIE auto-einfügen (bei De-Eskalation wäre der
+      // Originaltext das Gegenteil der Absicht; bei einem Treue-Befund wäre der Endtext schlicht
+      // falsch). Die Meldung unterscheidet den Grund (Umschreib-Fehler vs. „beantwortet", v0.4.5).
+      deps.ausgabe.inZwischenablage(terminal.rohtext)
+      deps.ausgabe.melde(teilErfolgMeldung(terminal.grund))
+      void protokolliere(kontext)
+    } else if (terminal.status === 'fehler') {
+      // W3-B: bei transienten Fehlern (netzwerk/anbieter) hält der Runner das Audio → Retry anbieten.
+      const retrybar =
+        (terminal.art === 'netzwerk' || terminal.art === 'anbieter') &&
+        deps.runner.kannErneutVersuchen()
+      // F1: bei retrybaren Fehlern den Retry-Callback mitreichen → der Adapter hängt ihn an einen
+      // Notification-Aktions-Button „Erneut versuchen". Klick löst erneutVersuchen() aus (kein neues
+      // Diktat). void: der Adapter-Callback ist synchron, das Retry läuft im Hintergrund weiter.
+      deps.ausgabe.melde(
+        fehlerMeldung(terminal.art, terminal.message, retrybar),
+        retrybar ? { erneut: () => void sitzung.erneutVersuchen() } : undefined
+      )
     }
   }
 
@@ -171,7 +321,8 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
         asrModell: kontext.asrModell,
         chatModell: m.umgeschrieben ? kontext.chatModell : '',
         usage: m.usage,
-        umgeschrieben: m.umgeschrieben
+        umgeschrieben: m.umgeschrieben,
+        promptKennung: m.promptKennung
       })
       if (geschrieben) deps.onHistoryChanged?.()
     } catch (err) {

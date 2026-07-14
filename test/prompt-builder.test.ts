@@ -233,10 +233,24 @@ describe('Ausgabesprache (R1)', () => {
     expect(p).toContain('AUSSCHLIESSLICH auf Deutsch')
   })
 
-  it('unbekannter Sprachcode wird direkt verwendet', () => {
-    expect(resolveSystemPrompt({ ...improve, ausgabeSprache: 'fr' })).toContain(
-      'AUSSCHLIESSLICH auf fr'
+  it('unbekannter Sprachcode wird direkt verwendet (Fallback, W2-F)', () => {
+    // 'xx' ist bewusst KEIN in @shared/sprachen gelisteter Code — prüft den Fallback-Pfad
+    // (unbekannter Code ⇒ Code selbst als Sprachname), nicht eine der 23 unterstützten Sprachen.
+    expect(resolveSystemPrompt({ ...improve, ausgabeSprache: 'xx' })).toContain(
+      'AUSSCHLIESSLICH auf xx'
     )
+  })
+
+  // W2-F (v0.5.0): Sprachliste von {de, en} auf 23 Sprachen erweitert (zentralisiert in
+  // @shared/sprachen). Stichprobe dreier neuer Sprachen prüft, dass zielsprachenBlock die
+  // gemeinsame Quelle tatsächlich nutzt (nicht mehr die alte lokale SPRACHNAMEN-Map).
+  it.each([
+    ['fr', 'Französisch'],
+    ['tr', 'Türkisch'],
+    ['zh', 'Chinesisch']
+  ])('hängt den Zielsprachen-Block für %s (%s) korrekt an', (code, promptName) => {
+    const p = resolveSystemPrompt({ ...improve, ausgabeSprache: code })
+    expect(p).toContain(`AUSSCHLIESSLICH auf ${promptName}`)
   })
 
   it('buildSystemPrompt bleibt von ausgabeSprache unberührt (kein Block)', () => {
@@ -311,6 +325,112 @@ describe('Daten-Rahmen / Prompt-Injection-Härtung (v0.3.4)', () => {
     expect(entferneTranskriptMarken('Der Wert a < b bleibt')).toBe('Der Wert a < b bleibt')
     // Ein Tag MITTEN im Satz (nicht am Rand) bleibt unangetastet — wir putzen nur die Ränder.
     expect(entferneTranskriptMarken('Vorher <mitte> nachher')).toBe('Vorher <mitte> nachher')
+  })
+})
+
+// v0.5.0: „5. Wiederkehr" der Leak-Klasse — drei neue Randformen, die am reinen <…>-Tag-Schnitt (v0.4.4)
+// vorbeirutschen: (a) randständige Markdown-Codefences ums ganze Ergebnis, (b) konversationelle Vorreden
+// vor dem eigentlichen Text, (c) Meta-Nachsätze NACH einer bereits entfernten Schlussmarke. Leitprinzip:
+// PRÄZISION VOR RECALL — die App fügt ungefragt ein; ein Fehlschnitt legitimer Diktat-Inhalte wiegt
+// schwerer als ein durchgerutschtes Präfix. Deshalb enge Muster + reichlich Negativ-Kontrollen.
+describe('entferneTranskriptMarken — Rand-Artefakte v0.5.0 (Codefence/Vorrede/Nachsatz)', () => {
+  const F = (s: string): string => entferneTranskriptMarken(s)
+
+  describe('randständige Codefences', () => {
+    it('entfernt eine öffnende + schließende Fence um den ganzen Text', () => {
+      expect(F('```\nDer eigentliche Text.\n```')).toBe('Der eigentliche Text.')
+    })
+    it('entfernt eine öffnende Fence MIT Sprach-Suffix', () => {
+      expect(F('```markdown\nDer Text.\n```')).toBe('Der Text.')
+      expect(F('```text\nZeile eins.\nZeile zwei.\n```')).toBe('Zeile eins.\nZeile zwei.')
+    })
+    it('entfernt auch eine nur einseitig echote Fence am Rand', () => {
+      expect(F('```\nNur oben eine Fence.')).toBe('Nur oben eine Fence.')
+      expect(F('Nur unten eine Fence.\n```')).toBe('Nur unten eine Fence.')
+    })
+    // NEGATIV: eine Fence MITTEN im Text (legitimes Code-Diktat) bleibt unberührt.
+    it('lässt Fences MITTEN im Text unangetastet (Code-Diktat)', () => {
+      const mitte = 'Führe das aus:\n```\nnpm run build\n```\nund melde dich.'
+      expect(F(mitte)).toBe(mitte)
+    })
+    // NEGATIV: drei Backticks INLINE (kein eigener Zeilen-Fence) bleiben.
+    it('lässt inline-Backticks am Rand unberührt (keine eigene Fence-Zeile)', () => {
+      expect(F('Nutze ```code``` hier.')).toBe('Nutze ```code``` hier.')
+    })
+  })
+
+  describe('konversationelle Vorreden', () => {
+    it('entfernt eine eindeutige Übergabe-Floskel als erste Zeile', () => {
+      expect(F('Hier ist der überarbeitete Text:\nDer eigentliche Inhalt bleibt.')).toBe(
+        'Der eigentliche Inhalt bleibt.'
+      )
+      expect(F('Gerne, hier die polierte Version:\n\nDie Nachricht steht hier.')).toBe(
+        'Die Nachricht steht hier.'
+      )
+      expect(F('Here is the rewritten text:\nActual content.')).toBe('Actual content.')
+    })
+    // NEGATIV (Pflicht): legitimer Inhalt, der mit „Hier ist der Plan:" beginnt — KEIN Übergabe-Vokabular.
+    it('lässt „Hier ist der Plan:" als legitimen Diktat-Anfang UNVERÄNDERT', () => {
+      const text = 'Hier ist der Plan:\nWir treffen uns morgen um neun.'
+      expect(F(text)).toBe(text)
+    })
+    // NEGATIV (PFLICHT, F3 — zwei Reviewer, P2): Das alte VORREDE_MUSTER akzeptierte Handover-Wörter
+    // wie „sicher"/„klar" als bloßes Adverb am Zeilenanfang zu locker — das schnitt legitimen
+    // Diktat-Anfang ab. „Sicher"/„klar" sind normale Gesprächs-Adverbien, kein Übergabe-Signal.
+    it('lässt „Sicher ist sicher, das ist mein Text:" als legitimen Diktat-Anfang UNVERÄNDERT (F3)', () => {
+      const text = 'Sicher ist sicher, das ist mein Text:\nIch habe das Angebot geprüft.'
+      expect(F(text)).toBe(text)
+    })
+    it('lässt „Klar formulierte Version:" als legitimen Diktat-Anfang UNVERÄNDERT (F3)', () => {
+      const text = 'Klar formulierte Version:\nWir sollten den Termin verschieben.'
+      expect(F(text)).toBe(text)
+    })
+    it('lässt „Sicher, das ist mein Text:" als legitimen Diktat-Anfang UNVERÄNDERT (F3)', () => {
+      const text = 'Sicher, das ist mein Text:\nBitte gib mir noch Feedback dazu.'
+      expect(F(text)).toBe(text)
+    })
+    // NEGATIV (Pflicht): Übergabe-Floskel als KOMPLETTER Ein-Zeilen-Inhalt ohne Folgetext bleibt.
+    it('lässt eine Floskel-Zeile OHNE Folgetext unverändert (nichts zum Behalten)', () => {
+      const text = 'Hier ist der überarbeitete Text: bitte prüfen'
+      expect(F(text)).toBe(text)
+    })
+    // NEGATIV: Floskel-Vokabular mitten in einem echten Satz (kein eigener Zeilen-Präfix) bleibt.
+    it('lässt Übergabe-Vokabular mitten im Fließtext unberührt', () => {
+      const text = 'Ich habe den überarbeiteten Text gestern an dich geschickt.'
+      expect(F(text)).toBe(text)
+    })
+  })
+
+  describe('Meta-Nachsätze nach entfernter Schlussmarke', () => {
+    it('entfernt einen Floskel-Schlussabsatz nach einer echoten Schlussmarke', () => {
+      expect(F('Der fertige Text steht hier.\n</transkript>\n\nLass mich wissen, falls du Änderungen brauchst!')).toBe(
+        'Der fertige Text steht hier.'
+      )
+    })
+    it('entfernt einen Floskel-Schlussabsatz auch ohne vorherige Marke', () => {
+      expect(F('Die Nachricht ist fertig.\n\nIch hoffe, das hilft dir weiter.')).toBe(
+        'Die Nachricht ist fertig.'
+      )
+      expect(F('Alles erledigt.\n\nFalls du Änderungen möchtest, sag Bescheid.')).toBe(
+        'Alles erledigt.'
+      )
+    })
+    // NEGATIV: ein inhaltlicher Schlussabsatz (kein Floskel-Muster) bleibt erhalten.
+    it('lässt einen inhaltlichen Schlussabsatz stehen', () => {
+      const text = 'Der erste Punkt ist klar.\n\nDer zweite Punkt betrifft das Budget.'
+      expect(F(text)).toBe(text)
+    })
+    // NEGATIV: „ich hoffe" als Teil eines echten inhaltlichen Satzes (kein eigener Schlussabsatz) bleibt.
+    it('lässt eine Ich-hoffe-Aussage im Fließtext unberührt', () => {
+      const text = 'Ich hoffe auf gutes Wetter und plane die Reise entsprechend.'
+      expect(F(text)).toBe(text)
+    })
+  })
+
+  // Zusammenspiel: Fence + Vorrede + Marke + Nachsatz in EINEM Ergebnis → nur der Kern bleibt.
+  it('räumt kombinierte Rand-Artefakte in einem Durchlauf ab', () => {
+    const roh = '```\nHier ist der überarbeitete Text:\nDer Kern bleibt erhalten.\n</transkript>\n```\n\nLass mich wissen, falls du Änderungen brauchst!'
+    expect(F(roh)).toBe('Der Kern bleibt erhalten.')
   })
 })
 

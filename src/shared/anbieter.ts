@@ -3,7 +3,7 @@
 // Reihenfolge: Workflow-Override → Anbieter-/Global-Default; verwaiste Zuordnung → Standard-Anbieter.
 // Der Byte-Identitäts-Snapshot über die vier Built-ins (siehe Test) wacht über Verhaltensgleichheit.
 
-import { getProvider, modelleFuerVorlage, PROVIDER } from '@shared/providers'
+import { modelleFuerVorlage, PROVIDER } from '@shared/providers'
 
 export interface AnbieterKonfig {
   id: string
@@ -56,22 +56,14 @@ export function findeAnbieter(
   return liste.find((a) => a.id === id)
 }
 
-/** Leitet eine Anbieter-Konfig aus dem v1/v2.0-Single-Provider-Feld ab (Migration/Übergang). */
-export function anbieterAusProvider(p: {
+/** Standard-Anbieter der Liste: der zur `id`, sonst der erste (Fallback für verwaiste/leere id). */
+export function standardAnbieterAus(
+  liste: readonly AnbieterKonfig[],
   id: string
-  baseUrl: string
-  asrModell: string
-  chatModell: string
-}): AnbieterKonfig {
-  const descriptor = getProvider(p.id)
-  return {
-    id: p.id,
-    vorlage: descriptor ? descriptor.id : 'custom',
-    label: descriptor?.label ?? p.id,
-    baseUrl: p.baseUrl,
-    asrModell: p.asrModell,
-    chatModell: p.chatModell
-  }
+): AnbieterKonfig {
+  const gefunden = findeAnbieter(liste, id) ?? liste[0]
+  if (!gefunden) throw new Error('standardAnbieterAus: leere Anbieter-Liste')
+  return gefunden
 }
 
 /**
@@ -116,8 +108,7 @@ export function aufloeseWorkflowLauf(
 ): AufgeloesterLauf {
   const anbieter =
     (workflow.anbieterId ? findeAnbieter(ctx.anbieter, workflow.anbieterId) : undefined) ??
-    findeAnbieter(ctx.anbieter, ctx.standardAnbieterId) ??
-    ctx.anbieter[0]
+    standardAnbieterAus(ctx.anbieter, ctx.standardAnbieterId)
 
   const chat = chatModellAufloesung(workflow.model, anbieter)
   return {

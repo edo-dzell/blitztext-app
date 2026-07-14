@@ -2,6 +2,7 @@
 // Treue Portierung der Prompts aus LLMService.swift (reine Logik).
 
 import type { WorkflowId, WorkflowDefinition } from '@shared/workflows'
+import { sprachPromptName } from '@shared/sprachen'
 
 export interface RewriteSettings {
   tone?: 'formal' | 'neutral' | 'casual'
@@ -142,7 +143,58 @@ export function kapsleTranskript(rohtext: string): string {
  *
  * Bewusst NUR an den Rändern und NUR geklammert: nackte Wörter im Fließtext („Das Transkript war
  * gut") und ein „<" (echtes „kleiner als") mitten im Satz bleiben unangetastet.
+ *
+ * v0.5.0 („5. Wiederkehr" der Leak-Klasse): Am reinen <…>-Schnitt rutschen drei weitere Randformen
+ * vorbei: (a) Markdown-Codefences um das GANZE Ergebnis (```​ / ```lang oben, ``` unten), (b)
+ * konversationelle Vorreden vor dem Text („Hier ist der überarbeitete Text:"), (c) Meta-Nachsätze
+ * NACH einer schon entfernten Schlussmarke („Lass mich wissen, falls du Änderungen brauchst!") —
+ * der alte Loop terminierte nach dem Marken-Schnitt, der Prosa-Nachsatz blieb.
+ *
+ * Leitprinzip PRÄZISION VOR RECALL: Die App fügt den Text UNGEFRAGT ein — ein Fehlschnitt legitimer
+ * Diktat-Inhalte wiegt schwerer als ein durchgerutschtes Präfix. Anders als bei den strukturellen
+ * <…>-Marken (praktisch nie legitim) sind Fence-Zeichen, „Hier ist…"-Zeilen und „ich hoffe"-Sätze
+ * durchaus legitimer Diktat-Inhalt. Deshalb greifen die drei Zusatz-Schnitte NUR unter engen
+ * Struktur- UND Vokabel-Bedingungen:
+ *  - Fence: nur eine eigene Zeile, die AUSSCHLIESSLICH aus ``` (+ optionalem Sprach-Suffix) besteht,
+ *    und nur ganz am Rand → Fences MITTEN im Text (Code-Diktat) und Inline-Backticks bleiben.
+ *  - Vorrede: nur die EIGENE erste Zeile, die mit „:" endet, ein enges Übergabe-Floskel-Muster matcht
+ *    UND von echtem Folgetext gefolgt wird → „Hier ist der Plan:" (kein Floskel-Vokabular) und eine
+ *    Floskel OHNE Folgetext bleiben.
+ *  - Nachsatz: nur ein durch Leerzeile abgetrennter, kurzer Schluss-Absatz aus engem Floskel-Muster.
+ * Alle drei matchen nur an Zeilen-/Absatz-Grenzen, nie mitten im Fließtext.
  */
+
+// Enge Übergabe-Floskel als eigene erste Zeile, die mit „:" endet (Vorrede). Bewusst restriktiv:
+// Der KERN muss ein eindeutiges Übergabe-Verb/-Konstrukt sein — „hier ist/kommt/folgt …", „hier
+// die/der/das …", „here is/here's/here are …", „ich habe … überarbeitet/formuliert/umgeschrieben…"
+// oder „die überarbeitete/korrigierte/finale/… Version/Fassung/Text/Nachricht" — JEWEILS weiterhin
+// kombiniert mit einem Bearbeitungs- oder Text-Wort (wie bisher). Ein optionaler höflicher Vorsatz
+// („Gerne,"/„Klar,"/„Na klar,"/„Kein Problem,") darf VORANGEHEN, ist aber selbst NICHT der Trigger.
+//
+// F3 (zwei Reviewer, P2): Die Vorgänger-Fassung akzeptierte Handover-WÖRTER wie „sicher"/„klar" als
+// bloßes Adverb am Zeilenanfang — das schnitt legitimen Diktat-Anfang ab („Sicher ist sicher, das
+// ist mein Text:", „Klar formulierte Version:", „Sicher, das ist mein Text:" sind normale Diktate,
+// keine Modell-Floskeln). „sicher"/„klar" sind jetzt aus dem Trigger-Vokabular entfernt (auch als
+// Vorsatz — nur „gerne"/„klar[,]"/„na klar"/„kein problem" bleiben als Vorsatz, NICHT „sicher").
+// „Hier ist der Plan:" bleibt weiterhin geschützt (kein Bearbeitungs-/Text-Wort im Kern).
+// PRÄZISION VOR RECALL: bewusst engeres Vokabular, auch wenn dadurch weniger echte Floskeln greifen.
+const VORREDE_KERN =
+  '(?:überarbeitet\\w*|poliert\\w*|korrigiert\\w*|umgeschrieben\\w*|verbessert\\w*|bereinigt\\w*|' +
+  'formuliert\\w*|version|fassung|text|nachricht|rewritten|revised|polished|corrected|improved)'
+const VORREDE_MUSTER = new RegExp(
+  '^(?:(?:gerne|klar|na klar|kein problem)\\s*,\\s*)?(?:' +
+    `hier[^\\n:]*\\b${VORREDE_KERN}\\b[^\\n:]*` +
+    `|here(?:'s| is| are)[^\\n:]*\\b${VORREDE_KERN}\\b[^\\n:]*` +
+    '|ich habe[^\\n:]*\\b(?:überarbeitet\\w*|umgeschrieben\\w*|formuliert\\w*|poliert\\w*|korrigiert\\w*|verbessert\\w*|bereinigt\\w*)\\b[^\\n:]*' +
+    '|die (?:überarbeitete|korrigierte|finale|polierte|umgeschriebene|verbesserte|bereinigte)\\s+(?:version|fassung|text|nachricht)[^\\n:]*' +
+  '):\\s*$',
+  'i'
+)
+
+// Enges Floskel-Muster für einen Meta-Schluss-Absatz (Nachsatz). Kurz + typische Schluss-Floskeln.
+const NACHSATZ_MUSTER =
+  /^(?:lass(?:en)? (?:sie|dich|mich)?\s*(?:es|mich|uns)?\s*wissen|ich hoffe,?\s|falls (?:du|sie|noch)|sag(?:en sie)? bescheid|melde dich|bei fragen|hoffentlich hilft|let me know|i hope (?:this|that) helps|hope (?:this|that) helps|feel free)[^\n]*$/i
+
 export function entferneTranskriptMarken(text: string): string {
   let result = text
   let vorher: string
@@ -156,14 +208,42 @@ export function entferneTranskriptMarken(text: string): string {
       // Extra-Härtung: Schlussmarke, der zusätzlich das „>" abgeschnitten wurde → „</…" am Textende.
       // Nur die „</"-Form, denn echtes „kleiner als" im Satz ist „<", nie „</" → kein Fehlschnitt.
       .replace(/\s*<\/[^<>\n]*$/, '')
+      // v0.5.0 (a) randständige Codefence-Zeile: öffnend am Anfang (mit optionalem Sprach-Suffix) …
+      .replace(/^```[^\n`]*\n/, '')
+      // … oder schließend am Ende. Nur eine reine ```-Zeile am Rand (keine Inline-Backticks).
+      .replace(/\n```\s*$/, '')
+      .replace(/^```\s*$/, '')
       .trim()
+    // v0.5.0 (b) Vorrede: nur die eigene erste Zeile, wenn sie das enge Floskel-Muster matcht UND
+    // echter Folgetext existiert (sonst gäbe es nichts zu behalten → Floskel bliebe als Inhalt).
+    const ersterUmbruch = result.indexOf('\n')
+    if (ersterUmbruch > -1) {
+      const ersteZeile = result.slice(0, ersterUmbruch)
+      const rest = result.slice(ersterUmbruch + 1).trim()
+      if (rest !== '' && VORREDE_MUSTER.test(ersteZeile.trim())) {
+        result = rest
+      }
+    }
+    // v0.5.0 (c) Meta-Nachsatz: ein durch Leerzeile abgetrennter, kurzer Schluss-Absatz aus engem
+    // Floskel-Muster. Nur der LETZTE Absatz, nur wenn davor noch inhaltlicher Text steht.
+    const absatzTrennung = result.lastIndexOf('\n\n')
+    if (absatzTrennung > -1) {
+      const letzterAbsatz = result.slice(absatzTrennung + 2).trim()
+      const davor = result.slice(0, absatzTrennung).trim()
+      if (davor !== '' && !letzterAbsatz.includes('\n') && NACHSATZ_MUSTER.test(letzterAbsatz)) {
+        result = davor
+      }
+    }
+    result = result.trim()
   } while (result !== vorher)
   return result
 }
 
-const SPRACHNAMEN: Record<string, string> = { de: 'Deutsch', en: 'Englisch' }
+// v0.5.0 (W2-F): SPRACHNAMEN kannte nur {de, en} — die Sprachliste ist jetzt in @shared/sprachen
+// zentralisiert (EINE Quelle statt dreier Kopien: hier + WorkflowsView + EinstellungenView).
+// Fallback bei unbekanntem Code bleibt unverändert: der Code selbst (sprachPromptName).
 function zielsprachenBlock(code: string): string {
-  const sprache = SPRACHNAMEN[code] ?? code
+  const sprache = sprachPromptName(code)
   return (
     `Gib deine Antwort AUSSCHLIESSLICH auf ${sprache} aus, auch wenn die Eingabe in einer anderen ` +
     'Sprache verfasst ist. Übersetze den Inhalt sinngemäß; Eigennamen nicht übersetzen; keine ' +

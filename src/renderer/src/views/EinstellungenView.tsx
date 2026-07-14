@@ -3,6 +3,10 @@ import { Trash2, Plus } from 'lucide-react'
 import type { BlitztextSettings } from '@main/settings/store'
 import type { AnbieterKonfig } from '@shared/anbieter'
 import { PROVIDER, getProvider, modelleFuerVorlage } from '@shared/providers'
+import { SPRACHEN } from '@shared/sprachen'
+import { geraeteliste, aufgeloesteGeraetewahl, type MikrofonGeraet } from '@/lib/mikrofon-auswahl'
+import { istSichereAnbieterUrl } from '@/lib/anbieter-url-guard'
+import type { DiagnoseErgebnis } from '@main/health'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -14,7 +18,7 @@ import ZweiEbenenShell from '@/components/ZweiEbenenShell'
 import { useBestaetigung } from '@/components/Bestaetigung'
 import { useHinweis } from '@/components/Hinweis'
 import { useNavGuard } from '@/components/NavGuard'
-import { einstellungenGeaendert } from '@/lib/dirty'
+import { einstellungenGeaendert, apiKeyEntwurfGeaendert } from '@/lib/dirty'
 
 // Einstellungen (P8): Zwei-Ebenen-Ansicht. Band = Anbieter (vorausgewählt) / Transkription & Umschreiben
 // / Datenschutz / Darstellung. Speicher-Modell A: EIN globaler Entwurf, EIN fest sichtbarer (dirty-
@@ -26,7 +30,7 @@ interface Props {
   speichern: (next: BlitztextSettings) => Promise<void>
 }
 
-type Abschnitt = 'anbieter' | 'transkription' | 'datenschutz' | 'darstellung'
+type Abschnitt = 'anbieter' | 'transkription' | 'datenschutz' | 'darstellung' | 'system'
 
 export default function EinstellungenView({ settings, speichern }: Props) {
   const [entwurf, setEntwurf] = useState<BlitztextSettings>(settings)
@@ -89,7 +93,8 @@ export default function EinstellungenView({ settings, speichern }: Props) {
     { id: 'anbieter', titel: 'Anbieter' },
     { id: 'transkription', titel: 'Transkription & Umschreiben' },
     { id: 'datenschutz', titel: 'Datenschutz' },
-    { id: 'darstellung', titel: 'Darstellung' }
+    { id: 'darstellung', titel: 'Darstellung' },
+    { id: 'system', titel: 'System & Diagnose' }
   ]
 
   return (
@@ -143,12 +148,19 @@ export default function EinstellungenView({ settings, speichern }: Props) {
         <div className="flex flex-col gap-4">
           <Field
             label="Sprache"
-            hint="Sprache, in der du diktierst — verbessert die Transkription (ISO-Code, z. B. de, en). Pro Workflow überschreibbar."
+            hint="Sprache, in der du diktierst — verbessert die Transkription. Pro Workflow überschreibbar."
           >
-            <Input
+            <Select
               value={entwurf.language}
               onChange={(e) => setEntwurf({ ...entwurf, language: e.target.value })}
-            />
+            >
+              <option value="">Automatisch erkennen</option>
+              {SPRACHEN.map((s) => (
+                <option key={s.code} value={s.code}>
+                  {s.anzeigeName}
+                </option>
+              ))}
+            </Select>
           </Field>
           <Field
             label="Eigene Begriffe"
@@ -185,6 +197,10 @@ export default function EinstellungenView({ settings, speichern }: Props) {
               <option value="toggle">Drücken</option>
             </Select>
           </Field>
+          <MikrofonFeld
+            gewaehlt={entwurf.mikrofonDeviceId}
+            aendere={(id) => setEntwurf({ ...entwurf, mikrofonDeviceId: id })}
+          />
         </div>
       )}
 
@@ -220,7 +236,222 @@ export default function EinstellungenView({ settings, speichern }: Props) {
           </Select>
         </Field>
       )}
+
+      {auswahl === 'system' && (
+        <div className="flex flex-col gap-4">
+          <AutostartKarte
+            an={entwurf.autostart}
+            aendere={(v) => setEntwurf({ ...entwurf, autostart: v })}
+          />
+          <UpdateKarte
+            an={entwurf.updateHinweisAktiv}
+            aendere={(v) => setEntwurf({ ...entwurf, updateHinweisAktiv: v })}
+          />
+          <DiagnoseKarte />
+        </div>
+      )}
     </ZweiEbenenShell>
+  )
+}
+
+// W3-ζ: Mikrofon-Auswahl. Speist sich aus enumerateDevices() (Renderer-API) + geraeteliste() (reine
+// Filter-Logik). „Automatisch (Standard)" = leere deviceId (OS-Standardgerät, rückwärtskompatibel).
+// Labels sind leer, solange keine Mikrofon-Berechtigung erteilt wurde — dann greift der Fallback-Text.
+// Reale Geräte-Enumeration ist HITL-only (Windows/Berechtigung); headless liefert enumerateDevices [].
+function MikrofonFeld({
+  gewaehlt,
+  aendere
+}: {
+  gewaehlt: string
+  aendere: (id: string) => void
+}) {
+  const [geraete, setGeraete] = useState<MikrofonGeraet[]>([])
+
+  useEffect(() => {
+    let abgemeldet = false
+    async function lade() {
+      try {
+        const alle = await navigator.mediaDevices.enumerateDevices()
+        if (!abgemeldet) setGeraete(geraeteliste(alle))
+      } catch {
+        if (!abgemeldet) setGeraete([]) // keine Berechtigung/kein Zugriff → nur „Automatisch"
+      }
+    }
+    void lade()
+    return () => {
+      abgemeldet = true
+    }
+  }, [])
+
+  // Fallback-Auflösung: eine gespeicherte, aber nicht (mehr) vorhandene deviceId zeigt „Automatisch".
+  const aktiv = aufgeloesteGeraetewahl(gewaehlt || undefined, geraete.map((g) => g.id)) ?? ''
+
+  return (
+    <Field
+      label="Mikrofon"
+      hint='Aufnahmegerät für das Diktieren. „Automatisch" nutzt das Windows-Standardgerät. Gerätenamen erscheinen erst nach erteilter Mikrofon-Berechtigung.'
+    >
+      <Select value={aktiv} onChange={(e) => aendere(e.target.value)}>
+        <option value="">Automatisch (Standard)</option>
+        {geraete.map((g, i) => (
+          <option key={g.id || i} value={g.id}>
+            {g.label || `Mikrofon ${i + 1}`}
+          </option>
+        ))}
+      </Select>
+    </Field>
+  )
+}
+
+// W3-γ: Autostart-Schalter mit dem EHRLICHEN Hinweis (portable .exe: Eintrag zeigt auf den .exe-Pfad
+// zum Einschalt-Zeitpunkt; Verschieben/Umbenennen macht ihn wirkungslos). Zeigt zusätzlich den echten
+// Registry-Status (aktiv/verwaist), sobald er geladen ist.
+function AutostartKarte({ an, aendere }: { an: boolean; aendere: (v: boolean) => void }) {
+  const [statusText, setStatusText] = useState<string | null>(null)
+
+  useEffect(() => {
+    let abgemeldet = false
+    void window.blitztext.autostart.status().then((s) => {
+      if (abgemeldet) return
+      if (s.zustand === 'verwaist') {
+        setStatusText('Der hinterlegte Eintrag zeigt auf eine andere/verschobene .exe — bitte neu einschalten.')
+      } else {
+        setStatusText(null)
+      }
+    })
+    return () => {
+      abgemeldet = true
+    }
+  }, [an])
+
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-2 p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium">Mit Windows starten</p>
+            <p className="text-xs text-muted-foreground">
+              Startet Blitztext automatisch bei der Anmeldung. Hinweis: bricht, wenn die .exe verschoben
+              oder umbenannt wird (portable App ohne Installer) — dann bitte hier neu einschalten.
+            </p>
+          </div>
+          <Switch checked={an} onCheckedChange={aendere} />
+        </div>
+        {statusText && <p className="text-xs text-amber-600 dark:text-amber-500">{statusText}</p>}
+      </CardContent>
+    </Card>
+  )
+}
+
+// W3-δ: Opt-in Update-Hinweis. Default AUS (kein Netzabruf ohne Zustimmung). Bei „an" wird beim
+// nächsten Start (und hier auf Wunsch) die GitHub-Releases-API des öffentlichen Forks abgefragt —
+// anonym, kein Auto-Download. Zeigt einen dezenten Hinweis mit Link, wenn eine neuere Version vorliegt.
+function UpdateKarte({ an, aendere }: { an: boolean; aendere: (v: boolean) => void }) {
+  const [ergebnis, setErgebnis] = useState<{ neuVerfuegbar: boolean; url: string; aktuelleVersion: string } | null>(
+    null
+  )
+
+  useEffect(() => {
+    if (!an) {
+      setErgebnis(null)
+      return
+    }
+    let abgemeldet = false
+    void window.blitztext.update.pruefe().then((r) => {
+      if (!abgemeldet) setErgebnis(r)
+    })
+    return () => {
+      abgemeldet = true
+    }
+  }, [an])
+
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-2 p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium">Nach Updates suchen</p>
+            <p className="text-xs text-muted-foreground">
+              Fragt beim Start anonym die Releases-Seite ab (kein Auto-Download, keine Telemetrie).
+              Standardmäßig aus.
+            </p>
+          </div>
+          <Switch checked={an} onCheckedChange={aendere} />
+        </div>
+        {an && ergebnis?.neuVerfuegbar && ergebnis.url && (
+          <p className="text-xs">
+            Neue Version verfügbar —{' '}
+            <a href={ergebnis.url} target="_blank" rel="noreferrer" className="underline">
+              Release ansehen
+            </a>
+          </p>
+        )}
+        {an && ergebnis && !ergebnis.neuVerfuegbar && (
+          <p className="text-xs text-muted-foreground">Aktuell auf dem neuesten Stand.</p>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// W3-ε: Selbstdiagnose-Ampel. Ruft health.diagnose mit der im Renderer ermittelten Mikrofon-Anzahl
+// (enumerateDevices) auf und zeigt je Check + Gesamt eine Ampel (ok/warnung/fehler). „Erneut prüfen"
+// löst eine frische Diagnose aus. Reale Werte (Erreichbarkeit/Mikrofon/Hotkey) sind HITL-only (Windows).
+function DiagnoseKarte() {
+  const [ergebnis, setErgebnis] = useState<DiagnoseErgebnis | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  async function pruefe() {
+    setBusy(true)
+    let mikrofonAnzahl = 0
+    try {
+      const alle = await navigator.mediaDevices.enumerateDevices()
+      mikrofonAnzahl = geraeteliste(alle).length
+    } catch {
+      mikrofonAnzahl = 0
+    }
+    setErgebnis(await window.blitztext.health.diagnose(mikrofonAnzahl))
+    setBusy(false)
+  }
+
+  const farbe = (s: 'ok' | 'warnung' | 'fehler') =>
+    s === 'ok'
+      ? 'bg-emerald-500'
+      : s === 'warnung'
+        ? 'bg-amber-500'
+        : 'bg-red-500'
+
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-3 p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            {ergebnis && <span className={`size-3 rounded-full ${farbe(ergebnis.gesamtstatus)}`} />}
+            <p className="text-sm font-medium">Selbstdiagnose</p>
+          </div>
+          <Button size="sm" variant="secondary" onClick={pruefe} disabled={busy}>
+            {busy ? 'Prüfe…' : 'Erneut prüfen'}
+          </Button>
+        </div>
+        {ergebnis ? (
+          <ul className="flex flex-col gap-2">
+            {ergebnis.checks.map((c) => (
+              <li key={c.titel} className="flex items-start gap-2">
+                <span className={`mt-1 size-2.5 shrink-0 rounded-full ${farbe(c.status)}`} />
+                <div>
+                  <p className="text-sm">{c.titel}</p>
+                  <p className="text-xs text-muted-foreground">{c.detail}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Prüft API-Key, Anbieter-Erreichbarkeit, Mikrofon und Hotkey-Erkennung.
+          </p>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -241,12 +472,28 @@ function AnbieterKarte({ anbieter, istStandard, standardWaehlen, aendere, entfer
   const [keyInput, setKeyInput] = useState('')
   const [keyBusy, setKeyBusy] = useState(false)
   const [keyFehler, setKeyFehler] = useState<string | null>(null)
+  const { registriereDirty } = useNavGuard()
 
   useEffect(() => {
     void window.blitztext.apiKey.maske(anbieter.id).then(setMaske)
   }, [anbieter.id])
 
+  // W1-E (P1-Datenverlust): ein getippter, nicht gespeicherter API-Key zählt als dirty — sonst geht er
+  // beim Wegnavigieren stumm verloren (Keys werden separat/sofort gespeichert, nicht über den
+  // Settings-Entwurf, daher eigene Guard-Quelle je Anbieter-Karte).
+  const keyGeaendert = apiKeyEntwurfGeaendert(keyInput)
+  useEffect(
+    () => registriereDirty(`api-key:${anbieter.id}`, () => keyGeaendert),
+    [registriereDirty, anbieter.id, keyGeaendert]
+  )
+
   async function speichereKey() {
+    // S21-Rest (URL-Guard): bei Custom-Anbietern mit unsicherer Base-URL (weder https noch
+    // localhost/127.0.0.1/::1) den Key NICHT senden — sonst ginge er im Klartext übers Netz.
+    if (istCustom && !istSichereAnbieterUrl(anbieter.baseUrl)) {
+      setKeyFehler('Unsichere Base-URL — bitte erst https:// (oder localhost) eintragen.')
+      return
+    }
     setKeyBusy(true)
     setKeyFehler(null)
     const v = await window.blitztext.apiKey.save(anbieter.id, keyInput.trim(), anbieter.baseUrl)
@@ -299,6 +546,14 @@ function AnbieterKarte({ anbieter, istStandard, standardWaehlen, aendere, entfer
             placeholder="https://…/v1"
             onChange={(e) => aendere({ baseUrl: e.target.value })}
           />
+          {/* S21-Rest (Klartext-Warnung): dezenter Hinweis bei unsicherer Base-URL (weder https
+              noch localhost/127.0.0.1/::1) — API-Key ginge sonst im Klartext übers Netz. Blockiert
+              nichts hart (leeres Feld/Tippen in Ruhe möglich), warnt nur inline. */}
+          {anbieter.baseUrl.trim() !== '' && !istSichereAnbieterUrl(anbieter.baseUrl) && (
+            <p className="text-xs text-destructive">
+              Unsichere URL — bitte https:// verwenden (http:// nur für localhost/127.0.0.1).
+            </p>
+          )}
         </Field>
       )}
 

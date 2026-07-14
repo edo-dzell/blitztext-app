@@ -49,4 +49,55 @@ describe('validateApiKey', () => {
     await validateApiKey('sk', { baseUrl: 'https://api.groq.com/openai/v1', fetchFn: fetchSpy })
     expect(url).toBe('https://api.groq.com/openai/v1/models')
   })
+
+  // --- F2: URL-Guard im Main durchsetzen (Security-Review P1) ---
+
+  it('F2: https-Base-URL ⇒ Request geht raus wie gewohnt', async () => {
+    let called = false
+    const fetchFn = (async () => {
+      called = true
+      return new Response(null, { status: 200 })
+    }) as unknown as typeof fetch
+
+    const result = await validateApiKey('sk', {
+      baseUrl: 'https://api.openai.com/v1',
+      fetchFn
+    })
+    expect(result).toEqual({ status: 'valid' })
+    expect(called).toBe(true)
+  })
+
+  it('F2: http-Base-URL zu fremdem Host ⇒ blockiert, KEIN fetch, network-error statt Netzwerk-Retry', async () => {
+    let called = false
+    const fetchFn = (async () => {
+      called = true
+      return new Response(null, { status: 200 })
+    }) as unknown as typeof fetch
+
+    const result = await validateApiKey('sk', {
+      baseUrl: 'http://api.example.com/v1',
+      fetchFn
+    })
+
+    expect(called).toBe(false)
+    expect(result.status).toBe('network-error')
+    if (result.status === 'network-error') {
+      expect(result.message).toMatch(/http|unverschlüsselt/i)
+    }
+  })
+
+  it('F2: http-Base-URL auf localhost ⇒ erlaubt (lokales ASR ohne TLS)', async () => {
+    let called = false
+    const fetchFn = (async () => {
+      called = true
+      return new Response(null, { status: 200 })
+    }) as unknown as typeof fetch
+
+    const result = await validateApiKey('sk', {
+      baseUrl: 'http://localhost:8080/v1',
+      fetchFn
+    })
+    expect(result).toEqual({ status: 'valid' })
+    expect(called).toBe(true)
+  })
 })

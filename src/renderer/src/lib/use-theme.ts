@@ -14,7 +14,24 @@ export function useTheme(theme: BlitztextSettings['theme'] | undefined): void {
     if (theme === 'dunkel') return wende(true)
     if (theme === 'hell') return wende(false)
     // 'system': Initialwert holen + auf Änderungen lauschen.
-    void window.blitztext.theme.systemDark().then(wende)
-    window.blitztext.theme.onSystemChanged(wende)
+    let abgemeldet = false
+    void window.blitztext.theme.systemDark().then((dark) => {
+      if (!abgemeldet) wende(dark)
+    })
+    // S21-Rest (Listener-Leak): onSystemChanged registriert bei jedem Effect-Lauf einen neuen
+    // ipcRenderer-Listener; ohne Abmeldung akkumulieren sie (bei jedem Theme-Wechsel hin zu
+    // 'system', StrictMode-Doppel-Mount etc.). preload/index.ts liefert (Muster wie
+    // history.onChanged) jetzt eine echte Abmelde-Funktion zurück (removeListener auf dieselbe
+    // Listener-Referenz) → hier zusätzlich zum `abgemeldet`-Flag aufgerufen, damit sowohl der
+    // sichtbare Effekt (falsches Theme nach Wechsel) als auch die zugrundeliegende
+    // ipcRenderer-Listener-Akkumulation behoben sind.
+    const abgemeldeteWende = (dark: boolean): void => {
+      if (!abgemeldet) wende(dark)
+    }
+    const abmelden = window.blitztext.theme.onSystemChanged(abgemeldeteWende)
+    return () => {
+      abgemeldet = true
+      abmelden?.()
+    }
   }, [theme])
 }

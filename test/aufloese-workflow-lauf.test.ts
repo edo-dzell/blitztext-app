@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
   aufloeseWorkflowLauf,
-  anbieterAusProvider,
   chatModellAufloesung,
   findeAnbieter,
   type AnbieterKonfig
@@ -130,24 +129,6 @@ describe('aufloeseWorkflowLauf', () => {
     )
     expect(lauf.language).toBe('de')
     expect(lauf.asrModell).toBe('whisper-1')
-  })
-})
-
-describe('anbieterAusProvider', () => {
-  it('leitet eine Anbieter-Konfig aus dem Single-Provider-Feld ab (bekannte Vorlage)', () => {
-    const a = anbieterAusProvider({
-      id: 'groq',
-      baseUrl: 'https://api.groq.com/openai/v1',
-      asrModell: 'whisper-large-v3',
-      chatModell: 'llama-3.1-8b-instant'
-    })
-    expect(a).toMatchObject({ id: 'groq', vorlage: 'groq', label: 'Groq' })
-  })
-
-  it('unbekannte Id → Vorlage custom', () => {
-    const a = anbieterAusProvider({ id: 'eigenes', baseUrl: 'https://x', asrModell: 'm', chatModell: 'c' })
-    expect(a.vorlage).toBe('custom')
-    expect(a.label).toBe('eigenes')
   })
 })
 

@@ -212,6 +212,51 @@ export function werksVerhalten(id: string): Partial<WorkflowDefinition> | undefi
   return out as Partial<WorkflowDefinition>
 }
 
+// --- Prompt-Kennung im Verlauf (V5): identifiziert den Prompt-STAND, der einen Endtext erzeugte. ---
+// Reine, deterministische Funktion — bewusst ohne Node-`crypto` (Datei bleibt framework-/laufzeit-
+// unabhängig; läuft in Main, Renderer UND Tests gleich). FNV-1a 32-bit ist für diesen Zweck
+// (Kollisionsanzeige bei Prompt-Änderungen, KEINE Sicherheitsfunktion) ausreichend.
+function kurzHash(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  // >>> 0 macht das Ergebnis unsigned, damit toString(16) keine führende Minus-/Vorzeichenform liefert.
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
+/**
+ * Bildet eine deterministische Kennung des Prompt-Stands, der einen bestimmten Endtext erzeugt hat
+ * (V5, Verlauf-Anzeige). `aufgeloesterPrompt` ist der fertige System-Prompt-Text, wie ihn
+ * `resolveSystemPrompt` zur Laufzeit gebaut hat.
+ *
+ * - Eingebaute Workflows (`builtin===true`, i. d. R. `promptModus==='berechnet'`): Der Prompt-TEXT
+ *   selbst ändert sich mit jedem Prompt-Fix (v0.4.2…v0.4.5 etc.) — es gibt keine separate
+ *   Versionsnummer. Kennung = `builtin:<workflowId>@<kurzHash(aufgeloesterPrompt)>`; ändert sich der
+ *   Built-in-Prompt-Text (Bugfix/Härtung), ändert sich automatisch auch die Kennung.
+ * - Statische/eigene Prompts MIT passendem Eintrag in `promptHistorie` (Text-Gleichheit mit dem
+ *   aktuell gespeicherten `systemPrompt`): die `PromptVersion.id` dieses Eintrags — stabil über
+ *   Läufe hinweg, solange sich der gespeicherte Prompt nicht ändert.
+ * - Statische/eigene Prompts OHNE passenden Historie-Eintrag (z. B. Historie leer/deaktiviert):
+ *   `custom:<kurzHash(aufgeloesterPrompt)>` als Fallback.
+ */
+export function promptKennungFuer(
+  workflowDef: Pick<WorkflowDefinition, 'id' | 'builtin' | 'promptModus' | 'systemPrompt' | 'promptHistorie'>,
+  aufgeloesterPrompt: string
+): string {
+  if (workflowDef.builtin) {
+    return `builtin:${workflowDef.id}@${kurzHash(aufgeloesterPrompt)}`
+  }
+  if (workflowDef.promptModus === 'statisch') {
+    const treffer = (workflowDef.promptHistorie ?? []).find(
+      (v) => v.text === workflowDef.systemPrompt
+    )
+    if (treffer) return treffer.id
+  }
+  return `custom:${kurzHash(aufgeloesterPrompt)}`
+}
+
 /** Weicht ein EINGEBAUTER Workflow in einem Verhaltensfeld vom Werkszustand ab? (steuert Reset-Sichtbarkeit) */
 export function weichtVomWerkAb(w: WorkflowDefinition): boolean {
   if (!w.builtin) return false

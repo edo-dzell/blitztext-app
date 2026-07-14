@@ -47,6 +47,9 @@ describe('createSettingsStore', () => {
       preisOverrides: { 'gpt-4o-mini': { inputPro1MUsd: 1 } },
       usdEurKurs: 0.9,
       apiKeyStatus: { groq: { status: 'verifiziert' as const, zuletztGetestetMs: 123 } },
+      autostart: true,
+      mikrofonDeviceId: 'geraet-abc',
+      updateHinweisAktiv: true,
       workflows: [
         {
           id: 'transcribe',
@@ -94,6 +97,49 @@ describe('createSettingsStore', () => {
     const { workflows: _lw, ...loadedRest } = loaded
     const { workflows: _sw, ...settingsRest } = settings
     expect(loadedRest).toEqual(settingsRest)
+  })
+
+  // W3-γ/δ/ζ (Staffel 3.2): neue Felder migrationssicher — eine alte Datei OHNE diese Felder lädt mit
+  // konservativen Defaults (Autostart aus, Mikrofon = OS-Standard/leer, Update-Hinweis aus).
+  it('alte Datei ohne W3-Felder ⇒ konservative Defaults (autostart/updateHinweis aus, Mikrofon leer)', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(JSON.stringify({ language: 'de', tone: 'formal' }))
+    })
+    const loaded = await store.load()
+    expect(loaded.autostart).toBe(false)
+    expect(loaded.mikrofonDeviceId).toBe('')
+    expect(loaded.updateHinweisAktiv).toBe(false)
+  })
+
+  it('W3-Felder werden übernommen und round-trippen (autostart/mikrofonDeviceId/updateHinweisAktiv)', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(
+        JSON.stringify({ autostart: true, mikrofonDeviceId: 'mic-42', updateHinweisAktiv: true })
+      )
+    })
+    const loaded = await store.load()
+    expect(loaded.autostart).toBe(true)
+    expect(loaded.mikrofonDeviceId).toBe('mic-42')
+    expect(loaded.updateHinweisAktiv).toBe(true)
+  })
+
+  it('typfremde W3-Werte fallen auf die Defaults zurück (kein Absturz)', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(
+        JSON.stringify({ autostart: 'ja', mikrofonDeviceId: 123, updateHinweisAktiv: 1 })
+      )
+    })
+    const loaded = await store.load()
+    expect(loaded.autostart).toBe(false) // nur === true zählt
+    expect(loaded.mikrofonDeviceId).toBe('') // Nicht-String → Default
+    expect(loaded.updateHinweisAktiv).toBe(false)
+  })
+
+  it('defaultSettings enthält die neuen W3-Felder mit konservativen Defaults', () => {
+    const d = defaultSettings()
+    expect(d.autostart).toBe(false)
+    expect(d.mikrofonDeviceId).toBe('')
+    expect(d.updateHinweisAktiv).toBe(false)
   })
 
   it('seedet die vier eingebauten Workflows ohne vorhandenes File', async () => {
@@ -291,5 +337,156 @@ describe('createSettingsStore', () => {
     expect(loaded.usdEurKurs).toBe(0.92)
     expect(loaded.preisOverrides).toEqual({ 'gpt-4o': { inputPro1MUsd: 3 } })
     expect(loaded.apiKeyStatus).toEqual({ openai: { status: 'verifiziert', zuletztGetestetMs: 5 } })
+  })
+
+  // R3/#26: Prompt-Historie je Workflow (parsePromptHistorie) — feldweise Validierung inkl. `quelle`.
+  describe('Prompt-Historie (R3/#26): parsePromptHistorie', () => {
+    it('lädt gültige Einträge beider quelle-Werte unverändert', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              {
+                id: 'mein-flow',
+                label: 'Mein Flow',
+                builtin: false,
+                rewrites: true,
+                promptModus: 'statisch',
+                systemPrompt: 'aktuell',
+                promptHistorie: [
+                  { id: 'v2', zeitstempelMs: 200, text: 'zweite', quelle: 'assistent' },
+                  { id: 'v1', zeitstempelMs: 100, text: 'erste', quelle: 'manuell' }
+                ]
+              }
+            ]
+          })
+        )
+      }).load()
+      const flow = loaded.workflows.find((w) => w.id === 'mein-flow')
+      expect(flow?.promptHistorie).toEqual([
+        { id: 'v2', zeitstempelMs: 200, text: 'zweite', quelle: 'assistent' },
+        { id: 'v1', zeitstempelMs: 100, text: 'erste', quelle: 'manuell' }
+      ])
+    })
+
+    it('unbekannter/fehlender quelle-Wert fällt auf manuell zurück (kein Wurf)', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              {
+                id: 'mein-flow',
+                label: 'Mein Flow',
+                builtin: false,
+                rewrites: true,
+                promptModus: 'statisch',
+                systemPrompt: 'x',
+                promptHistorie: [
+                  { id: 'v1', zeitstempelMs: 1, text: 'a', quelle: 'unbekannt' },
+                  { id: 'v2', zeitstempelMs: 2, text: 'b' } // quelle fehlt ganz
+                ]
+              }
+            ]
+          })
+        )
+      }).load()
+      const flow = loaded.workflows.find((w) => w.id === 'mein-flow')
+      expect(flow?.promptHistorie).toEqual([
+        { id: 'v1', zeitstempelMs: 1, text: 'a', quelle: 'manuell' },
+        { id: 'v2', zeitstempelMs: 2, text: 'b', quelle: 'manuell' }
+      ])
+    })
+
+    it('verwirft Einträge ohne id/text, fehlender zeitstempelMs fällt auf 0 zurück', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              {
+                id: 'mein-flow',
+                label: 'Mein Flow',
+                builtin: false,
+                rewrites: true,
+                promptModus: 'statisch',
+                systemPrompt: 'x',
+                promptHistorie: [
+                  { id: 'gueltig', text: 'ok', quelle: 'manuell' }, // zeitstempelMs fehlt → 0
+                  { text: 'ohne id', quelle: 'manuell' }, // keine id → verworfen
+                  { id: 'ohne-text', quelle: 'manuell' }, // kein text → verworfen
+                  'nicht-mal-ein-objekt' // kein Objekt → verworfen
+                ]
+              }
+            ]
+          })
+        )
+      }).load()
+      const flow = loaded.workflows.find((w) => w.id === 'mein-flow')
+      expect(flow?.promptHistorie).toEqual([
+        { id: 'gueltig', zeitstempelMs: 0, text: 'ok', quelle: 'manuell' }
+      ])
+    })
+
+    it('round-trippt promptHistorie über save→load (beide quelle-Werte, Reihenfolge erhalten)', async () => {
+      const store = createSettingsStore({ file: fakeFile() })
+      const settings = {
+        ...defaultSettings(),
+        workflows: [
+          {
+            id: 'mein-flow',
+            label: 'Mein Flow',
+            summary: '',
+            builtin: false,
+            rewrites: true,
+            promptModus: 'statisch' as const,
+            systemPrompt: 'aktuell',
+            model: '',
+            temperature: 0.3,
+            anbieterId: '',
+            language: '',
+            ausgabeSprache: '',
+            promptHistorie: [
+              { id: 'v3', zeitstempelMs: 300, text: 'neueste', quelle: 'assistent' as const },
+              { id: 'v2', zeitstempelMs: 200, text: 'mitte', quelle: 'manuell' as const },
+              { id: 'v1', zeitstempelMs: 100, text: 'aelteste', quelle: 'manuell' as const }
+            ]
+          }
+        ]
+      }
+      await store.save(settings)
+      const loaded = await store.load()
+      const flow = loaded.workflows.find((w) => w.id === 'mein-flow')
+      expect(flow?.promptHistorie).toEqual(settings.workflows[0]!.promptHistorie)
+    })
+
+    it('fehlendes/ungültiges promptHistorie-Feld ergibt kein Feld (undefined), kein Wurf', async () => {
+      const ohneFeld = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              { id: 'mein-flow', label: 'M', builtin: false, rewrites: true, promptModus: 'statisch' }
+            ]
+          })
+        )
+      }).load()
+      expect(ohneFeld.workflows.find((w) => w.id === 'mein-flow')?.promptHistorie).toBeUndefined()
+
+      const keinArray = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              {
+                id: 'mein-flow',
+                label: 'M',
+                builtin: false,
+                rewrites: true,
+                promptModus: 'statisch',
+                promptHistorie: 'nicht-array'
+              }
+            ]
+          })
+        )
+      }).load()
+      expect(keinArray.workflows.find((w) => w.id === 'mein-flow')?.promptHistorie).toBeUndefined()
+    })
   })
 })

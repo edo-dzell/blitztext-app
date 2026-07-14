@@ -50,7 +50,8 @@ describe('createMainComposition', () => {
         anzeigen: vi.fn(),
         zeigeEinstellungen: vi.fn(),
         melde: vi.fn(),
-        inZwischenablage: vi.fn()
+        inZwischenablage: vi.fn(),
+        erfasseFenster: vi.fn(() => null)
       },
       apiKeys: { has: async () => false, get: async () => null, set: async () => {}, clear: async () => {}, maske: async () => null },
       settingsFile: { read: async () => null, write: async () => {} },
@@ -77,6 +78,9 @@ describe('createMainComposition', () => {
     // #03: Abbruch-Naht nach außen (für den Tray-Eintrag).
     expect(typeof comp.brichAb).toBe('function')
     expect(comp.beschaeftigt()).toBe(false)
+    // F1 (W3-B): Retry-Naht nach außen (Tray-Eintrag/Notification-Button); ohne Lauf kein Retry möglich.
+    expect(typeof comp.erneutVersuchen).toBe('function')
+    expect(comp.kannErneutVersuchen()).toBe(false)
   })
 
   it('verschiebt aktualisiere während eines aktiven Laufs und übernimmt es nach Lauf-Ende', async () => {
@@ -92,7 +96,8 @@ describe('createMainComposition', () => {
         anzeigen: vi.fn(),
         zeigeEinstellungen: vi.fn(),
         melde: vi.fn(),
-        inZwischenablage: vi.fn()
+        inZwischenablage: vi.fn(),
+        erfasseFenster: vi.fn(() => null)
       },
       apiKeys: { has: async () => true, get: async () => 'sk', set: async () => {}, clear: async () => {}, maske: async () => null },
       settingsFile: { read: async () => null, write: async () => {} },
@@ -115,7 +120,7 @@ describe('createMainComposition', () => {
     expect(comp.sitzung.beschaeftigt()).toBe(true)
 
     const next = await comp.einstellungen.load()
-    next.anbieter = [{ ...next.anbieter[0], baseUrl: 'https://api.groq.com/openai/v1' }]
+    next.anbieter = [{ ...next.anbieter[0]!, baseUrl: 'https://api.groq.com/openai/v1' }]
     // Während des Laufs: verschoben, Base-URL NICHT gewechselt.
     expect(comp.aktualisiere(next)).toBe(false)
     expect(comp.aktuelleBaseUrl()).toBe('https://api.openai.com/v1')
@@ -140,7 +145,8 @@ describe('createMainComposition', () => {
         anzeigen: vi.fn(),
         zeigeEinstellungen: vi.fn(),
         melde: vi.fn(),
-        inZwischenablage: vi.fn()
+        inZwischenablage: vi.fn(),
+        erfasseFenster: vi.fn(() => null)
       },
       apiKeys: { has: async () => true, get: async () => 'sk', set: async () => {}, clear: async () => {}, maske: async () => null },
       settingsFile: { read: async () => null, write: async () => {} },

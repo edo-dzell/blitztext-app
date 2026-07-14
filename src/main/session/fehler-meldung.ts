@@ -8,8 +8,13 @@ import type { TeilErfolgGrund } from '@main/workflow/runner'
 export interface FehlerMeldung {
   titel: string
   koerper: string
-  /** Wenn gesetzt: der Adapter bietet einen Sprung in die Einstellungen an (z. B. Notification-Klick). */
-  aktion?: 'einstellungen'
+  /**
+   * Wenn gesetzt, bietet der Adapter eine Folge-Aktion an (z. B. Notification-Klick):
+   * - 'einstellungen': Sprung in die Einstellungen (Konfigurationsfehler).
+   * - 'erneut': erneuter Versuch ab Transkription mit dem gehaltenen Audio (W3-B), OHNE neues Diktat.
+   *   Der Konsument (Staffel 3.2 UI) verbindet diese Aktion mit `sitzung.erneutVersuchen()`.
+   */
+  aktion?: 'einstellungen' | 'erneut'
 }
 
 /**
@@ -30,10 +35,33 @@ export function teilErfolgMeldung(grund: TeilErfolgGrund): FehlerMeldung {
         koerper:
           'Das Diktat sah aus wie eine Anweisung an die KI — der Rohtext liegt in der Zwischenablage, kein automatisches Einfügen.'
       }
+    case 'abgeschnitten':
+      return {
+        titel: 'Umschreiben abgeschnitten',
+        koerper:
+          'Die Antwort wurde vom Modell abgeschnitten (Token-Limit) — der Rohtext liegt in der Zwischenablage — mit Strg+V einfügen.'
+      }
   }
 }
 
-export function fehlerMeldung(art: FehlerArt, message: string): FehlerMeldung {
+/**
+ * Fokus-Drift (W3-A, ADR-0011 Weg B): der Nutzer hat während Transkription/Umschreiben das
+ * Vordergrundfenster gewechselt. Statt in ein fremdes Fenster zu tippen, liegt der fertige Text in
+ * der Zwischenablage — der Nutzer fügt selbst ein. Keine Sprung-Aktion (nur ein Hinweis).
+ */
+export function fokusDriftMeldung(): FehlerMeldung {
+  return {
+    titel: 'Fokus gewechselt',
+    koerper: 'Der Text liegt in der Zwischenablage — mit Strg+V einfügen.'
+  }
+}
+
+/**
+ * @param retrybar Bei transienten Fehlern (netzwerk/anbieter) hält die Sitzung das Audio flüchtig im
+ * Speicher (W3-B) → die Meldung trägt `aktion:'erneut'`, damit die UI (Staffel 3.2) einen erneuten
+ * Versuch ab Transkription anbieten kann (kein neues Diktat nötig).
+ */
+export function fehlerMeldung(art: FehlerArt, message: string, retrybar = false): FehlerMeldung {
   switch (art) {
     case 'aufnahme':
       return { titel: 'Nichts aufgenommen', koerper: message }
@@ -42,9 +70,14 @@ export function fehlerMeldung(art: FehlerArt, message: string): FehlerMeldung {
     case 'netzwerk':
       return {
         titel: 'Keine Verbindung',
-        koerper: 'Verbindung zum Anbieter fehlgeschlagen — bitte später erneut versuchen.'
+        koerper: 'Verbindung zum Anbieter fehlgeschlagen — bitte später erneut versuchen.',
+        ...(retrybar ? { aktion: 'erneut' as const } : {})
       }
     case 'anbieter':
-      return { titel: 'Fehler beim Anbieter', koerper: message }
+      return {
+        titel: 'Fehler beim Anbieter',
+        koerper: message,
+        ...(retrybar ? { aktion: 'erneut' as const } : {})
+      }
   }
 }

@@ -7,6 +7,7 @@
 
 import { asrUnterstuetztTextFormat } from '@shared/providers'
 import { leseFehlerDetail, type AnbieterFehler } from '@main/workflow/fehler-klassifikation'
+import { pruefeAnbieterUrlSicherheit } from '@shared/anbieter-url-guard'
 
 export interface TranscribeOptions {
   language?: string
@@ -30,6 +31,21 @@ const OPENAI_DEFAULT: TranscriptionConfig = {
   model: 'whisper-1'
 }
 
+// Größen-Guard (W1-F): OpenAI-kompatible ASR-Endpunkte limitieren Uploads auf ~25 MB (OpenAI-Doku).
+// 24 MB Sicherheitsmarge (statt exakt 25 MB) fängt Rundungs-/Encoding-Overhead ab, bevor der Anbieter
+// mit einem 4xx antwortet. Der Guard prüft VOR dem fetch → sofortiger, klarer Fehler statt langem
+// Upload-Warten + kryptischer Server-Meldung. Exportiert, damit Tests eine kleine Grenze injizieren können.
+export const MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+
+// Fetch-Timeout (W1-F): der Runner-Watchdog (90 s, runner.ts) ist der Backstop für JEDEN hängenden
+// Anbieter-Aufruf und klassifiziert bewusst als 'anbieter' (nicht wiederholbar — siehe
+// fehler-klassifikation.ts). Ein eigener, KÜRZERER Provider-Timeout liegt darunter, damit ein
+// stockender Verbindungsaufbau/Transfer VOR dem Watchdog als Transport-/Verbindungsfehler auffällt
+// (`.transport = true` → Fehler-Art 'netzwerk', wiederholbar via mitRetry) statt erst nach 90 s als
+// nicht wiederholbarer Anbieter-Fehler zu enden. 60 s lässt große Uploads (bis MAX_UPLOAD_BYTES) auf
+// langsamen Leitungen zu und bleibt trotzdem deutlich unter den 90 s des Watchdogs.
+export const DEFAULT_FETCH_TIMEOUT_MS = 60_000
+
 export function createCloudTranscriptionProvider(deps: {
   getApiKey: () => Promise<string | null>
   /** Aktive Provider-Config; ohne Angabe = OpenAI/whisper-1 (v1-Verhalten). */
@@ -37,9 +53,15 @@ export function createCloudTranscriptionProvider(deps: {
   /** L1: erlaubt einen Lauf OHNE Key (key-loser lokaler Anbieter) → kein Authorization-Header. */
   erlaubeOhneKey?: () => boolean
   fetchFn?: typeof fetch
+  /** Obergrenze für die Audio-Blob-Größe; Default MAX_UPLOAD_BYTES. Injizierbar für Tests. */
+  maxUploadBytes?: number
+  /** Eigener Fetch-Timeout in ms; Default DEFAULT_FETCH_TIMEOUT_MS. Injizierbar für Tests. */
+  fetchTimeoutMs?: number
 }): TranscriptionProvider {
   const fetchFn = deps.fetchFn ?? fetch
   const getConfig = deps.getConfig ?? (() => OPENAI_DEFAULT)
+  const maxUploadBytes = deps.maxUploadBytes ?? MAX_UPLOAD_BYTES
+  const fetchTimeoutMs = deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS
 
   return {
     async transcribe(audio, options = {}) {
@@ -48,7 +70,24 @@ export function createCloudTranscriptionProvider(deps: {
         throw new Error('OpenAI API-Key fehlt. Bitte in den Einstellungen hinterlegen.')
       }
 
+      if (audio.size > maxUploadBytes) {
+        // Bewusst OHNE .status/.transport: die Fehler-Klassifikation (fehler-klassifikation.ts)
+        // kennt Fehler-Art 'aufnahme' nur als Urteil des Runners (zu kurz/Artefakt) und leitet sie
+        // nie aus strukturierten Feldern ab. Ein "nackter" Error ohne diese Felder landet dort
+        // deterministisch auf 'anbieter' — NICHT auf 'netzwerk' (kein sinnloser Retry einer Datei,
+        // die so oder so zu groß bleibt) und nicht auf 'konfiguration' (kein Einrichtungsfehler).
+        throw new Error(
+          'Diktat zu lang für die Übertragung. Bitte kürzer aufnehmen oder in Abschnitten diktieren.'
+        )
+      }
+
       const { baseUrl, model } = getConfig()
+
+      // F2 (Security-Review P1): Hart-Block VOR dem Key-tragenden fetch — http zu einem fremden Host
+      // würde den Bearer-Key im Klartext senden. localhost/127.0.0.1/::1 mit http bleibt erlaubt
+      // (lokales ASR). Der Fehler trägt .status=400 → Fehler-Art 'konfiguration' (kein Retry).
+      pruefeAnbieterUrlSicherheit(baseUrl)
+
       const textFormat = asrUnterstuetztTextFormat(model)
 
       const form = new FormData()
@@ -63,16 +102,43 @@ export function createCloudTranscriptionProvider(deps: {
         form.append('prompt', `Eigennamen und Begriffe: ${options.vocabularyHints.join(', ')}`)
       }
 
+      // Eigener Fetch-Timeout (W1-F, unter dem 90s-Runner-Watchdog): kombiniert mit einem etwaig
+      // durchgereichten Abbruch-Signal (Nutzer-Abbruch oder Watchdog des Aufrufers), sodass BEIDE
+      // Gründe weiter abbrechen können. `internTimeout.signal` feuert NUR bei unserem eigenen Timer.
+      const internTimeout = new AbortController()
+      const timeoutTimer = setTimeout(
+        () => internTimeout.abort(new DOMException('Zeitüberschreitung.', 'TimeoutError')),
+        fetchTimeoutMs
+      )
+      const combinedSignal = options.signal
+        ? AbortSignal.any([options.signal, internTimeout.signal])
+        : internTimeout.signal
+
       let response: Response
       try {
         response = await fetchFn(`${baseUrl}/audio/transcriptions`, {
           method: 'POST',
           headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
           body: form,
-          signal: options.signal
+          signal: combinedSignal
         })
       } catch (cause) {
-        // Abbruch/Timeout unverändert weiterreichen, damit der Aufrufer (Reducer) sie klassifizieren kann.
+        // Unser EIGENER Timeout ist erkennbar an internTimeout.signal.aborted — von einem durchgereichten
+        // Nutzer-Abbruch/Watchdog-Timeout des Aufrufers unterscheiden (der unverändert weiterfliegt).
+        if (internTimeout.signal.aborted && !(options.signal?.aborted ?? false)) {
+          // NICHT als 'TimeoutError' weiterreichen: der Runner (runner.ts) behandelt JEDEN
+          // TimeoutError als Watchdog-Timeout → Fehler-Art 'anbieter' (nicht wiederholbar). Unser
+          // Timeout liegt bewusst UNTER dem Watchdog und soll als Transport-/Verbindungsfehler
+          // gelten → Fehler-Art 'netzwerk', damit der bestehende Retry (mitRetry) greift.
+          const fehler = new Error(
+            'Netzwerkfehler: Zeitüberschreitung bei der Übertragung zum Anbieter.',
+            { cause }
+          ) as AnbieterFehler
+          fehler.transport = true
+          throw fehler
+        }
+        // Abbruch/Timeout des AUFRUFERS (Nutzer-Abbruch oder dessen Watchdog) unverändert weiterreichen,
+        // damit der Aufrufer (Reducer) sie klassifizieren kann.
         if (cause instanceof Error && (cause.name === 'AbortError' || cause.name === 'TimeoutError')) {
           throw cause
         }
@@ -83,6 +149,8 @@ export function createCloudTranscriptionProvider(deps: {
         ) as AnbieterFehler
         fehler.transport = true // Transport-/Verbindungsfehler → Fehler-Art netzwerk
         throw fehler
+      } finally {
+        clearTimeout(timeoutTimer)
       }
 
       const raw = await response.text()

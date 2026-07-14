@@ -3,6 +3,8 @@
 // schickt den fertigen Blob (als ArrayBuffer) + die gemessene Dauer zurück. Kein UI — das Fenster
 // bleibt unsichtbar. Laufzeit-Abnahme (echtes Mikrofon, Berechtigungen) auf Windows.
 
+import { waehleAudioConstraints } from './lib/mikrofon-auswahl'
+
 declare global {
   interface Window {
     blitztextRecorder: {
@@ -27,9 +29,26 @@ function aufräumen(): void {
   chunks = []
 }
 
+/**
+ * Liest die gewünschte Mikrofon-deviceId aus den Einstellungen (W3-ζ). Staffel 3.2 ergänzt das Feld
+ * in BlitztextSettings + die Auswahl-UI — bis dahin liefert settings.get() das Feld nicht, der
+ * optionale Zugriff bleibt aber schon fertig verdrahtet (kein weiterer Anschluss hier nötig). Jeder
+ * Fehler (z. B. Settings noch nicht erreichbar) fällt auf „kein Wunschgerät" zurück, NIE die Aufnahme
+ * blockieren.
+ */
+async function ermittleGewuenschteDeviceId(): Promise<string | undefined> {
+  try {
+    const settings = (await window.blitztext.settings.get()) as { mikrofonDeviceId?: string }
+    return settings.mikrofonDeviceId
+  } catch {
+    return undefined
+  }
+}
+
 async function starteAufnahme(): Promise<void> {
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const deviceId = await ermittleGewuenschteDeviceId()
+    stream = await navigator.mediaDevices.getUserMedia(waehleAudioConstraints(deviceId))
     chunks = []
     mediaRecorder = new MediaRecorder(stream) // Chromium-Default: audio/webm;codecs=opus
     mediaRecorder.ondataavailable = (e) => {

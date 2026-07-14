@@ -122,4 +122,63 @@ describe('createVerlaufStore', () => {
     expect(await store.aufzeichnen(eintrag('a'))).toBe(false) // P5b: nicht verschlüsselbar → false
     expect(file.data).toBeNull()
   })
+
+  // --- V5: promptKennung ist optional/migrationssicher (alte Einträge ohne das Feld) ---
+
+  it('speichert promptKennung, wenn gesetzt, und liest sie unverändert zurück', async () => {
+    const file = fakeFile()
+    const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+    await store.aufzeichnen({ ...eintrag('a'), promptKennung: 'builtin:improve@deadbeef' })
+    const liste = await store.liste()
+    expect(liste[0]!.promptKennung).toBe('builtin:improve@deadbeef')
+  })
+
+  it('lädt einen alten Eintrag ohne promptKennung klaglos (Migration), Feld ist undefined', async () => {
+    const file = fakeFile()
+    const alterEintrag = eintrag('alt') // kein promptKennung-Feld — simuliert Vor-V5-Datensatz
+    const roh = JSON.stringify([alterEintrag])
+    file.data = await fakeCipher().encrypt(roh)
+    const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+    const liste = await store.liste()
+    expect(liste).toHaveLength(1)
+    expect(liste[0]!.id).toBe('alt')
+    expect(liste[0]!.promptKennung).toBeUndefined()
+  })
+
+  it('mischt alte (ohne promptKennung) und neue (mit) Einträge ohne Fehler', async () => {
+    const file = fakeFile()
+    const gemischt = [
+      { ...eintrag('neu'), promptKennung: 'custom:12345678' },
+      eintrag('alt')
+    ]
+    file.data = await fakeCipher().encrypt(JSON.stringify(gemischt))
+    const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+    const liste = await store.liste()
+    expect(liste.map((e) => e.promptKennung)).toEqual(['custom:12345678', undefined])
+  })
+
+  // --- Off-by-one an der ECHTEN Default-Grenze STANDARD_MAX=200 (nicht der Test-Kleinstwert) ---
+  // maxEintraege bewusst NICHT gesetzt → der reale Default greift.
+
+  it('hält bei genau 200 Einträgen alle (kein vorzeitiges Kappen an der Grenze)', async () => {
+    const file = fakeFile()
+    const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+    for (let i = 0; i < 200; i++) await store.aufzeichnen(eintrag(String(i)))
+    const liste = await store.liste()
+    expect(liste).toHaveLength(200)
+    // Neueste zuerst: '199' vorne, ältester '0' ganz hinten — noch vorhanden.
+    expect(liste[0]!.id).toBe('199')
+    expect(liste[liste.length - 1]!.id).toBe('0')
+  })
+
+  it('kappt bei 201 Einträgen auf 200 und wirft den ältesten heraus', async () => {
+    const file = fakeFile()
+    const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+    for (let i = 0; i < 201; i++) await store.aufzeichnen(eintrag(String(i)))
+    const liste = await store.liste()
+    expect(liste).toHaveLength(200) // exakt an der Default-Grenze gekappt
+    expect(liste[0]!.id).toBe('200') // neuester behalten
+    expect(liste[liste.length - 1]!.id).toBe('1') // '0' (ältester) herausgefallen
+    expect(liste.some((e) => e.id === '0')).toBe(false)
+  })
 })

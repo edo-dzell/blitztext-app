@@ -16,15 +16,16 @@ const anbieter = (
 })
 
 describe('preisModellListen', () => {
-  it('ohne Anbieter: nur die PREISE-Defaults (OpenAI/Groq), nach ASR/Chat getrennt', () => {
+  it('ohne Anbieter: nur die PREISE-Defaults (OpenAI/Groq/Mistral), nach ASR/Chat getrennt', () => {
     const { asr, chat } = preisModellListen()
     expect(asr).toContain('whisper-1')
     expect(asr).toContain('whisper-large-v3-turbo')
     expect(chat).toContain('gpt-4o-mini')
     expect(chat).toContain('llama-3.3-70b-versatile')
-    // kein Mistral, solange kein Mistral-Anbieter konfiguriert ist
-    expect(chat).not.toContain('mistral-small-latest')
-    expect(asr).not.toContain('voxtral-mini-latest')
+    // Mistral hat jetzt eigene PREISE-Defaults (PEN-2) → erscheint unabhängig davon,
+    // ob ein Mistral-Anbieter konfiguriert ist.
+    expect(chat).toContain('mistral-small-latest')
+    expect(asr).toContain('voxtral-mini-latest')
   })
 
   it('mit Mistral-Anbieter: dessen Katalog-Modelle erscheinen (der eigentliche Fix)', () => {
@@ -32,7 +33,7 @@ describe('preisModellListen', () => {
     expect(asr).toContain('voxtral-mini-latest')
     expect(chat).toContain('mistral-small-latest')
     expect(chat).toContain('mistral-large-latest')
-    // Defaults bleiben zusätzlich erhalten
+    // Defaults bleiben zusätzlich erhalten (auch ohne Mistral-Anbieter, s.o.)
     expect(chat).toContain('gpt-4o-mini')
   })
 

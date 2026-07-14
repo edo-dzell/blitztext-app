@@ -79,9 +79,12 @@ const INHALTE: Record<string, Inhalt> = {
   }
 }
 
+const LEER_INHALT: Inhalt = { titel: '', absaetze: [] }
+
 export default function HilfeView({ zielTopic }: { zielTopic?: string }) {
-  const [auswahl, setAuswahl] = useState<string>(zielTopic ?? HELP_TOPICS[0].id)
-  const inhalt = INHALTE[auswahl] ?? INHALTE[HELP_TOPICS[0].id]
+  const ersterTopic = HELP_TOPICS[0]?.id ?? ''
+  const [auswahl, setAuswahl] = useState<string>(zielTopic ?? ersterTopic)
+  const inhalt = INHALTE[auswahl] ?? INHALTE[ersterTopic] ?? LEER_INHALT
 
   return (
     <ZweiEbenenShell

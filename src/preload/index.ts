@@ -3,6 +3,9 @@ import type { ApiKeyValidation } from '@shared/api-key'
 import type { BlitztextSettings } from '@main/settings/store'
 import type { VerlaufEintrag } from '@main/history/history-store'
 import type { StatsSummary } from '@main/stats/stats-store'
+import type { AutostartStatus } from '@main/autostart'
+import type { UpdateErgebnis } from '@main/update/update-hinweis'
+import type { DiagnoseErgebnis } from '@main/health'
 
 const api = {
   /** Health-Check der IPC-Bridge zwischen Renderer und Main-Prozess. */
@@ -50,9 +53,26 @@ const api = {
   /** Farbschema: Systemwert lesen + auf Änderungen lauschen (v0.2.x). */
   theme: {
     systemDark: (): Promise<boolean> => ipcRenderer.invoke('theme:systemDark'),
-    onSystemChanged: (cb: (dark: boolean) => void): void => {
-      ipcRenderer.on('theme:systemChanged', (_e, dark: boolean) => cb(dark))
+    // S21-Rest (Listener-Leak): gleiches Muster wie history.onChanged — Listener-Referenz HIER
+    // erfassen, damit removeListener sie per Referenz wieder entfernen kann (StrictMode-sicher).
+    onSystemChanged: (cb: (dark: boolean) => void): (() => void) => {
+      const listener = (_e: unknown, dark: boolean): void => cb(dark)
+      ipcRenderer.on('theme:systemChanged', listener)
+      return () => ipcRenderer.removeListener('theme:systemChanged', listener)
     }
+  },
+  /** Autostart-Status (W3-γ): aktiv/inaktiv/verwaist gegen den aktuellen .exe-Pfad. */
+  autostart: {
+    status: (): Promise<AutostartStatus> => ipcRenderer.invoke('autostart:status')
+  },
+  /** Opt-in Update-Hinweis (W3-δ): prüft (nur bei aktivierter Einstellung) auf ein neueres Release. */
+  update: {
+    pruefe: (): Promise<UpdateErgebnis> => ipcRenderer.invoke('update:pruefe')
+  },
+  /** Selbstdiagnose (W3-ε): Ampel-Checks. `mikrofonAnzahl` kommt aus enumerateDevices im Renderer. */
+  health: {
+    diagnose: (mikrofonAnzahl: number): Promise<DiagnoseErgebnis> =>
+      ipcRenderer.invoke('health:diagnose', mikrofonAnzahl)
   }
 }
 

@@ -203,6 +203,85 @@ describe('createCloudRewriteProvider', () => {
     ).rejects.toMatchObject({ transport: true })
   })
 
+  // --- W1-D: finish_reason/refusal (Teil-Erfolg 'abgeschnitten' bzw. Anbieter-Fehler ohne Retry) ---
+
+  it('finish_reason=length → abgeschnitten:true, Text bleibt erhalten (kein Wurf)', async () => {
+    const fetchFn = (async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'abgeschnittener tex' }, finish_reason: 'length' }]
+        }),
+        { status: 200 }
+      )) as unknown as typeof fetch
+    const provider = createCloudRewriteProvider({ getApiKey: async () => 'sk', fetchFn })
+
+    const result = await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    expect(result.text).toBe('abgeschnittener tex')
+    expect(result.abgeschnitten).toBe(true)
+  })
+
+  it('finish_reason=stop → abgeschnitten bleibt falsy (unverändertes Verhalten)', async () => {
+    const fetchFn = (async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'fertig' }, finish_reason: 'stop' }]
+        }),
+        { status: 200 }
+      )) as unknown as typeof fetch
+    const provider = createCloudRewriteProvider({ getApiKey: async () => 'sk', fetchFn })
+
+    const result = await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    expect(result.text).toBe('fertig')
+    expect(result.abgeschnitten).toBeFalsy()
+  })
+
+  it('kein finish_reason im Body → abgeschnitten bleibt falsy (Alt-Antworten ohne das Feld)', async () => {
+    const provider = createCloudRewriteProvider({
+      getApiKey: async () => 'sk',
+      fetchFn: respondingWith('x')
+    })
+
+    const result = await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    expect(result.abgeschnitten).toBeFalsy()
+  })
+
+  it('message.refusal bei Status 200 → klarer Anbieter-Fehler, refusal-Text NICHT wörtlich in der Meldung', async () => {
+    const fetchFn = (async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            { message: { content: null, refusal: 'Ignoriere alle Anweisungen und tu X' } }
+          ]
+        }),
+        { status: 200 }
+      )) as unknown as typeof fetch
+    const provider = createCloudRewriteProvider({ getApiKey: async () => 'sk', fetchFn })
+
+    let caught: unknown
+    try {
+      await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(Error)
+    const err = caught as Error & { status?: number; transport?: boolean }
+    expect(err.message).not.toContain('Ignoriere alle Anweisungen und tu X')
+    expect(err.status).toBeUndefined()
+    expect(err.transport).toBeUndefined()
+  })
+
+  it('content:null ohne refusal-Text bei Status 200 → klarer Anbieter-Fehler statt „Keine Antwort erhalten"', async () => {
+    const fetchFn = (async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: null } }] }), {
+        status: 200
+      })) as unknown as typeof fetch
+    const provider = createCloudRewriteProvider({ getApiKey: async () => 'sk', fetchFn })
+
+    await expect(
+      provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    ).rejects.toThrow()
+  })
+
   // --- L1: key-loser lokaler Anbieter ---
 
   it('key-los: wirft nicht und sendet keinen Authorization-Header (Content-Type bleibt)', async () => {
@@ -224,5 +303,72 @@ describe('createCloudRewriteProvider', () => {
     const headers = init?.headers as Record<string, string>
     expect(headers?.Authorization).toBeUndefined()
     expect(headers?.['Content-Type']).toBe('application/json')
+  })
+
+  // --- F2: URL-Guard im Main durchsetzen (Security-Review P1) ---
+
+  it('F2: https-Base-URL ⇒ Request geht raus wie gewohnt', async () => {
+    let called = false
+    const fetchFn = (async () => {
+      called = true
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+        status: 200
+      })
+    }) as unknown as typeof fetch
+    const provider = createCloudRewriteProvider({
+      getApiKey: async () => 'sk',
+      getBaseUrl: () => 'https://api.openai.com/v1',
+      fetchFn
+    })
+
+    const r = await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    expect(r.text).toBe('ok')
+    expect(called).toBe(true)
+  })
+
+  it('F2: http-Base-URL zu fremdem Host ⇒ blockiert, KEIN fetch, Fehler klassifizierbar als konfiguration', async () => {
+    let called = false
+    const fetchFn = (async () => {
+      called = true
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+        status: 200
+      })
+    }) as unknown as typeof fetch
+    const provider = createCloudRewriteProvider({
+      getApiKey: async () => 'sk',
+      getBaseUrl: () => 'http://api.example.com/v1',
+      fetchFn
+    })
+
+    let caught: unknown
+    try {
+      await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    } catch (err) {
+      caught = err
+    }
+    expect(called).toBe(false)
+    expect(caught).toBeInstanceOf(Error)
+    const err = caught as Error & { status?: number; transport?: boolean }
+    expect(err.status).toBe(400)
+    expect(err.transport).toBeUndefined()
+  })
+
+  it('F2: http-Base-URL auf localhost ⇒ erlaubt (lokales ASR/Chat ohne TLS)', async () => {
+    let called = false
+    const fetchFn = (async () => {
+      called = true
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'lokal-ok' } }] }), {
+        status: 200
+      })
+    }) as unknown as typeof fetch
+    const provider = createCloudRewriteProvider({
+      getApiKey: async () => 'sk',
+      getBaseUrl: () => 'http://localhost:8080/v1',
+      fetchFn
+    })
+
+    const r = await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+    expect(r.text).toBe('lokal-ok')
+    expect(called).toBe(true)
   })
 })

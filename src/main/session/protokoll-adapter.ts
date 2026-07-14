@@ -47,7 +47,9 @@ export function createProtokoll(deps: {
         // Tatsächlich genutzte Modelle + Verbrauch für die Kosten-Anzeige je Eintrag (VL-2).
         asrModell: daten.asrModell,
         chatModell: daten.umgeschrieben ? daten.chatModell : '',
-        usage: daten.usage
+        usage: daten.usage,
+        // V5 (W3-μ): reicht die bereits in der Sitzung berechnete Prompt-Kennung unverändert durch.
+        promptKennung: daten.promptKennung
       })
     }
   }

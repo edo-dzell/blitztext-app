@@ -23,7 +23,7 @@ describe('Prompt-Historie', () => {
     let h: PromptVersion[] = []
     for (let i = 0; i < PROMPT_HISTORIE_MAX + 5; i++) h = mitNeuemPrompt(h, v(String(i)))
     expect(h).toHaveLength(PROMPT_HISTORIE_MAX)
-    expect(h[0].id).toBe(String(PROMPT_HISTORIE_MAX + 4)) // neueste vorn
+    expect(h[0]!.id).toBe(String(PROMPT_HISTORIE_MAX + 4)) // neueste vorn
   })
 
   it('findePromptVersion findet per id, sonst undefined', () => {
@@ -77,6 +77,6 @@ describe('historieNachSpeichern (R3/#26)', () => {
       neu
     )
     expect(r).toHaveLength(PROMPT_HISTORIE_MAX)
-    expect(r?.[0].id).toBe('99')
+    expect(r?.[0]!.id).toBe('99')
   })
 })

@@ -35,9 +35,37 @@ describe('pricing', () => {
   })
 
   it('unbekanntes Modell → null (keine Schätzung)', () => {
-    expect(asrKostenUsd('voxtral-mini-latest', 60)).toBeNull()
     expect(asrKostenUsd('irgendwas-unbekanntes', 60)).toBeNull()
-    expect(chatKostenUsd('mistral-large-latest', 1000, 1000)).toBeNull()
+    expect(chatKostenUsd('irgendwas-unbekanntes', 1000, 1000)).toBeNull()
+  })
+
+  // --- v0.5.0 PEN-2: Mistral-Default-Preise (Quelle: https://mistral.ai/pricing/api/, Stand 2026-07) ---
+
+  it('mistral-small-latest: 0.15 / 0.60 USD pro 1M (Mistral Small 4)', () => {
+    expect(chatKostenUsd('mistral-small-latest', 1_000_000, 0)).toBeCloseTo(0.15, 6)
+    expect(chatKostenUsd('mistral-small-latest', 0, 1_000_000)).toBeCloseTo(0.6, 6)
+  })
+
+  it('mistral-large-latest: 0.50 / 1.50 USD pro 1M (Mistral Large 3)', () => {
+    expect(chatKostenUsd('mistral-large-latest', 1_000_000, 0)).toBeCloseTo(0.5, 6)
+    expect(chatKostenUsd('mistral-large-latest', 0, 1_000_000)).toBeCloseTo(1.5, 6)
+  })
+
+  it('voxtral-mini-latest: 0.003 USD pro Minute (Voxtral Mini Transcribe 2)', () => {
+    expect(asrKostenUsd('voxtral-mini-latest', 60)).toBeCloseTo(0.003, 6)
+    expect(asrKostenUsd('voxtral-mini-latest', 30)).toBeCloseTo(0.0015, 6)
+  })
+
+  it('laufKosten: Mistral ASR (Voxtral) + Mistral Chat (Small) realistische Nutzung', () => {
+    const k = laufKosten({
+      asrModell: 'voxtral-mini-latest',
+      dauerSekunden: 120, // 2 min → 0,006 USD
+      chatModell: 'mistral-small-latest',
+      usage: { promptTokens: 2000, completionTokens: 500 }
+    })
+    // Chat: 2000/1e6*0.15 + 500/1e6*0.6 = 0.0003 + 0.0003 = 0.0006
+    expect(k.usd).toBeCloseTo(0.006 + 0.0006, 6)
+    expect(k.eur).toBeCloseTo((0.006 + 0.0006) * 0.86, 6)
   })
 
   // --- v0.2.x #16: EUR-Schätzung + Lauf-Kosten je Eintrag (VL-2) ---
@@ -76,9 +104,9 @@ describe('pricing', () => {
 
   it('aufgelosteTabelle mischt Overrides feldweise (Override gewinnt, fehlende Felder Default)', () => {
     const t = aufgelosteTabelle({ 'gpt-4o-mini': { inputPro1MUsd: 1 } })
-    expect(t['gpt-4o-mini'].inputPro1MUsd).toBe(1) // Override gewinnt
-    expect(t['gpt-4o-mini'].outputPro1MUsd).toBe(0.6) // fehlendes Feld bleibt Default
-    expect(t['gpt-4o'].inputPro1MUsd).toBe(2.5) // unangetastetes Modell unverändert
+    expect(t['gpt-4o-mini']!.inputPro1MUsd).toBe(1) // Override gewinnt
+    expect(t['gpt-4o-mini']!.outputPro1MUsd).toBe(0.6) // fehlendes Feld bleibt Default
+    expect(t['gpt-4o']!.inputPro1MUsd).toBe(2.5) // unangetastetes Modell unverändert
   })
 
   it('aufgelosteTabelle kennt auch reine Override-Modelle (neue id)', () => {

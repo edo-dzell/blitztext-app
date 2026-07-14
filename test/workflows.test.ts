@@ -9,7 +9,9 @@ import {
   WORKFLOW_VERHALTENS_FELDER,
   werksVerhalten,
   weichtVomWerkAb,
-  type WorkflowDefinition
+  promptKennungFuer,
+  type WorkflowDefinition,
+  type PromptVersion
 } from '@shared/workflows'
 
 const improve = BUILTIN_WORKFLOWS.find((w) => w.id === 'improve') as WorkflowDefinition
@@ -122,5 +124,82 @@ describe('Werks-Reset (P3)', () => {
 
   it('Anbieter-/Sprachänderung zählt NICHT als Abweichung (bleibt erhalten)', () => {
     expect(weichtVomWerkAb({ ...improve, anbieterId: 'groq', language: 'en' })).toBe(false)
+  })
+})
+
+// --- V5: Prompt-Kennung im Verlauf (identifiziert den Prompt-Stand hinter einem Endtext) ---
+describe('promptKennungFuer', () => {
+  it('Built-in: builtin:<id>@<hash> aus dem aufgelösten Prompt-Text', () => {
+    const kennung = promptKennungFuer(improve, 'Der aufgelöste System-Prompt-Text.')
+    expect(kennung).toMatch(/^builtin:improve@[0-9a-f]{8}$/)
+  })
+
+  it('Built-in: gleicher Text → gleiche Kennung (deterministisch/stabil)', () => {
+    const a = promptKennungFuer(improve, 'Text A')
+    const b = promptKennungFuer(improve, 'Text A')
+    expect(a).toBe(b)
+  })
+
+  it('Built-in: unterschiedlicher aufgelöster Text → unterschiedliche Kennung (Prompt-Fix erkennbar)', () => {
+    const vorFix = promptKennungFuer(improve, 'Alter Prompt-Text')
+    const nachFix = promptKennungFuer(improve, 'Neuer, gehärteter Prompt-Text')
+    expect(vorFix).not.toBe(nachFix)
+  })
+
+  it('statisch MIT passendem Historie-Eintrag: liefert dessen PromptVersion.id', () => {
+    const version: PromptVersion = {
+      id: 'v-123',
+      zeitstempelMs: 1000,
+      text: 'Mein eigener Prompt',
+      quelle: 'manuell'
+    }
+    const eigen: WorkflowDefinition = {
+      ...improve,
+      id: 'eigener-flow',
+      builtin: false,
+      promptModus: 'statisch',
+      systemPrompt: 'Mein eigener Prompt',
+      promptHistorie: [version]
+    }
+    expect(promptKennungFuer(eigen, 'Mein eigener Prompt\n\n(Daten-Rahmen etc.)')).toBe('v-123')
+  })
+
+  it('statisch OHNE passenden Historie-Eintrag: Fallback custom:<hash>', () => {
+    const eigen: WorkflowDefinition = {
+      ...improve,
+      id: 'eigener-flow',
+      builtin: false,
+      promptModus: 'statisch',
+      systemPrompt: 'Ein Prompt ohne Historie',
+      promptHistorie: undefined
+    }
+    const kennung = promptKennungFuer(eigen, 'Ein Prompt ohne Historie (aufgelöst)')
+    expect(kennung).toMatch(/^custom:[0-9a-f]{8}$/)
+  })
+
+  it('statisch mit Historie, aber KEIN Eintrag passt zum aktuellen systemPrompt: Fallback custom:<hash>', () => {
+    const eigen: WorkflowDefinition = {
+      ...improve,
+      id: 'eigener-flow',
+      builtin: false,
+      promptModus: 'statisch',
+      systemPrompt: 'Neuer, noch nicht gespeicherter Text',
+      promptHistorie: [{ id: 'v-alt', zeitstempelMs: 1, text: 'Alter Text', quelle: 'manuell' }]
+    }
+    const kennung = promptKennungFuer(eigen, 'Neuer, noch nicht gespeicherter Text (aufgelöst)')
+    expect(kennung).toMatch(/^custom:[0-9a-f]{8}$/)
+  })
+
+  it('Migration: fehlende promptHistorie (alter Eintrag) wirft nicht, fällt auf custom:<hash> zurück', () => {
+    const eigen: WorkflowDefinition = {
+      ...improve,
+      id: 'eigener-flow',
+      builtin: false,
+      promptModus: 'statisch',
+      systemPrompt: 'X'
+    }
+    delete (eigen as Partial<WorkflowDefinition>).promptHistorie
+    expect(() => promptKennungFuer(eigen, 'X (aufgelöst)')).not.toThrow()
+    expect(promptKennungFuer(eigen, 'X (aufgelöst)')).toMatch(/^custom:[0-9a-f]{8}$/)
   })
 })

@@ -109,6 +109,6 @@ describe('createProtokoll', () => {
 
     await protokoll.aufzeichnen({ ...basis, umgeschrieben: false, chatModell: '', usage: undefined })
 
-    expect(s.nutzungen[0].chat).toBeUndefined()
+    expect(s.nutzungen[0]!.chat).toBeUndefined()
   })
 })

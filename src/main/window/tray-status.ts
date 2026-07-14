@@ -28,3 +28,53 @@ export function phaseTooltip(phase: WorkflowPhase): string {
 export function spiegleStatus(tray: Tray, phase: WorkflowPhase): void {
   tray.setToolTip(phaseTooltip(phase))
 }
+
+/** Aktionen, die das Tray-Kontextmenü auslöst (von index.ts gestellt; hier nur die reinen Zustände). */
+export interface TrayMenuAktionen {
+  einstellungenOeffnen: () => void
+  abbrechen: () => void
+  erneutVersuchen: () => void
+  beenden: () => void
+}
+
+/** Live-Zustände, die den Aktiv-/Sichtbar-Zustand der Einträge bestimmen (pro Neuaufbau frisch gelesen). */
+export interface TrayMenuZustand {
+  /** true, solange ein Lauf aktiv ist → „Abbrechen" aktiv. */
+  beschaeftigt: boolean
+  /** F1 (W3-B): true, wenn die letzte Aufnahme erneut verarbeitet werden kann → Retry-Eintrag aktiv. */
+  kannErneutVersuchen: boolean
+}
+
+/**
+ * Ein Menü-Eintrag (label/enabled/type/click) — die für das Kontextmenü genutzte Teilmenge von
+ * Electrons MenuItemConstructorOptions, ohne Electron-Import (rein/testbar). index.ts reicht das
+ * Ergebnis unverändert an `Menu.buildFromTemplate`.
+ */
+export interface TrayMenuEintrag {
+  label?: string
+  enabled?: boolean
+  type?: 'separator'
+  click?: () => void
+}
+
+/**
+ * Baut das Tray-Kontextmenü-Template (F1: inkl. „Letzte Aufnahme erneut verarbeiten", aktiv nur wenn
+ * `kannErneutVersuchen`). Rein, damit Reihenfolge/Aktivzustände ohne Electron testbar sind — die
+ * dünne `Menu.buildFromTemplate`-Anbindung bleibt in index.ts (HITL).
+ */
+export function baueTrayMenuTemplate(
+  zustand: TrayMenuZustand,
+  aktionen: TrayMenuAktionen
+): TrayMenuEintrag[] {
+  return [
+    { label: 'Einstellungen öffnen…', click: aktionen.einstellungenOeffnen },
+    { label: 'Abbrechen', enabled: zustand.beschaeftigt, click: aktionen.abbrechen },
+    {
+      label: 'Letzte Aufnahme erneut verarbeiten',
+      enabled: zustand.kannErneutVersuchen,
+      click: aktionen.erneutVersuchen
+    },
+    { type: 'separator' },
+    { label: 'Beenden', click: aktionen.beenden }
+  ]
+}

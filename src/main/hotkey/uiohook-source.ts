@@ -20,6 +20,12 @@ export interface UiohookQuelleDeps {
   verarbeiteTaste(event: KeyEvent): void
   /** Default: das uIOhook-Singleton; in Tests ein Fake. */
   hook?: UiohookQuelle
+  /**
+   * W3-ε (3.2): meldet, ob `hook.start()` erfolgreich war. `start()` schluckt einen Fehler (Header),
+   * ohne ihn nach außen zu geben — dieser Callback macht den Erfolg/Misserfolg für den Health-Check
+   * „Hotkey-Erkennung" sichtbar, OHNE die Start-Logik umzubauen (rein additiv).
+   */
+  onStatus?(aktiv: boolean): void
 }
 
 /** Startet den Hook und gibt einen Stopp-Thunk zurück (für app.will-quit). */
@@ -43,8 +49,10 @@ export function starteUiohookQuelle(deps: UiohookQuelleDeps): () => void {
   // (uiohook-napi-Crash ist macOS-spezifisch, Windows unkritisch — RESEARCH §5).
   try {
     hook.start()
+    deps.onStatus?.(true)
   } catch (err) {
     console.error('uiohook konnte nicht gestartet werden:', err)
+    deps.onStatus?.(false)
     return () => {}
   }
   return () => {

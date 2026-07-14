@@ -38,3 +38,23 @@ export function einstellungenGeaendert(
 ): boolean {
   return !tiefGleich(ohneApiKeyStatus(entwurf), ohneApiKeyStatus(settings))
 }
+
+/**
+ * W1-E (P1-Datenverlust): Ein API-Key-Eingabefeld ist dirty, sobald nicht-leerer, ungespeicherter Text
+ * drinsteht — unabhängig vom eigentlichen Einstellungs-Entwurf, denn der Key wird separat/sofort
+ * gespeichert (nicht über den Settings-Entwurf). Nur Whitespace zählt als leer (Trim), damit
+ * versehentliches Leerzeichen-Tippen keinen Guard auslöst.
+ */
+export function apiKeyEntwurfGeaendert(keyInput: string): boolean {
+  return keyInput.trim() !== ''
+}
+
+/**
+ * W1-E (P1-Datenverlust): Läuft eine Prompt-Assistent-Anfrage, ist der Workflow-Editor „dirty" —
+ * die Antwort würde beim Remount (key={aktiv.id} in WorkflowsView) kommentarlos verloren gehen, weil
+ * WorkflowEditor bei Auswahl-Wechsel neu erzeugt wird. Variante (a): Auswahl sperren statt (b) Antwort
+ * über den Wechsel retten — reuse desselben Guard-Mechanismus wie ein ungespeicherter Entwurf.
+ */
+export function assistentSperrtAuswahl(assistentBusy: boolean): boolean {
+  return assistentBusy
+}

@@ -47,8 +47,20 @@ export interface StatsStore {
 }
 
 function datumAus(jetztMs: number): string {
-  // YYYY-MM-DD in UTC (deterministisch, zeitzonenunabhängig für die Aggregation).
-  return new Date(jetztMs).toISOString().slice(0, 10)
+  // YYYY-MM-DD in LOKALER Zeit (v0.5.0-Fix): vorher UTC via toISOString(), wodurch Läufe zwischen
+  // 0 und 2 Uhr deutscher Zeit (UTC+1/+2) im UTC-Vortag landeten. Jahr/Monat/Tag werden bewusst aus
+  // den lokalen Date-Komponenten gebaut (nicht aus dem ISO-String), damit der Tageswechsel der
+  // tatsächlichen Nutzer-Zeitzone folgt.
+  //
+  // BEWUSST KEINE rückwirkende Migration: Bestandseinträge behalten ihren (UTC-)Schlüssel aus
+  // Versionen vor diesem Fix — historische Tage können dadurch um ±1 Tag verschoben sein. Ab v0.5.0
+  // stimmen neue Einträge lokal. Alt- und Neu-Schlüssel liegen im selben Format (YYYY-MM-DD) und
+  // bleiben daher lexikalisch sortier- und aggregierbar (siehe Test „gemischte Alt-/Neu-Schlüssel").
+  const d = new Date(jetztMs)
+  const jahr = String(d.getFullYear()).padStart(4, '0')
+  const monat = String(d.getMonth() + 1).padStart(2, '0')
+  const tag = String(d.getDate()).padStart(2, '0')
+  return `${jahr}-${monat}-${tag}`
 }
 
 function schluessel(z: Pick<StatZeile, 'datum' | 'workflowId' | 'asrModell' | 'chatModell'>): string {
@@ -75,10 +87,9 @@ export function createStatsStore({ file }: { file: StatsFile }): StatsStore {
       const idx = zeilen.findIndex(
         (z) => schluessel(z) === schluessel({ datum, workflowId: nutzung.workflowId, asrModell: nutzung.asrModell, chatModell })
       )
+      const bestehend = idx >= 0 ? zeilen[idx] : undefined
       const ziel: StatZeile =
-        idx >= 0
-          ? zeilen[idx]
-          : {
+        bestehend ?? {
               datum,
               workflowId: nutzung.workflowId,
               anzahl: 0,

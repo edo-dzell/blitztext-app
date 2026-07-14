@@ -28,7 +28,10 @@ import type { SecretCipher, CiphertextFile } from '@main/secrets/api-key-store'
 import type { ApiKeyVault } from '@main/secrets/api-key-vault'
 import type { SettingsStore } from '@main/settings/store'
 import type { KeyEvent } from '@main/hotkey/matcher'
-import { findeAnbieter, type AnbieterKonfig } from '@shared/anbieter'
+import { findeAnbieter, standardAnbieterAus, type AnbieterKonfig } from '@shared/anbieter'
+import type { Autostart, AutostartStatus } from '@main/autostart'
+import { pruefeAufUpdate, type Holer, type UpdateCacheSpeicher, type UpdateErgebnis } from '@main/update/update-hinweis'
+import { fuehreDiagnose, type DiagnoseErgebnis, type ErreichbarkeitsPort } from '@main/health'
 
 /** Die OS-/GUI-nahen Ports, die nur Windows real erfüllen kann (HITL). */
 export interface NativePorts {
@@ -49,6 +52,26 @@ export interface CompositionDeps extends NativePorts {
   neueId?: () => string
   /** Feuert nach erfolgtem Verlauf-Schreiben (P5b) → index.ts sendet `history:changed` ans Dashboard. */
   onHistoryChanged?: () => void
+  /**
+   * W3-γ (3.2): Autostart-Port (createDefaultAutostart) + der aktuelle .exe-Pfad. Beide optional, damit
+   * headless-Tests/Nicht-Windows die Komposition ohne echten Registry-Port bauen können. Fehlt der Port,
+   * sind Autostart-Kopplung + Status ein No-Op (Status meldet 'inaktiv').
+   */
+  autostart?: Autostart
+  exePfad?: string
+  /**
+   * W3-δ (3.2): echte Ports für den Opt-in-Update-Hinweis. Fehlen sie, liefert `pruefeUpdate` still
+   * „kein Update" (kein Netz). Die Opt-in-Entscheidung kommt live aus den Settings.
+   */
+  updateHoler?: Holer
+  updateCache?: UpdateCacheSpeicher
+  /** Lokale App-Version für den Update-Vergleich (app.getVersion()); Default '0.0.0'. */
+  appVersion?: string
+  /**
+   * W3-ε (3.2): echter Erreichbarkeits-Port (leichter Anbieter-Ping) für die Selbstdiagnose. Fehlt er,
+   * meldet der Erreichbarkeits-Check 'warnung' (nicht prüfbar) — kein Absturz.
+   */
+  erreichbarkeit?: ErreichbarkeitsPort
 }
 
 export interface MainComposition {
@@ -57,6 +80,13 @@ export interface MainComposition {
   brichAb(): void
   /** true, solange ein Lauf aktiv ist (Aktivzustand des Tray-„Abbrechen"-Eintrags). */
   beschaeftigt(): boolean
+  /**
+   * F1 (W3-B): true, wenn die letzte Aufnahme erneut verarbeitet werden kann (transient gescheitert,
+   * Audio noch gehalten). Aktivzustand des Tray-Eintrags „Letzte Aufnahme erneut verarbeiten".
+   */
+  kannErneutVersuchen(): boolean
+  /** F1 (W3-B): verarbeitet die zuletzt gehaltene Aufnahme erneut (Tray-Eintrag/Notification-Button). */
+  erneutVersuchen(): void
   /** Einstellungs-Store für die Settings-IPC (get/save). */
   einstellungen: SettingsStore
   /** Verlauf-Store für die Verlauf-IPC (liste/loeschen). */
@@ -91,14 +121,38 @@ export interface MainComposition {
   aktualisiere(settings: BlitztextSettings): boolean
   /** Wendet ausstehende Einstellungen an, sobald kein Lauf mehr aktiv ist (vom onStatus-Terminal). */
   wendeAusstehendeAn(): void
+  /**
+   * W3-γ: meldet den Laufstatus des globalen Tastatur-Hooks (uiohook). index.ts setzt ihn nach dem
+   * `starteUiohookQuelle`-Start-Ergebnis; der Health-Check „Hotkey-Erkennung" liest ihn.
+   */
+  setzeHotkeyHookAktiv(aktiv: boolean): void
+  /**
+   * W3-γ: gleicht beim App-Start den Registry-Eintrag an das gespeicherte `autostart`-Feld an (an ⇒
+   * Pfad auf die aktuelle .exe aktualisieren — heilt einen „verwaisten" Eintrag nach dem Verschieben;
+   * aus ⇒ Eintrag entfernen). No-Op ohne verdrahteten Port.
+   */
+  syncAutostartBeimStart(): Promise<void>
+  /** W3-γ: Autostart-Status gegen den aktuellen .exe-Pfad (aktiv/inaktiv/verwaist). */
+  autostartStatus(): Promise<AutostartStatus>
+  /**
+   * W3-δ: führt den Opt-in-Update-Hinweis aus (nutzt live die `updateHinweisAktiv`-Einstellung als
+   * optIn). Ohne echte Ports oder bei optIn=false ⇒ still „kein Update".
+   */
+  pruefeUpdate(): Promise<UpdateErgebnis>
+  /**
+   * W3-ε: führt die Selbstdiagnose aus. `mikrofonAnzahl` liefert der Renderer (enumerateDevices) per
+   * IPC mit — der Main-Prozess hat keinen direkten Medien-Geräte-Zugriff.
+   */
+  diagnose(mikrofonAnzahl: number): Promise<DiagnoseErgebnis>
 }
 
 /** Mutierbare Provider-Config-Zelle: die Provider-Closures lesen sie pro Call (Live-Wechsel). */
 function bindungenAus(settings: BlitztextSettings): Bindung[] {
   // Nur Workflows mit belegtem Chord binden (custom Workflows können unbelegt sein).
-  return settings.workflows
-    .filter((w) => (settings.hotkeys[w.id]?.length ?? 0) > 0)
-    .map((w) => ({ chord: settings.hotkeys[w.id], workflow: w.id }))
+  return settings.workflows.flatMap((w) => {
+    const chord = settings.hotkeys[w.id]
+    return chord && chord.length > 0 ? [{ chord, workflow: w.id }] : []
+  })
 }
 
 /** Reine Glue: ordnet eine Dispatch-Aktion der passenden Sitzung-Methode zu (Hotkey-Quelle). */
@@ -119,7 +173,7 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
   // Anbieter-Auflösung (ADR-0010): Standard-Anbieter (für Assistent/Validierung) + der pro Lauf aktive
   // Anbieter, den die Provider-Closures pro Call lesen. Die Sitzung setzt `aktiverAnbieter` je Lauf.
   const findeStandard = (s: BlitztextSettings): AnbieterKonfig =>
-    findeAnbieter(s.anbieter, s.standardAnbieterId) ?? s.anbieter[0]
+    standardAnbieterAus(s.anbieter, s.standardAnbieterId)
   let standardAnbieter: AnbieterKonfig = findeStandard(settings)
   let aktiverAnbieter: AnbieterKonfig = standardAnbieter
 
@@ -183,7 +237,28 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
   // Einstellungen, die während eines aktiven Laufs gespeichert wurden und nach Lauf-Ende greifen.
   let ausstehend: BlitztextSettings | null = null
 
+  // W3-γ: Laufstatus des globalen Tastatur-Hooks (uiohook). Wird von index.ts nach dem Start gesetzt;
+  // vor dem Start pessimistisch false (der Health-Check meldet dann 'fehler', bis der Hook läuft).
+  let hotkeyHookAktiv = false
+
+  /**
+   * W3-γ: koppelt den Autostart-Registry-Eintrag an das `autostart`-Settings-Feld. an ⇒ Eintrag auf den
+   * aktuellen exePfad setzen, aus ⇒ Eintrag entfernen. Fehler (z. B. reg.exe auf Nicht-Windows) werden
+   * geschluckt — eine fehlgeschlagene Autostart-Kopplung darf das Settings-Speichern nicht scheitern
+   * lassen (der Status-Getter zeigt dem Nutzer ohnehin den echten Registry-Zustand).
+   */
+  async function koppleAutostart(gewuenscht: boolean): Promise<void> {
+    if (!deps.autostart || !deps.exePfad) return
+    try {
+      if (gewuenscht) await deps.autostart.autostartAn(deps.exePfad)
+      else await deps.autostart.autostartAus()
+    } catch (err) {
+      console.error('Autostart konnte nicht gekoppelt werden:', err instanceof Error ? err.message : err)
+    }
+  }
+
   function uebernimm(next: BlitztextSettings): void {
+    const autostartGeaendert = next.autostart !== settings.autostart
     settings = next
     standardAnbieter = findeStandard(next)
     aktiverAnbieter = standardAnbieter
@@ -191,6 +266,9 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
       bindungen: bindungenAus(next),
       mode: next.aufnahmemodus
     })
+    // Nur bei echter Änderung an-/abkoppeln (idempotenter Registry-Schreibvorgang, aber unnötige
+    // reg.exe-Aufrufe bei jedem Speichern vermeiden). Bewusst nicht awaiten — feuer-und-vergiss.
+    if (autostartGeaendert) void koppleAutostart(next.autostart)
   }
 
   return {
@@ -200,6 +278,12 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     },
     beschaeftigt() {
       return sitzung.beschaeftigt()
+    },
+    kannErneutVersuchen() {
+      return sitzung.kannErneutVersuchen()
+    },
+    erneutVersuchen() {
+      void sitzung.erneutVersuchen()
     },
     einstellungen,
     verlauf,
@@ -244,6 +328,47 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
         uebernimm(ausstehend)
         ausstehend = null
       }
+    },
+    setzeHotkeyHookAktiv(aktiv) {
+      hotkeyHookAktiv = aktiv
+    },
+    async syncAutostartBeimStart() {
+      await koppleAutostart(settings.autostart)
+    },
+    async autostartStatus() {
+      if (!deps.autostart || !deps.exePfad) return { zustand: 'inaktiv' }
+      return deps.autostart.istAutostartAktiv(deps.exePfad)
+    },
+    async pruefeUpdate() {
+      const leer: UpdateErgebnis = {
+        aktuelleVersion: deps.appVersion ?? '0.0.0',
+        neuVerfuegbar: false,
+        url: ''
+      }
+      if (!deps.updateHoler || !deps.updateCache) return leer
+      return pruefeAufUpdate({
+        optIn: settings.updateHinweisAktiv, // live aus den Einstellungen (Opt-in)
+        lokaleVersion: deps.appVersion ?? '0.0.0',
+        holer: deps.updateHoler,
+        speicher: deps.updateCache
+      })
+    },
+    async diagnose(mikrofonAnzahl) {
+      return fuehreDiagnose({
+        apiKey: { apiKeys: deps.apiKeys, anbieter: standardAnbieter },
+        erreichbarkeit: {
+          // Ohne echten Port meldet der Check 'warnung' (Port wirft ⇒ nicht prüfbar).
+          holer: deps.erreichbarkeit ?? {
+            pingeAnbieter: async () => {
+              throw new Error('kein Erreichbarkeits-Port verdrahtet')
+            }
+          },
+          anbieter: { label: standardAnbieter.label, baseUrl: standardAnbieter.baseUrl }
+        },
+        // Der Renderer speist die (nicht-negative, ganzzahlige) Geräteanzahl ein.
+        mikrofon: { geraete: { anzahl: async () => Math.max(0, Math.trunc(mikrofonAnzahl)) } },
+        hotkeyHook: { hook: { istAktiv: async () => hotkeyHookAktiv } }
+      })
     }
   }
 }

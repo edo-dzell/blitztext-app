@@ -52,6 +52,12 @@ export interface BlitztextSettings {
   usdEurKurs: number
   /** „Zuletzt erfolgreich getestet" je Anbieter (P1). NUR im Main geschrieben (Lost-Update-Schutz). */
   apiKeyStatus: Record<string, ApiKeyStatus>
+  /** Mit Windows starten (W3-γ/3.2). Default AUS. Ehrlich: bricht, wenn die portable .exe verschoben wird. */
+  autostart: boolean
+  /** Gewähltes Mikrofon (deviceId aus enumerateDevices, W3-ζ). Leer = OS-Standardgerät. */
+  mikrofonDeviceId: string
+  /** Opt-in Update-Hinweis (W3-δ). Default AUS — KEIN Netzabruf ohne ausdrückliche Zustimmung. */
+  updateHinweisAktiv: boolean
 }
 
 // Default-Anbieter = OpenAI. ASR auf die moderne Generation `gpt-4o-mini-transcribe` (v0.2.4, per
@@ -94,7 +100,10 @@ export function defaultSettings(): BlitztextSettings {
     theme: 'system',
     preisOverrides: {},
     usdEurKurs: EUR_PRO_USD,
-    apiKeyStatus: {}
+    apiKeyStatus: {},
+    autostart: false,
+    mikrofonDeviceId: '',
+    updateHinweisAktiv: false
   }
 }
 
@@ -239,7 +248,7 @@ function parseAnbieter(o: Record<string, unknown>): {
       const standard =
         typeof o.standardAnbieterId === 'string' && liste.some((a) => a.id === o.standardAnbieterId)
           ? o.standardAnbieterId
-          : liste[0].id
+          : liste[0]!.id
       return { anbieter: liste, standardAnbieterId: standard }
     }
   }
@@ -262,8 +271,9 @@ function parseHotkeys(raw: unknown, workflows: WorkflowDefinition[]): Record<Wor
   const o = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
   const ergebnis: Record<WorkflowId, string[]> = {}
   for (const { id } of workflows) {
+    const standard = DEFAULT_HOTKEYS[id]
     if (istChord(o[id])) ergebnis[id] = o[id] as string[]
-    else if (id in DEFAULT_HOTKEYS) ergebnis[id] = [...DEFAULT_HOTKEYS[id]]
+    else if (standard) ergebnis[id] = [...standard]
     else ergebnis[id] = []
   }
   return ergebnis
@@ -306,7 +316,11 @@ function parseSettings(raw: unknown): BlitztextSettings {
       typeof o.usdEurKurs === 'number' && Number.isFinite(o.usdEurKurs) && o.usdEurKurs > 0
         ? o.usdEurKurs
         : d.usdEurKurs,
-    apiKeyStatus: parseApiKeyStatus(o.apiKeyStatus)
+    apiKeyStatus: parseApiKeyStatus(o.apiKeyStatus),
+    // Neue W3-Felder (3.2). Migration-sicher: alte Datei ohne diese Felder ⇒ konservativer Default.
+    autostart: o.autostart === true, // Default AUS
+    mikrofonDeviceId: typeof o.mikrofonDeviceId === 'string' ? o.mikrofonDeviceId : d.mikrofonDeviceId,
+    updateHinweisAktiv: o.updateHinweisAktiv === true // Opt-in, Default AUS
   }
 }
 

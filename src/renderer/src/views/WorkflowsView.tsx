@@ -17,6 +17,7 @@ import { berechneterPrompt, wandleAufStatisch, type RewriteSettings } from '@mai
 import { modelleFuerVorlage } from '@shared/providers'
 import type { AnbieterKonfig } from '@shared/anbieter'
 import { validateChord } from '@shared/validate-chord'
+import { SPRACHEN } from '@shared/sprachen'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -28,7 +29,7 @@ import { Field, Separator } from '@/components/ui/field'
 import ZweiEbenenShell from '@/components/ZweiEbenenShell'
 import { useBestaetigung } from '@/components/Bestaetigung'
 import { useNavGuard } from '@/components/NavGuard'
-import { workflowEntwurfGeaendert } from '@/lib/dirty'
+import { workflowEntwurfGeaendert, assistentSperrtAuswahl } from '@/lib/dirty'
 import {
   normalisiereChord,
   istAltGr,
@@ -44,6 +45,9 @@ interface Props {
 
 export default function WorkflowsView({ settings, speichern }: Props) {
   const [auswahl, setAuswahl] = useState<string | null>(settings.workflows[0]?.id ?? null)
+  // W1-E (P1-Datenverlust): läuft eine Prompt-Assistent-Anfrage, sperrt die Bandliste (Variante a) —
+  // ein Auswahl-Wechsel würde WorkflowEditor remounten (key={aktiv.id}) und die Antwort verwerfen.
+  const [assistentBusy, setAssistentBusy] = useState(false)
   const bestaetige = useBestaetigung()
   const { versucheNavigation } = useNavGuard()
 
@@ -124,15 +128,32 @@ export default function WorkflowsView({ settings, speichern }: Props) {
     )
   }))
 
+  // W1-E: Bandliste bewusst NICHT über den Bestätigungs-Dialog laufen lassen — eine laufende
+  // Netzwerk-Anfrage lässt sich nicht "wiederherstellen", ein Verwerfen-Dialog wäre nur Theater. Statt
+  // dessen: harte Sperre (kein Wechsel möglich) + sichtbarer Hinweis, konsistent mit anderen
+  // busy-Mustern (z. B. Speichern-Button-Text "Speichere…").
+  const auswahlGesperrt = assistentSperrtAuswahl(assistentBusy)
+
   return (
     <ZweiEbenenShell
       eintraege={eintraege}
       aktivId={auswahl}
-      onWaehle={(id) => versucheNavigation(() => setAuswahl(id))}
+      onWaehle={(id) => {
+        if (auswahlGesperrt) return
+        versucheNavigation(() => setAuswahl(id))
+      }}
       bandKopf={
-        <Button size="sm" className="w-full" onClick={neuerWorkflow}>
-          <Plus /> Neuer Workflow
-        </Button>
+        <div className="flex flex-col gap-2">
+          <Button size="sm" className="w-full" onClick={neuerWorkflow} disabled={auswahlGesperrt}>
+            <Plus /> Neuer Workflow
+          </Button>
+          {auswahlGesperrt && (
+            <p className="text-[11px] leading-tight text-muted-foreground">
+              Prompt-Assistent entwirft … Auswahl ist währenddessen gesperrt, damit die Antwort nicht
+              verloren geht.
+            </p>
+          )}
+        </div>
       }
       leer="Wähle links einen Workflow, um ihn zu bearbeiten — oder lege einen neuen an."
     >
@@ -151,6 +172,7 @@ export default function WorkflowsView({ settings, speichern }: Props) {
           }}
           onSpeichern={aktualisiereWorkflow}
           onLoeschen={aktiv.builtin ? undefined : () => loesche(aktiv.id)}
+          onAssistentBusyChange={setAssistentBusy}
         />
       )}
     </ZweiEbenenShell>
@@ -177,6 +199,8 @@ interface EditorProps {
   rewriteSettings: RewriteSettings
   onSpeichern: (def: WorkflowDefinition, hotkey?: string[]) => Promise<void>
   onLoeschen?: () => void
+  /** W1-E: meldet den Busy-Zustand der Prompt-Assistent-Anfrage nach oben (sperrt dort die Bandliste). */
+  onAssistentBusyChange?: (busy: boolean) => void
 }
 
 function WorkflowEditor({
@@ -187,7 +211,8 @@ function WorkflowEditor({
   standardAnbieterId,
   rewriteSettings,
   onSpeichern,
-  onLoeschen
+  onLoeschen,
+  onAssistentBusyChange
 }: EditorProps) {
   const [e, setE] = useState<WorkflowDefinition>(def)
   // Der für diesen Workflow aufgelöste Anbieter (Override → sonst Standard) bestimmt die Modell-Liste.
@@ -195,8 +220,8 @@ function WorkflowEditor({
     anbieter.find((a) => a.id === e.anbieterId) ??
     anbieter.find((a) => a.id === standardAnbieterId) ??
     anbieter[0]
-  const chatModelle = modelleFuerVorlage(aufgeloesterAnbieter.vorlage).chat
-  const providerChatModell = aufgeloesterAnbieter.chatModell
+  const chatModelle = modelleFuerVorlage(aufgeloesterAnbieter?.vorlage ?? '').chat
+  const providerChatModell = aufgeloesterAnbieter?.chatModell ?? ''
   const [chord, setChord] = useState<string[]>(hotkey)
   const [faengt, setFaengt] = useState(false)
   // Akkumuliert die SEITEN-GENAUEN Codes (ControlRight …) über die einzelnen keydown-Events einer
@@ -214,6 +239,19 @@ function WorkflowEditor({
   const geaendert = workflowEntwurfGeaendert(e, def, chord, hotkey)
   // Dirty-Quelle für den globalen Guard (P8): Workflow-Wechsel/Sidebar fragen bei ungespeichertem Stand.
   useEffect(() => registriereDirty('workflow', () => geaendert), [registriereDirty, geaendert])
+
+  // W1-E (P1-Datenverlust): eine laufende Prompt-Assistent-Anfrage zählt ebenfalls als dirty — sonst
+  // könnte die App-Sidebar (App.tsx → versucheNavigation) mitten in der Anfrage wegnavigieren und die
+  // Antwort ginge verloren. Die Bandliste selbst wird zusätzlich hart gesperrt (siehe WorkflowsView).
+  useEffect(
+    () => registriereDirty('workflow-assistent', () => assistentSperrtAuswahl(assistentBusy)),
+    [registriereDirty, assistentBusy]
+  )
+  // Busy-Zustand nach oben melden (sperrt dort die Bandliste selbst).
+  useEffect(() => {
+    onAssistentBusyChange?.(assistentBusy)
+    return () => onAssistentBusyChange?.(false)
+  }, [assistentBusy, onAssistentBusyChange])
 
   // P3: Verhalten auf Werkszustand laden (Variante A — Übernahme erst per Speichern). Warn-Dialog davor.
   async function aufWerkZuruecksetzen() {
@@ -337,8 +375,11 @@ function WorkflowEditor({
               onChange={(ev) => setE({ ...e, language: ev.target.value })}
             >
               <option value="">Erbt global</option>
-              <option value="de">Deutsch (de)</option>
-              <option value="en">Englisch (en)</option>
+              {SPRACHEN.map((s) => (
+                <option key={s.code} value={s.code}>
+                  {s.anzeigeName}
+                </option>
+              ))}
             </Select>
           </Field>
         </div>
@@ -364,8 +405,11 @@ function WorkflowEditor({
                 onChange={(ev) => setE({ ...e, ausgabeSprache: ev.target.value })}
               >
                 <option value="">Keine Vorgabe (wie Eingabe)</option>
-                <option value="de">Deutsch (de)</option>
-                <option value="en">Englisch (en)</option>
+                {SPRACHEN.map((s) => (
+                  <option key={s.code} value={s.code}>
+                    {s.anzeigeName}
+                  </option>
+                ))}
               </Select>
             </Field>
             <Field

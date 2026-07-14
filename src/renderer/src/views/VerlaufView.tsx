@@ -143,7 +143,20 @@ export default function VerlaufView({ settings, speichern }: Props) {
         <Card>
           <CardContent className="flex flex-col gap-3 p-5">
             <div className="flex items-center justify-between text-xs text-muted-foreground">
-              <span>{aktiv.workflowLabel}</span>
+              <span className="flex items-center gap-1.5">
+                {aktiv.workflowLabel}
+                {/* V5: dezenter Prompt-Stand-Badge — zeigt, welche Prompt-Fassung den Endtext erzeugt
+                    hat (Kennung siehe promptKennungFuer, shared/workflows.ts). Fehlt bei Einträgen
+                    ohne rewrite-Schritt und bei allen Vor-V5-Einträgen (optionales Feld). */}
+                {aktiv.promptKennung && (
+                  <span
+                    className="rounded border px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground/70"
+                    title={`Prompt-Stand: ${aktiv.promptKennung}`}
+                  >
+                    {aktiv.promptKennung}
+                  </span>
+                )}
+              </span>
               <span>{new Date(aktiv.zeitstempelMs).toLocaleString('de-DE')}</span>
             </div>
             {(() => {

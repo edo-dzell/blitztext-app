@@ -12,7 +12,7 @@
 ![Electron](https://img.shields.io/badge/Electron-33-47848F?style=flat-square&logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-087EA4?style=flat-square&logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strikt-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-389%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-714%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
 
 [**⬇️ Download**](https://github.com/edo-dzell/blitztext-app-windows/releases/latest) ·
 [Vergleich zum Original](#-stark-erweitert-windows-port-vs-macos-original) ·
@@ -69,7 +69,7 @@ Idee zur Alltags-App aus:
 | **Statistik** | ✅ Token-Summen und Kosten, mit editierbarer Preistabelle | — |
 | **Design** | ✅ Hell/Dunkel (nach System oder manuell), Tray-Icon folgt dem Theme | — |
 | **Diktier-UX** | ✅ Fokusfreie Status-Pille, Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar | Menubar-Icon |
-| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* statt es umzuschreiben, und legt dann den Rohtext in die Zwischenablage statt falschen Text einzufügen), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 389 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* statt es umzuschreiben, und legt dann den Rohtext in die Zwischenablage statt falschen Text einzufügen), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 714 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
 
 <sup>Vergleich auf Basis des öffentlichen README des Originals (Stand Juni 2026).</sup>
 

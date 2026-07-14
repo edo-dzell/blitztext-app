@@ -21,10 +21,14 @@ interface MakeOpts {
   verlaufGeschrieben?: boolean
   /** Lässt die Transkription werfen (für Fehlerpfad-Tests). */
   transcribeFehler?: Error
+  /** Lässt NUR den ersten Transkriptions-Versuch werfen (für Audio-Retry-Tests, W3-B). */
+  transcribeFehlerErsterVersuch?: Error
   /** Lässt das Umschreiben werfen (für Teil-Erfolg-Tests). */
   rewriteFehler?: Error
   /** Lässt das Protokoll-Schreiben werfen (für die Crash-Härtung A5). */
   protokollWirft?: boolean
+  /** Vom erfasseFenster-Port zurückgegebenes HWND beim Aufnahme-Start (Weg B, W3-A). */
+  erfasstesHwnd?: number | null
 }
 
 function makeSitzung(opts: MakeOpts = {}) {
@@ -43,11 +47,16 @@ function makeSitzung(opts: MakeOpts = {}) {
       recorder.discarded++
     }
   }
+  let transcribeAufrufe = 0
   const runner = createWorkflowRunner({
     recorder,
     transcription: {
       async transcribe(_audio, options) {
+        transcribeAufrufe++
         opts.captureTranscribe?.(options)
+        if (opts.transcribeFehlerErsterVersuch && transcribeAufrufe === 1) {
+          throw opts.transcribeFehlerErsterVersuch
+        }
         if (opts.transcribeFehler) throw opts.transcribeFehler
         if (opts.hangUntilAbort) {
           return await new Promise<string>((_resolve, reject) => {
@@ -83,19 +92,33 @@ function makeSitzung(opts: MakeOpts = {}) {
 
   const calls = {
     einfügen: [] as string[],
+    einfügenKontext: [] as Array<{ fokusRueckkehr: boolean; erfasstesHwnd: number | null } | undefined>,
     anzeigen: [] as string[],
     zeigeEinstellungen: 0,
     melde: [] as FehlerMeldung[],
-    inZwischenablage: [] as string[]
+    // W3-B: pro melde-Aufruf der mitgereichte Retry-Callback (oder undefined) — für den Notification-Button.
+    meldeErneut: [] as Array<(() => void) | undefined>,
+    inZwischenablage: [] as string[],
+    erfasseFenster: 0
   }
   const ausgabe: Ausgabe = {
-    einfügen: (t) => calls.einfügen.push(t),
+    einfügen: (t, kontext) => {
+      calls.einfügen.push(t)
+      calls.einfügenKontext.push(kontext)
+    },
     anzeigen: (t) => calls.anzeigen.push(t),
     zeigeEinstellungen: () => {
       calls.zeigeEinstellungen++
     },
-    melde: (f) => calls.melde.push(f),
-    inZwischenablage: (t) => calls.inZwischenablage.push(t)
+    melde: (f, aktionen) => {
+      calls.melde.push(f)
+      calls.meldeErneut.push(aktionen?.erneut)
+    },
+    inZwischenablage: (t) => calls.inZwischenablage.push(t),
+    erfasseFenster: () => {
+      calls.erfasseFenster++
+      return opts.erfasstesHwnd ?? null
+    }
   }
 
   const apiKeys = {
@@ -124,7 +147,14 @@ function makeSitzung(opts: MakeOpts = {}) {
       historyChanges.n++
     }
   })
-  return { sitzung, calls, recorder, protokollDaten, historyChanges }
+  return {
+    sitzung,
+    calls,
+    recorder,
+    protokollDaten,
+    historyChanges,
+    transcribeAufrufe: () => transcribeAufrufe
+  }
 }
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
@@ -288,6 +318,25 @@ describe('createSitzung', () => {
     expect(protokollDaten[0]).toMatchObject({ chatModell: '', umgeschrieben: false })
   })
 
+  // --- W3-μ (V5): promptKennung reicht von runner.letzteMetrik unverändert bis in Abschlussdaten ---
+
+  it('Umschreib-Workflow: protokolliert eine promptKennung (builtin:<id>@<hash>)', async () => {
+    const { sitzung, protokollDaten } = makeSitzung({ transcript: 'roh', rewritten: 'fertig' })
+    await sitzung.starteWorkflow('improve', 'hotkey')
+    await sitzung.stoppe()
+
+    expect(protokollDaten).toHaveLength(1)
+    expect(protokollDaten[0]!.promptKennung).toMatch(/^builtin:improve@[0-9a-f]{8}$/)
+  })
+
+  it('reine Transkription: promptKennung bleibt undefined (kein System-Prompt gelaufen)', async () => {
+    const { sitzung, protokollDaten } = makeSitzung({ transcript: 'nur text' })
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+
+    expect(protokollDaten[0]!.promptKennung).toBeUndefined()
+  })
+
   it('leitet die Phasen des Runners an onStatus weiter (für Tray/Fenster)', async () => {
     const { sitzung } = makeSitzung({ transcript: 'hallo' })
     const phasen: string[] = []
@@ -389,8 +438,8 @@ describe('createSitzung', () => {
     const { sitzung, calls } = makeSitzung({ settings: NUR_MISTRAL })
     await sitzung.starteWorkflow('improve', 'manuell')
     expect(calls.melde).toHaveLength(1)
-    expect(calls.melde[0].titel).toBe('Modell ersetzt')
-    expect(calls.melde[0].koerper).toContain('mistral-small-latest')
+    expect(calls.melde[0]!.titel).toBe('Modell ersetzt')
+    expect(calls.melde[0]!.koerper).toContain('mistral-small-latest')
   })
 
   it('hotkey: bleibt bei abgewertetem Modell still (keine Notification im Hintergrund)', async () => {
@@ -420,5 +469,348 @@ describe('createSitzung', () => {
 
     await sitzung.starteWorkflow('transcribe', 'hotkey')
     expect(recorder.started).toBe(1)
+  })
+
+  // W2-A: Race-Härtung von starteWorkflow. Die Guards/Reservierung müssen VOR den Start-Awaits
+  // greifen, sonst schlüpfen zwei quasi-gleichzeitige Auslösungen durch (Doppel-Start) bzw. ein
+  // brichAb() während der Awaits geht verloren (Start trotzdem). Wir kontrollieren dazu, WANN der
+  // erste await (Einstellungen laden) auflöst — über einen manuell gesteuerten read()-Port.
+  function makeSitzungMitTorSteuerung(opts: MakeOpts = {}) {
+    const recorder = {
+      started: 0,
+      stopped: 0,
+      discarded: 0,
+      start(): void {
+        recorder.started++
+      },
+      async stop() {
+        recorder.stopped++
+        return { audio, durationSeconds: opts.durationSeconds ?? 1.5 }
+      },
+      discard(): void {
+        recorder.discarded++
+      }
+    }
+    const runner = createWorkflowRunner({
+      recorder,
+      transcription: {
+        async transcribe() {
+          return opts.transcript ?? 'roh'
+        }
+      },
+      rewrite: {
+        async rewrite() {
+          return { text: opts.rewritten ?? 'umgeschrieben' }
+        }
+      },
+      resolveSystemPrompt,
+      quality
+    })
+
+    // read() blockiert, bis wir das Tor aufmachen → deterministisches Interleaving der Awaits.
+    const content: string | null = opts.settings ? JSON.stringify(opts.settings) : null
+    let toreLoesen: Array<() => void> = []
+    const einstellungen = createSettingsStore({
+      file: {
+        read() {
+          return new Promise<string | null>((resolve) => {
+            toreLoesen.push(() => resolve(content))
+          })
+        },
+        async write() {
+          // no-op
+        }
+      }
+    })
+
+    const calls = {
+      einfügen: [] as string[],
+      anzeigen: [] as string[],
+      zeigeEinstellungen: 0,
+      melde: [] as FehlerMeldung[],
+      inZwischenablage: [] as string[]
+    }
+    const ausgabe: Ausgabe = {
+      einfügen: (t) => calls.einfügen.push(t),
+      anzeigen: (t) => calls.anzeigen.push(t),
+      zeigeEinstellungen: () => {
+        calls.zeigeEinstellungen++
+      },
+      melde: (f) => calls.melde.push(f),
+      inZwischenablage: (t) => calls.inZwischenablage.push(t),
+      erfasseFenster: () => null
+    }
+
+    const apiKeys = {
+      async has() {
+        return opts.hasKey ?? true
+      }
+    }
+
+    const sitzung = createSitzung({ runner, einstellungen, apiKeys, ausgabe })
+    // Löst alle bislang gestauten read()-Aufrufe auf und lässt die Microtasks durchlaufen.
+    async function oeffneTore(): Promise<void> {
+      const tore = toreLoesen
+      toreLoesen = []
+      for (const t of tore) t()
+      await tick()
+      await tick()
+    }
+    return { sitzung, calls, recorder, oeffneTore, wartendeTore: () => toreLoesen.length }
+  }
+
+  it('W2-A/1: zwei quasi-gleichzeitige starteWorkflow starten den Runner nur EINMAL', async () => {
+    const { sitzung, recorder, oeffneTore } = makeSitzungMitTorSteuerung()
+
+    // Beide Aufrufe treten ein, BEVOR der erste await (load) aufgelöst hat → hier entscheidet sich,
+    // ob die Reservierung vor dem await greift. Bei kaputtem Guard: beide passieren → recorder.started == 2.
+    const p1 = sitzung.starteWorkflow('transcribe', 'hotkey')
+    const p2 = sitzung.starteWorkflow('improve', 'manuell')
+    await oeffneTore()
+    await Promise.all([p1, p2])
+
+    expect(recorder.started).toBe(1)
+  })
+
+  it('W2-A/2: brichAb während des load-Awaits verhindert den Start und hinterlässt keine Reservierung', async () => {
+    const { sitzung, recorder, calls, oeffneTore } = makeSitzungMitTorSteuerung()
+
+    const p = sitzung.starteWorkflow('transcribe', 'hotkey')
+    // Der Lauf hängt jetzt im load-await. Der Nutzer bricht ab, BEVOR load aufgelöst hat.
+    sitzung.brichAb()
+    // Erst danach löst load auf; starteWorkflow läuft weiter — darf aber NICHT mehr starten.
+    await oeffneTore()
+    await p
+
+    expect(recorder.started).toBe(0)
+    expect(sitzung.beschaeftigt()).toBe(false)
+    expect(calls.einfügen).toEqual([])
+    expect(calls.anzeigen).toEqual([])
+
+    // Kein Zustands-Leck: eine frische Auslösung nach dem Abbruch läuft sauber an.
+    const p2 = sitzung.starteWorkflow('transcribe', 'hotkey')
+    await oeffneTore()
+    await p2
+    expect(recorder.started).toBe(1)
+    expect(sitzung.beschaeftigt()).toBe(true)
+  })
+
+  it('W2-A/3: normaler Start/Stop bleibt über das Tor unverändert', async () => {
+    const { sitzung, calls, recorder, oeffneTore } = makeSitzungMitTorSteuerung({ transcript: 'hallo' })
+
+    const p = sitzung.starteWorkflow('transcribe', 'hotkey')
+    await oeffneTore()
+    await p
+    expect(recorder.started).toBe(1)
+    expect(sitzung.beschaeftigt()).toBe(true)
+
+    await sitzung.stoppe()
+    expect(calls.einfügen).toEqual(['hallo'])
+    expect(sitzung.beschaeftigt()).toBe(false)
+  })
+
+  // --- W3-A: Fokus-Rückkehr (ADR-0011 Weg B) — HWND beim Start erfassen, an einfügen durchreichen ---
+
+  it('Weg B: erfasst beim Start das Fenster und reicht fokusRueckkehr + erfasstesHwnd an einfügen', async () => {
+    const { sitzung, calls } = makeSitzung({
+      transcript: 'hallo',
+      erfasstesHwnd: 4711,
+      settings: { fokusRueckkehr: true }
+    })
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+
+    expect(calls.erfasseFenster).toBe(1)
+    expect(calls.einfügen).toEqual(['hallo'])
+    expect(calls.einfügenKontext[0]).toEqual({ fokusRueckkehr: true, erfasstesHwnd: 4711 })
+  })
+
+  it('Weg B: reicht fokusRueckkehr=false durch, wenn das Feature aus ist', async () => {
+    const { sitzung, calls } = makeSitzung({
+      transcript: 'hallo',
+      erfasstesHwnd: 4711,
+      settings: { fokusRueckkehr: false }
+    })
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+
+    expect(calls.einfügenKontext[0]).toEqual({ fokusRueckkehr: false, erfasstesHwnd: 4711 })
+  })
+
+  it('Weg B: erfasst KEIN Fenster bei manueller Quelle (kein Auto-Einfügen, nur Anzeige)', async () => {
+    const { sitzung, calls } = makeSitzung({ transcript: 'hallo', erfasstesHwnd: 4711 })
+
+    await sitzung.starteWorkflow('transcribe', 'manuell')
+    await sitzung.stoppe()
+
+    // Manuelle Quelle zeigt an statt einzufügen → keine Fenster-Erfassung nötig.
+    expect(calls.erfasseFenster).toBe(0)
+    expect(calls.anzeigen).toEqual(['hallo'])
+  })
+
+  // --- W3-B: Audio-Retry (Meldung mit aktion 'erneut' + erneutVersuchen ohne neues Diktat) ---
+
+  it('W3-B: anbieter-Fehler bietet aktion "erneut"; erneutVersuchen fügt nach Erfolg ein (kein neues Diktat)', async () => {
+    const { sitzung, calls, recorder, transcribeAufrufe } = makeSitzung({
+      transcript: 'endlich da',
+      transcribeFehlerErsterVersuch: new Error('OpenAI-Fehler: 500')
+    })
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+
+    // Erster Lauf scheitert → Meldung mit Retry-Aktion, nichts eingefügt.
+    expect(calls.einfügen).toEqual([])
+    expect(calls.melde).toHaveLength(1)
+    expect(calls.melde[0]!.aktion).toBe('erneut')
+    expect(recorder.stopped).toBe(1)
+    expect(transcribeAufrufe()).toBe(1)
+
+    // Retry ab Transkription — ohne neues Diktat (kein Recorder-Neustart).
+    await sitzung.erneutVersuchen()
+    await tick()
+
+    expect(recorder.started).toBe(1) // NICHT erneut gestartet
+    expect(transcribeAufrufe()).toBe(2)
+    expect(calls.einfügen).toEqual(['endlich da'])
+  })
+
+  it('W3-B: erneutVersuchen ohne gehaltenes Audio ist ein No-Op', async () => {
+    const { sitzung, calls } = makeSitzung({ transcript: 'hallo' })
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+    // Erfolgreicher Lauf → Audio verworfen. Ein Retry darf nichts tun.
+    calls.einfügen.length = 0
+    await sitzung.erneutVersuchen()
+    await tick()
+    expect(calls.einfügen).toEqual([])
+  })
+
+  // --- F1: kannErneutVersuchen spiegelt den Runner-Zustand (für den Tray-Eintrag-Aktivzustand) ---
+
+  it('F1: kannErneutVersuchen ist false vor jedem Lauf', () => {
+    const { sitzung } = makeSitzung({ transcript: 'hallo' })
+    expect(sitzung.kannErneutVersuchen()).toBe(false)
+  })
+
+  it('F1: kannErneutVersuchen ist true nach einem transienten Fehler (Audio gehalten)', async () => {
+    const { sitzung } = makeSitzung({
+      transcript: 'endlich da',
+      transcribeFehlerErsterVersuch: new Error('OpenAI-Fehler: 500')
+    })
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+    expect(sitzung.kannErneutVersuchen()).toBe(true)
+  })
+
+  it('F1: kannErneutVersuchen ist false nach einem erfolgreichen Lauf (Audio verworfen)', async () => {
+    const { sitzung } = makeSitzung({ transcript: 'hallo' })
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+    expect(sitzung.kannErneutVersuchen()).toBe(false)
+  })
+
+  // --- F1: der Fehler-melde reicht bei aktion 'erneut' einen Retry-Callback mit (Notification-Button) ---
+
+  it('F1: retrybarer Fehler reicht einen erneut-Callback an melde; Aufruf löst erneutVersuchen aus', async () => {
+    const { sitzung, calls, recorder, transcribeAufrufe } = makeSitzung({
+      transcript: 'endlich da',
+      transcribeFehlerErsterVersuch: new Error('OpenAI-Fehler: 500')
+    })
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+
+    // Meldung trägt die Retry-Aktion UND einen aufrufbaren Callback.
+    expect(calls.melde[0]!.aktion).toBe('erneut')
+    const erneut = calls.meldeErneut[0]
+    expect(typeof erneut).toBe('function')
+    expect(transcribeAufrufe()).toBe(1)
+
+    // Der Callback (Notification-Button-Klick) verarbeitet das gehaltene Audio erneut.
+    erneut!()
+    await tick()
+    await tick()
+
+    expect(recorder.started).toBe(1) // kein neues Diktat
+    expect(transcribeAufrufe()).toBe(2)
+    expect(calls.einfügen).toEqual(['endlich da'])
+  })
+
+  it('F1: ein nicht-retrybarer Fehler reicht KEINEN erneut-Callback mit', async () => {
+    const { sitzung, calls } = makeSitzung({
+      transcribeFehler: Object.assign(new Error('Ungültiger Key'), { status: 401 })
+    })
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+    expect(calls.melde[0]!.aktion).toBe('einstellungen')
+    expect(calls.meldeErneut[0]).toBeUndefined()
+  })
+
+  // --- F1: Reservierungs-Lücke in erneutVersuchen (P1-latent Doppel-Run-Korruption) ---
+
+  it('F1: während laufendem erneutVersuchen wird ein konkurrierender starteWorkflow abgewiesen', async () => {
+    // Erster Versuch scheitert transient (Audio gehalten), zweiter (Retry) hängt in der
+    // Transkription bis zum Abbruch-Signal. Ein starteWorkflow während des Retrys darf den Runner
+    // NICHT ein zweites Mal starten (Doppel-Run-Korruption auf demselben Runner).
+    const { sitzung, recorder } = makeSitzung({
+      transcript: 'egal',
+      transcribeFehlerErsterVersuch: new Error('OpenAI-Fehler: 500'),
+      hangUntilAbort: true
+    })
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+    expect(recorder.started).toBe(1)
+    expect(sitzung.kannErneutVersuchen()).toBe(true)
+
+    // Retry starten (hängt in der Transkription) — NICHT awaiten.
+    const retryP = sitzung.erneutVersuchen()
+    await tick()
+    // Während der Retry läuft, ist die Sitzung beschäftigt.
+    expect(sitzung.beschaeftigt()).toBe(true)
+
+    // Konkurrierender Hotkey-Start MUSS abgewiesen werden (kein zweiter runner.start).
+    await sitzung.starteWorkflow('improve', 'hotkey')
+    expect(recorder.started).toBe(1) // unverändert — kein zweiter Start
+
+    // Aufräumen: Abbruch löst den hängenden Retry auf.
+    sitzung.brichAb()
+    await retryP
+    expect(sitzung.beschaeftigt()).toBe(false)
+  })
+
+  it('F1: nach Abschluss von erneutVersuchen ist die Reservierung wieder frei', async () => {
+    const { sitzung, recorder } = makeSitzung({
+      transcript: 'endlich da',
+      transcribeFehlerErsterVersuch: new Error('OpenAI-Fehler: 500')
+    })
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+
+    await sitzung.erneutVersuchen()
+    await tick()
+    expect(sitzung.beschaeftigt()).toBe(false)
+
+    // Eine frische Auslösung nach dem erfolgreichen Retry läuft sauber an.
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    expect(recorder.started).toBe(2)
+  })
+
+  it('F1: erneutVersuchen wird ignoriert, solange ein Lauf aktiv ist', async () => {
+    const { sitzung, transcribeAufrufe } = makeSitzung({ transcript: 'hallo', hangUntilAbort: true })
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    const stopP = sitzung.stoppe() // hängt in der Transkription
+    await tick()
+    expect(sitzung.beschaeftigt()).toBe(true)
+
+    // Ein Retry während eines aktiven Laufs ist ein No-Op (kein zusätzlicher transcribe).
+    await sitzung.erneutVersuchen()
+    expect(transcribeAufrufe()).toBe(1)
+
+    sitzung.brichAb()
+    await stopP
   })
 })

@@ -30,7 +30,13 @@ export const PREISE: PreisTabelle = {
   'whisper-large-v3': { asrProMinuteUsd: 0.111 / 60 },
   'whisper-large-v3-turbo': { asrProMinuteUsd: 0.04 / 60 },
   'llama-3.3-70b-versatile': { inputPro1MUsd: 0.59, outputPro1MUsd: 0.79 },
-  'llama-3.1-8b-instant': { inputPro1MUsd: 0.05, outputPro1MUsd: 0.08 }
+  'llama-3.1-8b-instant': { inputPro1MUsd: 0.05, outputPro1MUsd: 0.08 },
+  // Mistral — Stand 2026-07, vor Rechnungsrelevanz prüfen. Quelle: https://mistral.ai/pricing/api/
+  // 'latest'-Alias löst aktuell auf: mistral-small-latest → Mistral Small 4, mistral-large-latest →
+  // Mistral Large 3, voxtral-mini-latest → Voxtral Mini Transcribe 2 (Transcriptions-Endpoint).
+  'mistral-small-latest': { inputPro1MUsd: 0.15, outputPro1MUsd: 0.6 },
+  'mistral-large-latest': { inputPro1MUsd: 0.5, outputPro1MUsd: 1.5 },
+  'voxtral-mini-latest': { asrProMinuteUsd: 0.003 }
 }
 
 // Feldweiser Merge: gesetzte Override-Felder gewinnen, fehlende behalten den Default (undefined-Felder

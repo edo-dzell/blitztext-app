@@ -60,11 +60,26 @@ export function createHotkeyMatcher(config: HotkeyMatcherConfig): HotkeyMatcher 
     return true
   }
 
-  // Entfernt getrackte Modifier, die laut Maske gar nicht (mehr) gedrückt sind.
-  const raeumeStaleTasten = (modifiers: ModifierLage): void => {
+  // Entfernt getrackte Modifier, die laut Maske gar nicht (mehr) gedrückt sind, und heilt
+  // im selben Zug stale Nicht-Modifier-Tasten. Für Modifier ist die uiohook-Maske Ground Truth;
+  // Nicht-Modifier (z. B. KeyJ in [ControlRight, KeyJ]) haben KEINE Maske — ihr verschlucktes
+  // Keyup (UIPI/Win+L, RESEARCH §3) bliebe sonst für immer getrackt (Phantom-Zustand).
+  // Das verlässliche Signal „wir waren in einem UIPI-/Lock-Fenster" ist, dass die Maske einen
+  // getrackten Modifier als losgelassen entlarvt. Genau dann — und nur dann — räumen wir auch
+  // alle gedrückten Nicht-Modifier-Tasten, außer der aktuell empfangenen (die ist real da).
+  // So bricht normales schnelles Tippen bei konsistenter Maske nichts.
+  const raeumeStaleTasten = (modifiers: ModifierLage, aktuelleTaste: string): void => {
+    let staleModifierGeraeumt = false
     for (const key of pressed) {
       const familie = MODIFIER_FAMILIE[key]
-      if (familie && !modifiers[familie]) pressed.delete(key)
+      if (familie && !modifiers[familie]) {
+        pressed.delete(key)
+        staleModifierGeraeumt = true
+      }
+    }
+    if (!staleModifierGeraeumt) return
+    for (const key of pressed) {
+      if (!MODIFIER_FAMILIE[key] && key !== aktuelleTaste) pressed.delete(key)
     }
   }
 
@@ -87,7 +102,7 @@ export function createHotkeyMatcher(config: HotkeyMatcherConfig): HotkeyMatcher 
       // wasComplete VOR dem Aufräumen messen: nur so wird eine verwaiste aktive Aufnahme
       // (Keyups während der Sperre verloren) als fallende Flanke erkannt und beendet.
       const wasComplete = chordComplete()
-      if (event.modifiers) raeumeStaleTasten(event.modifiers)
+      if (event.modifiers) raeumeStaleTasten(event.modifiers, event.key)
 
       const istChordTaste = chord.has(event.key)
       if (istChordTaste) {

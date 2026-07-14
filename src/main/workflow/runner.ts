@@ -7,7 +7,7 @@
 // in der RunInput. Modell/Temperatur/Prompt kommen damit aus der Definition statt aus hartem Code —
 // die vier eingebauten Workflows liefern über ihre Seeds exakt die alten Werte (Verhalten unverändert).
 
-import type { WorkflowDefinition } from '@shared/workflows'
+import { promptKennungFuer, type WorkflowDefinition } from '@shared/workflows'
 import type { TranscriptionProvider } from '@main/transcription/cloud-provider'
 import type { RewriteProvider } from '@main/rewrite/cloud-provider'
 import type { resolveSystemPrompt, RewriteSettings } from '@main/rewrite/prompt-builder'
@@ -53,6 +53,14 @@ export interface WorkflowRunnerDeps {
    * gibt eine Abbruchfunktion zurück. Ohne Angabe: 90 s via setTimeout. Im Test injizierbar.
    */
   starteWatchdog?: (onTimeout: () => void) => () => void
+  /**
+   * Aufnahme-Watchdog (W1-A, P0): eigener Backstop für die Phase `aufnehmen`. Stirbt der Recorder-
+   * Renderer, während `recorder.stop()` auf 'recorder:result'/'recorder:error' wartet, löst nichts die
+   * wartenden Listener auf → Phase `aufnehmen` hinge für immer (`beschaeftigt()` bliebe true). Dieser
+   * Timer bricht den Hänger ab. Bewusst getrennt vom Anbieter-Watchdog und großzügiger (der Nutzer
+   * hält evtl. minutenlang gedrückt). Ohne Angabe: AUFNAHME_WATCHDOG_MS via setTimeout. Im Test injizierbar.
+   */
+  starteAufnahmeWatchdog?: (onTimeout: () => void) => () => void
   /** Backoff-Verzögerung zwischen netzwerk-Retries; injizierbar für Tests (Default echte Verzögerung). */
   sleep?: (ms: number) => Promise<void>
 }
@@ -80,6 +88,12 @@ export interface RunMetrik {
   usage?: { promptTokens: number; completionTokens: number }
   /** true, wenn ein Umschreibe-Schritt (Chat) lief — sonst reine Transkription. */
   umgeschrieben: boolean
+  /**
+   * Kennung des Prompt-Stands, der den Endtext erzeugt hat (V5, `promptKennungFuer` in
+   * shared/workflows.ts). NUR bei Umschreib-Workflows gesetzt (rewrite lief) — reine Transkription
+   * hat keinen System-Prompt und bleibt `undefined`.
+   */
+  promptKennung?: string
 }
 
 // Fehler-Art (CONTEXT.md) ist im fehler-klassifikation-Modul definiert (aufnahme | konfiguration |
@@ -87,10 +101,11 @@ export interface RunMetrik {
 // ein Urteil des Runners (zu kurz/Artefakt); die übrigen bestimmt der Klassifizierer aus dem Anbieter-Fehler.
 export type { FehlerArt }
 
-// Warum es zum Teil-Erfolg kam (CONTEXT.md): ein Umschreib-Fehler (Anbieter scheiterte) ODER ein
-// Treue-Befund (das Modell hat das Diktat beantwortet, v0.4.5). Beide retten den Rohtext, aber die
+// Warum es zum Teil-Erfolg kam (CONTEXT.md): ein Umschreib-Fehler (Anbieter scheiterte), ein
+// Treue-Befund (das Modell hat das Diktat beantwortet, v0.4.5) ODER der Anbieter hat die Antwort am
+// Token-Limit abgeschnitten (finish_reason='length', W1-D). Alle drei retten den Rohtext, aber die
 // Sitzung meldet sie unterschiedlich (siehe sitzung.ts).
-export type TeilErfolgGrund = 'umschreibfehler' | 'beantwortet'
+export type TeilErfolgGrund = 'umschreibfehler' | 'beantwortet' | 'abgeschnitten'
 
 export type WorkflowPhase =
   | { status: 'idle' }
@@ -110,12 +125,58 @@ export interface WorkflowRunner {
   stop(): Promise<WorkflowPhase>
   /** Abbruch in Aufnahme/Transkription/Umschreiben: bricht laufende Anbieter-Aufrufe ab, still nach idle. */
   abbrechen(): void
+  /**
+   * W3-B (Audio-Retry): true, wenn ein Lauf an einem transienten Fehler (netzwerk/anbieter) bzw. einem
+   * Teil-Erfolg scheiterte UND das aufgenommene Audio noch flüchtig im Speicher liegt → ein erneuter
+   * Versuch ab Transkription ist möglich, OHNE neu zu diktieren.
+   */
+  kannErneutVersuchen(): boolean
+  /**
+   * W3-B: Verarbeitet das zuletzt gehaltene Audio erneut ab der Transkription (kein Recorder-Neustart,
+   * kein neues Diktat). No-Op (gibt die aktuelle Phase zurück), wenn kein Audio gehalten wird — etwa
+   * nach einem 'fertig' (das Audio wurde verworfen) oder im Leerlauf. NIE auf Disk, NIE in den Verlauf.
+   */
+  erneutVersuchen(): Promise<WorkflowPhase>
 }
 
 // Beide Aufnahme-Guards (zu kurz / Artefakt) melden denselben Text wie das macOS-Original.
 const NO_RECORDING_ERROR = 'Keine Aufnahme erkannt.'
+// Aufnahme-Watchdog-Frist (W1-A): großzügig, da der Nutzer im Halten-Modus minutenlang aufnehmen darf.
+// Rein als Backstop gegen einen toten Renderer gedacht, nicht als Aufnahme-Längenlimit.
+const AUFNAHME_WATCHDOG_MS = 10 * 60_000
+// Nutzergerichtete Meldung, wenn die Aufnahme-Phase in den Watchdog läuft (toter Renderer o. Ä.).
+const AUFNAHME_TIMEOUT_ERROR = 'Zeitüberschreitung bei der Aufnahme.'
 // Interner Grund-Vermerk für den Treue-Abbruch (die nutzergerichtete Meldung baut die Sitzung aus `grund`).
 const BEANTWORTET_WARNUNG = 'Endtext wirkt wie eine Antwort auf das Diktat, nicht wie dessen Bearbeitung.'
+// Interner Grund-Vermerk, wenn der Anbieter am Token-Limit abgeschnitten hat (finish_reason='length').
+const ABGESCHNITTEN_WARNUNG = 'Umschreiben wurde vom Modell abgeschnitten (Token-Limit erreicht).'
+
+// Steuerzeichen-Filter (MAL-1, Security-P1, W2-B): Modell-/Transkriptions-Output geht ungefiltert in
+// Zwischenablage + Auto-Paste. Landet der Fokus in einem Terminal, können eingebettete Escape-Sequenzen
+// dort ausgeführt werden (Terminal-Escape-Injection — z. B. Titel-Änderungen, in bestimmten Terminals
+// sogar Tastatur-Einspeisung). CSI beginnt mit ESC '[' und endet am ersten Byte 0x40–0x7E; OSC beginnt
+// mit ESC ']' und endet an BEL (\x07) oder ST (ESC '\'). Beide werden komplett entfernt, nicht nur das
+// ESC-Byte — sonst bliebe der Sequenzkörper (z. B. Farbcodes) als sichtbarer Text-Müll zurück.
+const CSI_ODER_OSC = /\x1b(?:\[[0-9:;<=>?]*[ -/]*[\x40-\x7e]|\][\s\S]*?(?:\x07|\x1b\\))/g
+// Verbleibende C0-Steuerzeichen (0x00–0x1F) außer \n (0x0A) und \t (0x09), \r (0x0D, separat behandelt),
+// plus DEL (0x7F). C1-Bereich (U+0080–U+009F) und die Unicode-Zeilentrenner U+2028/U+2029 werden
+// separat per Codepoint-Escape gefiltert (kein rohes Steuerzeichen im Quelltext).
+const RESTLICHE_C0_UND_DEL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g
+const C1_UND_ZEILENTRENNER = /[\u0080-\u009f\u2028\u2029]/g
+
+/**
+ * Entfernt Terminal-Escape-Sequenzen und sonstige Steuerzeichen aus Modell-/Transkriptions-Output,
+ * bevor er in die Zwischenablage/Auto-Paste geht (MAL-1). Legitimer Text (Umlaute, Emoji, normale
+ * Interpunktion, \n/\t, mehrzeiliger Text) bleibt unverändert — reine Funktion, keine Seiteneffekte.
+ */
+export function entferneSteuerzeichen(text: string): string {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(CSI_ODER_OSC, '')
+    .replace(RESTLICHE_C0_UND_DEL, '')
+    .replace(C1_UND_ZEILENTRENNER, '')
+}
 
 export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   let phase: WorkflowPhase = { status: 'idle' }
@@ -125,11 +186,22 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   // manuellen Abbruch, damit der Catch still nach idle führt statt einen Fehler zu melden.
   let controller: AbortController | null = null
   let abgebrochen = false
+  // W3-B (Audio-Retry): das zuletzt aufgenommene Audio wird NUR flüchtig im Speicher gehalten, solange
+  // ein erneuter Versuch sinnvoll ist (transienter Fehler / Teil-Erfolg). Bei 'fertig' oder Aufnahme-
+  // Fehler (nichts Brauchbares) wird es verworfen. NIE auf Disk, NIE in den Verlauf (Datenschutz).
+  let letzteAufnahme: RecordingResult | null = null
 
   const starteWatchdog =
     deps.starteWatchdog ??
     ((onTimeout: () => void) => {
       const t = setTimeout(onTimeout, 90_000)
+      return () => clearTimeout(t)
+    })
+
+  const starteAufnahmeWatchdog =
+    deps.starteAufnahmeWatchdog ??
+    ((onTimeout: () => void) => {
+      const t = setTimeout(onTimeout, AUFNAHME_WATCHDOG_MS)
       return () => clearTimeout(t)
     })
 
@@ -143,6 +215,8 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     start(next) {
       input = next
       abgebrochen = false
+      // W3-B: ein frisches Diktat macht ein zuvor gehaltenes Audio gegenstandslos → verwerfen.
+      letzteAufnahme = null
       transition({ status: 'aufnehmen' })
       deps.recorder.start()
     },
@@ -157,7 +231,14 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       }
       abgebrochen = true
       if (phase.status === 'aufnehmen') {
-        deps.recorder.discard()
+        // discard() darf die idle-Transition nicht killen (W1-A, P0): ein zerstörtes Recorder-Fenster
+        // ließe send() sonst werfen → Runner bliebe „beschäftigt". Der Adapter schluckt bereits, hier
+        // doppelt defensiv (auch für abweichende Recorder-Implementierungen/Tests).
+        try {
+          deps.recorder.discard()
+        } catch {
+          /* ignorieren — die stille Rückkehr nach idle hat Vorrang */
+        }
       } else {
         controller?.abort(new DOMException('Abbruch durch Nutzer.', 'AbortError'))
       }
@@ -171,111 +252,200 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       // Renderer 'Keine aktive Aufnahme' wirft → ungefangene Ablehnung → blockierender Fehlerdialog.
       if (phase.status !== 'aufnehmen') return phase
 
+      // Aufnahme-Watchdog (W1-A, P0): deckt die Phase `aufnehmen`, in der wir auf recorder.stop() warten.
+      // Stirbt der Renderer, ohne dass der Adapter den wartenden stop() auflöst, hinge dieser Await für
+      // immer (Phase `aufnehmen`, `beschaeftigt()` bliebe true). Der Watchdog löst das Rennen selbst auf
+      // (eigenes reject), damit wir NICHT davon abhängen, dass recorder.stop()/discard() den Hänger bricht.
+      let istAufnahmeTimeout = false
+      let feuereAufnahmeTimeout: () => void = () => {}
+      const aufnahmeTimeoutPromise = new Promise<never>((_resolve, reject) => {
+        feuereAufnahmeTimeout = () =>
+          reject(new DOMException(AUFNAHME_TIMEOUT_ERROR, 'TimeoutError'))
+      })
+      // Unhandled-Rejection vermeiden, falls der stop() vor dem Watchdog gewinnt.
+      aufnahmeTimeoutPromise.catch(() => {})
+      const stoppeAufnahmeWatchdog = starteAufnahmeWatchdog(() => {
+        istAufnahmeTimeout = true
+        // Renderer defensiv anstoßen (fire-and-forget, nie werfend); der Hänger wird ohnehin per race gelöst.
+        try {
+          deps.recorder.discard()
+        } catch {
+          /* ignorieren — das reject unten ist maßgeblich */
+        }
+        feuereAufnahmeTimeout()
+      })
+
       let recording: RecordingResult
       try {
-        recording = await deps.recorder.stop()
+        recording = await Promise.race([deps.recorder.stop(), aufnahmeTimeoutPromise])
       } catch (err) {
+        // Aufnahme-Watchdog gefeuert → Hänger als 'aufnahme'-Timeout melden (Notification statt Prozesstod).
+        if (istAufnahmeTimeout) {
+          return transition({ status: 'fehler', art: 'aufnahme', message: AUFNAHME_TIMEOUT_ERROR })
+        }
         // Recorder-Fehler sauber als 'fehler' melden statt als uncaught exception durchzureichen.
         // Manueller Abbruch (discard → AbortError) ist bereits nach idle gegangen → still bleiben.
         if (abgebrochen) return phase
         const message = err instanceof Error ? err.message : String(err)
         return transition({ status: 'fehler', art: 'aufnahme', message })
+      } finally {
+        stoppeAufnahmeWatchdog()
       }
       if (deps.quality.shouldRejectRecording(recording.durationSeconds)) {
+        // Aufnahme-Fehler: nichts Brauchbares zum Wiederholen → kein gehaltenes Audio.
+        letzteAufnahme = null
         return transition({ status: 'fehler', art: 'aufnahme', message: NO_RECORDING_ERROR })
       }
 
+      // W3-B: Audio ab hier flüchtig halten (verwertbare Aufnahme). Ein späterer transienter Fehler /
+      // Teil-Erfolg lässt einen Retry ab Transkription zu; ein 'fertig' verwirft es wieder (abschluss()).
+      letzteAufnahme = recording
+      return verarbeiteAufnahme(recording)
+    },
+    kannErneutVersuchen() {
+      return letzteAufnahme !== null
+    },
+    async erneutVersuchen() {
+      // No-Op ohne gehaltenes Audio: nach 'fertig' (verworfen), Aufnahme-Fehler oder im Leerlauf.
+      if (letzteAufnahme === null) return phase
+      // Frisches Diktat entfällt — direkt ab Transkription mit dem gehaltenen Audio.
       abgebrochen = false
-      controller = new AbortController()
-      let istTimeout = false
-      const stoppeWatchdog = starteWatchdog(() => {
-        istTimeout = true
-        controller?.abort(new DOMException('Zeitüberschreitung beim Anbieter.', 'TimeoutError'))
-      })
+      return verarbeiteAufnahme(letzteAufnahme)
+    }
+  }
 
-      const signal = controller.signal
-      // Nur transiente netzwerk-Fehler wiederholen — nie Abbruch/Watchdog-Timeout (sonst Doppel-Audio,
-      // und der abgebrochene Controller ließe den nächsten Versuch ohnehin sofort scheitern).
-      const retrybar = (fehler: unknown): boolean => {
-        if (abgebrochen || istTimeout) return false
-        if (fehler instanceof Error && (fehler.name === 'AbortError' || fehler.name === 'TimeoutError')) {
-          return false
-        }
-        return klassifiziere(fehler, { istWatchdogTimeout: false }) === 'netzwerk'
+  // Transkription → (Umschreiben) → Abschluss/Teil-Erfolg/Fehler. Wird von stop() (frisches Audio) und
+  // von erneutVersuchen() (gehaltenes Audio, W3-B) geteilt. Setzt einen frischen AbortController +
+  // Anbieter-Watchdog pro Durchlauf, damit auch ein Retry sauber abbrechbar/watchdog-gesichert ist.
+  async function verarbeiteAufnahme(recording: RecordingResult): Promise<WorkflowPhase> {
+    abgebrochen = false
+    controller = new AbortController()
+    let istTimeout = false
+    const stoppeWatchdog = starteWatchdog(() => {
+      istTimeout = true
+      controller?.abort(new DOMException('Zeitüberschreitung beim Anbieter.', 'TimeoutError'))
+    })
+
+    const signal = controller.signal
+    // Nur transiente netzwerk-Fehler wiederholen — nie Abbruch/Watchdog-Timeout (sonst Doppel-Audio,
+    // und der abgebrochene Controller ließe den nächsten Versuch ohnehin sofort scheitern).
+    const retrybar = (fehler: unknown): boolean => {
+      if (abgebrochen || istTimeout) return false
+      if (fehler instanceof Error && (fehler.name === 'AbortError' || fehler.name === 'TimeoutError')) {
+        return false
       }
-      const retryOpts = { versuche: 2, backoffMs: 300, retrybar, sleep: deps.sleep }
+      return klassifiziere(fehler, { istWatchdogTimeout: false }) === 'netzwerk'
+    }
+    const retryOpts = { versuche: 2, backoffMs: 300, retrybar, sleep: deps.sleep }
 
-      // Gemerkter Rohtext für den catch: ist er gesetzt, gelang die Transkription und nur das Umschreiben
-      // scheiterte → Teil-Erfolg (Rohtext retten) statt Totalverlust.
-      let letzterRohtext: string | null = null
-      try {
-        transition({ status: 'transkribieren' })
-        // Eigennamen nur bei ausreichend langer Aufnahme mitschicken (≥ 0,9 s), wie im Original.
-        const vocabularyHints = recording.durationSeconds >= 0.9 ? input?.customTerms ?? [] : []
-        const raw = await mitRetry(
-          () =>
-            deps.transcription.transcribe(recording.audio, {
-              language: input?.language,
-              vocabularyHints,
-              signal
-            }),
-          retryOpts
-        )
-        const rohtext = deps.quality.rohtextAus(raw, recording.durationSeconds)
-        if (rohtext === null) {
-          return transition({ status: 'fehler', art: 'aufnahme', message: NO_RECORDING_ERROR })
-        }
-        letzterRohtext = rohtext // Transkription gelang → bei späterem Umschreib-Fehler Teil-Erfolg
+    // --- Transkriptions-Phase: Audio → Rohtext (oder null bei leerer/artefaktiger Transkription). ---
+    // Reine Gliederung von verarbeiteAufnahme; Logik/Reihenfolge/Fehlerpfade unverändert. Nutzt die
+    // Closure-Werte (signal/retryOpts/input) direkt; wirft weiter an die try/catch-Orchestrierung.
+    async function transkribiere(): Promise<string | null> {
+      transition({ status: 'transkribieren' })
+      // Eigennamen nur bei ausreichend langer Aufnahme mitschicken (≥ 0,9 s), wie im Original.
+      const vocabularyHints = recording.durationSeconds >= 0.9 ? input?.customTerms ?? [] : []
+      const raw = await mitRetry(
+        () =>
+          deps.transcription.transcribe(recording.audio, {
+            language: input?.language,
+            vocabularyHints,
+            signal
+          }),
+        retryOpts
+      )
+      return deps.quality.rohtextAus(raw, recording.durationSeconds)
+    }
 
-        const def = input?.def
-        if (!def || !def.rewrites) {
-          return abschluss(rohtext, rohtext, recording.durationSeconds, undefined, false)
-        }
-
-        transition({ status: 'umschreiben' })
-        const system = deps.resolveSystemPrompt(def, input?.rewriteSettings)
-        // 0.3.1-Blocker-Fix: das bereits AUFGELÖSTE chatModell (aus aufloeseWorkflowLauf →
-        // aufgeloestesChatModell, inkl. Fremd-Modell-Fallback) ist die alleinige Wahrheitsquelle.
-        // NICHT mehr def.model bevorzugen — sonst ginge ein gepinntes OpenAI-Modell (Built-ins) gegen
-        // Mistral/Groq und stürzte ab. Der def.model-Vorrang steckt bereits korrekt in chatModell.
-        const model = input?.chatModell ?? ''
-        // Rohtext gekapselt senden (Daten-Rahmen, prompt-builder): zieht die Grenze „zu bearbeitende
-        // Daten" vs. „Anweisung", damit ein direkt ansprechendes Diktat nicht als Befehl befolgt wird.
-        const rewritten = await mitRetry(
-          () =>
-            deps.rewrite.rewrite(
-              { system, user: kapsleTranskript(rohtext) },
-              { model, temperature: def.temperature, signal }
-            ),
-          retryOpts
-        )
-        // Etwaig zurückgespiegelte Markierungen entfernen, bevor cleanedTranscript trimmt.
-        const endtext = deps.quality.cleanedTranscript(entferneTranskriptMarken(rewritten.text))
-        // Treue-Detektor (v0.4.5, ADR-0018): hat das Modell das Diktat beantwortet statt es zu
-        // bearbeiten? Dann den (geglückten) Rohtext retten statt falschen Text einzufügen.
-        if (deps.treueDetektor?.wirktBeantwortet(rohtext, endtext)) {
-          return teilErfolg(rohtext, recording.durationSeconds, BEANTWORTET_WARNUNG, 'beantwortet')
-        }
-        return abschluss(rohtext, endtext, recording.durationSeconds, rewritten.usage, true)
-      } catch (err) {
-        // Manueller Abbruch: still nach idle (bereits durch abbrechen() gesetzt) — kein Fehler/Metrik.
-        if (abgebrochen) return phase
-        const istTimeoutFehler =
-          istTimeout || (err instanceof Error && err.name === 'TimeoutError')
-        const art = klassifiziere(err, { istWatchdogTimeout: istTimeoutFehler })
-        const message = istTimeoutFehler
-          ? 'Zeitüberschreitung beim Anbieter.'
-          : err instanceof Error
-            ? err.message
-            : String(err)
-        // Teil-Erfolg: Transkription gelang, nur das Umschreiben scheiterte → Rohtext retten.
-        if (letzterRohtext !== null) {
-          return teilErfolg(letzterRohtext, recording.durationSeconds, message, 'umschreibfehler')
-        }
-        return transition({ status: 'fehler', art, message })
-      } finally {
-        stoppeWatchdog()
+    // --- Umschreib-Phase: Rohtext → Endtext-Terminal-Phase (fertig / teilErfolg). ---
+    // Reine Gliederung; Prompt-Auflösung, Token-Limit-, Treue- und Kennungs-Logik unverändert.
+    async function schreibeUm(rohtext: string, def: WorkflowDefinition): Promise<WorkflowPhase> {
+      transition({ status: 'umschreiben' })
+      const system = deps.resolveSystemPrompt(def, input?.rewriteSettings)
+      // 0.3.1-Blocker-Fix: das bereits AUFGELÖSTE chatModell (aus aufloeseWorkflowLauf →
+      // aufgeloestesChatModell, inkl. Fremd-Modell-Fallback) ist die alleinige Wahrheitsquelle.
+      // NICHT mehr def.model bevorzugen — sonst ginge ein gepinntes OpenAI-Modell (Built-ins) gegen
+      // Mistral/Groq und stürzte ab. Der def.model-Vorrang steckt bereits korrekt in chatModell.
+      const model = input?.chatModell ?? ''
+      // Rohtext gekapselt senden (Daten-Rahmen, prompt-builder): zieht die Grenze „zu bearbeitende
+      // Daten" vs. „Anweisung", damit ein direkt ansprechendes Diktat nicht als Befehl befolgt wird.
+      const rewritten = await mitRetry(
+        () =>
+          deps.rewrite.rewrite(
+            { system, user: kapsleTranskript(rohtext) },
+            { model, temperature: def.temperature, signal }
+          ),
+        retryOpts
+      )
+      // Token-Limit (W1-D): der Anbieter hat die Antwort bei finish_reason='length' abgeschnitten.
+      // Der zurückgegebene Text ist unvollständig — weder als voller Erfolg einfügen noch dem
+      // Treue-Detektor zur Prüfung vorlegen (der prüft eine vollständige Bearbeitung). Rohtext retten.
+      if (rewritten.abgeschnitten) {
+        return teilErfolg(rohtext, recording.durationSeconds, ABGESCHNITTEN_WARNUNG, 'abgeschnitten')
       }
+      // Etwaig zurückgespiegelte Markierungen entfernen, bevor cleanedTranscript trimmt.
+      const endtext = deps.quality.cleanedTranscript(entferneTranskriptMarken(rewritten.text))
+      // Treue-Detektor (v0.4.5, ADR-0018): hat das Modell das Diktat beantwortet statt es zu
+      // bearbeiten? Dann den (geglückten) Rohtext retten statt falschen Text einzufügen.
+      if (deps.treueDetektor?.wirktBeantwortet(rohtext, endtext)) {
+        return teilErfolg(rohtext, recording.durationSeconds, BEANTWORTET_WARNUNG, 'beantwortet')
+      }
+      // V5: Kennung des Prompt-Stands, der DIESEN Endtext erzeugt hat — NUR hier (Umschreib-Erfolg),
+      // reine Transkription (unten) bleibt ohne System-Prompt und damit ohne Kennung.
+      return abschluss(
+        rohtext,
+        endtext,
+        recording.durationSeconds,
+        rewritten.usage,
+        true,
+        promptKennungFuer(def, system)
+      )
+    }
+
+    // Gemerkter Rohtext für den catch: ist er gesetzt, gelang die Transkription und nur das Umschreiben
+    // scheiterte → Teil-Erfolg (Rohtext retten) statt Totalverlust.
+    let letzterRohtext: string | null = null
+    try {
+      const rohtext = await transkribiere()
+      if (rohtext === null) {
+        // Leere/artefaktige Transkription trotz verwertbarer Länge → Aufnahme-Fehler, kein sinnvoller
+        // Retry (dasselbe Audio liefert dasselbe Ergebnis) → Audio verwerfen.
+        letzteAufnahme = null
+        return transition({ status: 'fehler', art: 'aufnahme', message: NO_RECORDING_ERROR })
+      }
+      letzterRohtext = rohtext // Transkription gelang → bei späterem Umschreib-Fehler Teil-Erfolg
+
+      const def = input?.def
+      if (!def || !def.rewrites) {
+        return abschluss(rohtext, rohtext, recording.durationSeconds, undefined, false)
+      }
+
+      return await schreibeUm(rohtext, def)
+    } catch (err) {
+      // Manueller Abbruch: still nach idle (bereits durch abbrechen() gesetzt) — kein Fehler/Metrik.
+      // Bei Abbruch auch das gehaltene Audio verwerfen (der Nutzer will keinen Retry auf Verworfenes).
+      if (abgebrochen) {
+        letzteAufnahme = null
+        return phase
+      }
+      const istTimeoutFehler = istTimeout || (err instanceof Error && err.name === 'TimeoutError')
+      const art = klassifiziere(err, { istWatchdogTimeout: istTimeoutFehler })
+      const message = istTimeoutFehler
+        ? 'Zeitüberschreitung beim Anbieter.'
+        : err instanceof Error
+          ? err.message
+          : String(err)
+      // Teil-Erfolg: Transkription gelang, nur das Umschreiben scheiterte → Rohtext retten. Das Audio
+      // bleibt gehalten (W3-B): der Nutzer kann das Umschreiben erneut versuchen.
+      if (letzterRohtext !== null) {
+        return teilErfolg(letzterRohtext, recording.durationSeconds, message, 'umschreibfehler')
+      }
+      // Vollfehler: das Audio bleibt gehalten (W3-B) — ein transienter netzwerk/anbieter-Fehler lässt
+      // sich ab Transkription wiederholen. (Aufnahme-Fehler kommen hier nicht an, die sind oben schon
+      // terminal und verwerfen das Audio.)
+      return transition({ status: 'fehler', art, message })
+    } finally {
+      stoppeWatchdog()
     }
   }
 
@@ -286,7 +456,8 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     endtext: string,
     dauerSekunden: number,
     usage: RunMetrik['usage'],
-    umgeschrieben: boolean
+    umgeschrieben: boolean,
+    promptKennung?: string
   ): void {
     letzteMetrik = {
       workflowId: input?.def.id ?? '',
@@ -294,7 +465,8 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       rohtext,
       endtext,
       usage,
-      umgeschrieben
+      umgeschrieben,
+      promptKennung
     }
   }
 
@@ -303,10 +475,16 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     endtext: string,
     dauerSekunden: number,
     usage: RunMetrik['usage'],
-    umgeschrieben: boolean
+    umgeschrieben: boolean,
+    promptKennung?: string
   ): WorkflowPhase {
-    setzeMetrik(rohtext, endtext, dauerSekunden, usage, umgeschrieben)
-    return transition({ status: 'fertig', text: endtext })
+    // MAL-1 (W2-B): letzte Stelle vor Metrik/Phase — von hier geht `text` via Sitzung in
+    // Zwischenablage/Auto-Paste (einfügen/anzeigen). Steuerzeichen/Escape-Sequenzen raus.
+    const sauber = entferneSteuerzeichen(endtext)
+    // W3-B: erfolgreicher Lauf → das flüchtig gehaltene Audio verwerfen (kein Retry mehr nötig/Datenschutz).
+    letzteAufnahme = null
+    setzeMetrik(rohtext, sauber, dauerSekunden, usage, umgeschrieben, promptKennung)
+    return transition({ status: 'fertig', text: sauber })
   }
 
   // Teil-Erfolg (CONTEXT.md): die Transkription gelang, aber das Umschreiben scheiterte
@@ -319,8 +497,11 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     warnung: string,
     grund: TeilErfolgGrund
   ): WorkflowPhase {
-    setzeMetrik(rohtext, rohtext, dauerSekunden, undefined, false)
-    return transition({ status: 'teilErfolg', rohtext, warnung, grund })
+    // MAL-1 (W2-B): der Rohtext geht hier ebenfalls in die Zwischenablage (inZwischenablage) — derselbe
+    // Filter wie im Endtext-Pfad, sonst könnte ein Teil-Erfolg die Injektion durchlassen.
+    const sauber = entferneSteuerzeichen(rohtext)
+    setzeMetrik(sauber, sauber, dauerSekunden, undefined, false)
+    return transition({ status: 'teilErfolg', rohtext: sauber, warnung, grund })
   }
 
   function transition(next: WorkflowPhase): WorkflowPhase {

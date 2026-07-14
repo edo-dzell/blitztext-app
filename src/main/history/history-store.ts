@@ -18,6 +18,11 @@ export interface VerlaufEintrag {
   asrModell?: string
   chatModell?: string
   usage?: { promptTokens: number; completionTokens: number }
+  // V5: Kennung des Prompt-Stands, der den Endtext erzeugt hat (siehe `promptKennungFuer` in
+  // shared/workflows.ts). Optional + migrationssicher — ältere Einträge (vor V5) UND reine
+  // Transkription ohne Umschreibeschritt haben sie nicht; `ladeAlle` liest sie einfach als
+  // `undefined`, kein Schema-Bruch (JSON.parse liefert das fehlende Feld nicht mit).
+  promptKennung?: string
 }
 
 export interface VerlaufStore {

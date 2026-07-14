@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { fehlerMeldung, teilErfolgMeldung } from '@main/session/fehler-meldung'
+import { fehlerMeldung, teilErfolgMeldung, fokusDriftMeldung } from '@main/session/fehler-meldung'
 
 describe('fehlerMeldung', () => {
   it('konfiguration → Sprung in die Einstellungen, trägt die Ursache', () => {
@@ -37,5 +37,21 @@ describe('teilErfolgMeldung (v0.4.5)', () => {
     const m = teilErfolgMeldung('beantwortet')
     expect(m.koerper).toContain('Anweisung an die KI')
     expect(m.koerper).toContain('Zwischenablage')
+  })
+
+  it('abgeschnitten → benennt das Token-Limit, verweist auf die Zwischenablage', () => {
+    const m = teilErfolgMeldung('abgeschnitten')
+    expect(m.koerper).toContain('abgeschnitten')
+    expect(m.koerper).toContain('Zwischenablage')
+    expect(m.aktion).toBeUndefined()
+  })
+})
+
+describe('fokusDriftMeldung (W3-A, ADR-0011 Weg B)', () => {
+  it('nennt den Fokuswechsel und den Strg+V-Hinweis, keine Sprung-Aktion', () => {
+    const m = fokusDriftMeldung()
+    expect(m.titel).toContain('Fokus')
+    expect(m.koerper).toContain('Strg+V')
+    expect(m.aktion).toBeUndefined()
   })
 })

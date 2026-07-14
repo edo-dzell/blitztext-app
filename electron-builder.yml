@@ -13,10 +13,15 @@ files:
   # externalisiert sie statt sie zu bündeln.
   - node_modules/**
 
-# Native Module aus dem asar auspacken, sonst nicht ladbar. uiohook-napi ist N-API mit prebuilds
-# (node-gyp-build wählt zur Laufzeit prebuilds/win32-x64) → kein Rebuild nötig (s. npmRebuild:false).
+# Native Module aus dem asar auspacken, sonst nicht ladbar. uiohook-napi ist N-API mit prebuilds:
+# dist/index.js ruft `node-gyp-build(join(__dirname,'..'))`, das zur Laufzeit die passende
+# prebuilds/<platform>-<arch>/*.node dlopent (s. npmRebuild:false, keine from-source-Kompilierung).
+# Nur die .node-Binärdatei MUSS auf die echte Platte (dlopen kann nicht aus dem asar laden); JS wird
+# problemlos aus dem asar geladen. Das Build-Target ist ausschließlich win32-x64 → nur dessen Prebuild
+# entpacken (verifizierte Struktur: prebuilds/win32-x64/uiohook-napi.node). Spart die 6 fremden
+# Plattform-Prebuilds (darwin/linux/win32-arm64), die auf Windows-x64 nie geladen werden.
 asarUnpack:
-  - node_modules/uiohook-napi/**
+  - node_modules/uiohook-napi/prebuilds/win32-x64/**
 
 extraResources:
   - from: resources

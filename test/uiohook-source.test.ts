@@ -9,7 +9,7 @@ function fakeHook() {
   let stopped = 0
   const hook: UiohookQuelle = {
     on(event, listener) {
-      listeners[event].push(listener)
+      listeners[event]!.push(listener)
       return hook
     },
     start() {
@@ -31,7 +31,7 @@ function fakeHook() {
       shiftKey: mods.shiftKey ?? false,
       metaKey: mods.metaKey ?? false
     } as UiohookKeyboardEvent
-    for (const l of listeners[event]) l(e)
+    for (const l of listeners[event]!) l(e)
   }
   return { hook, feuere, get started() { return started }, get stopped() { return stopped } }
 }
@@ -80,5 +80,29 @@ describe('starteUiohookQuelle', () => {
     const stop = starteUiohookQuelle({ verarbeiteTaste: vi.fn(), hook: f.hook })
     stop()
     expect(f.stopped).toBe(1)
+  })
+
+  // W3-ε: onStatus macht den (sonst geschluckten) Start-Erfolg für den Health-Check sichtbar.
+  it('meldet onStatus(true) bei erfolgreichem Start', () => {
+    const f = fakeHook()
+    const onStatus = vi.fn()
+    starteUiohookQuelle({ verarbeiteTaste: vi.fn(), hook: f.hook, onStatus })
+    expect(onStatus).toHaveBeenCalledWith(true)
+  })
+
+  it('meldet onStatus(false), wenn hook.start() wirft (Fehler wird geschluckt, App-Start lebt)', () => {
+    const werfenderHook: UiohookQuelle = {
+      on() {
+        return werfenderHook
+      },
+      start() {
+        throw new Error('nativer Hook nicht ladbar')
+      },
+      stop() {}
+    }
+    const onStatus = vi.fn()
+    const stop = starteUiohookQuelle({ verarbeiteTaste: vi.fn(), hook: werfenderHook, onStatus })
+    expect(onStatus).toHaveBeenCalledWith(false)
+    expect(() => stop()).not.toThrow() // No-Op-Stopp-Thunk
   })
 })
