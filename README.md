@@ -39,11 +39,20 @@ aber als vollwertige Windows-App mit deutlich größerem Funktionsumfang (siehe
 
 ```mermaid
 flowchart LR
-    A(["🎙️ Hotkey halten<br/>und sprechen"]) --> B["Transkription:<br/>Cloud-Anbieter oder<br/>lokaler Endpunkt"]
-    B --> C{"Workflow"}
+    A(["🎙️ Hotkey halten<br/>& sprechen"]) --> B["📝 Transkription<br/>Cloud oder lokal"]
+    B --> C{"Workflow?"}
+    C -->|"umschreiben<br/>(Ton · Emojis)"| D["🤖 LLM"]
     C -->|nur transkribieren| E
-    C -->|"umschreiben<br/>(Ton- und Emoji-Stufe)"| D["LLM"]
-    D --> E(["📋 Text an der<br/>Cursor-Position einfügen"])
+    D --> E(["📋 Einfügen an der<br/>Cursor-Position"])
+
+    classDef bxStart fill:#4338ca,stroke:#312e81,color:#fff;
+    classDef bxStep fill:#eef2ff,stroke:#6366f1,color:#1e1b4b;
+    classDef bxChoice fill:#7c3aed,stroke:#5b21b6,color:#fff;
+    classDef bxDone fill:#f59e0b,stroke:#b45309,color:#1e1b4b;
+    class A bxStart;
+    class B,D bxStep;
+    class C bxChoice;
+    class E bxDone;
 ```
 
 Cloud-Aufrufe laufen ausschließlich über **deinen eigenen API-Key** direkt zum gewählten Anbieter —
