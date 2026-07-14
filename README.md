@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/hero.svg" alt="Blitztext für Windows" width="100%">
+<img src="assets/hero-v2.svg" alt="Blitztext für Windows" width="100%">
 
 **Hotkey halten → sprechen → der Text landet fertig formuliert an der Cursor-Position.**
 
