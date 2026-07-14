@@ -120,9 +120,17 @@ Fertige, portable Windows-`.exe` — kein Installer, kein Admin nötig:
 ## 🔏 Code-Signing & Datenschutz
 
 Die Releases sind aktuell **nicht code-signiert**. Windows zeigt beim ersten Start daher eine
-SmartScreen-Warnung („Unbekannter Herausgeber“); das ist zu erwarten und kein Fehler. Eine
-kostenlose Signierung für Open-Source-Projekte wird noch geprüft — bis dahin bleibt die Herkunft
-jedes Builds über die beiden folgenden Wege überprüfbar:
+SmartScreen-Warnung („Unbekannter Herausgeber“); das ist zu erwarten und kein Fehler.
+
+Für kostenlose Code-Signierung wurde ein Antrag bei der [SignPath
+Foundation](https://signpath.org/) gestellt (kostenlose Signierung für Open-Source-Projekte durch
+eine gemeinnützige Drittinstanz). Stand Juli 2026: **abgelehnt** — nicht wegen Qualitätsmängeln,
+sondern weil das Programm bestimmte externe Sichtbarkeits-Signale voraussetzt (u. a. GitHub-Stars/
+Forks, unabhängige Erwähnungen, eine gewisse Nutzerbasis), die dieses noch junge Projekt bisher
+nicht erfüllt. Eine erneute Bewerbung ist vorgesehen, sobald das Projekt gewachsen ist — ein ⭐ für
+dieses Repo hilft dabei.
+
+Bis dahin bleibt die Herkunft jedes Builds über die beiden folgenden Wege überprüfbar:
 
 - Jedes Release-Artefakt (portable `.exe`) wird von GitHub Actions auf GitHub-gehosteten Runnern
   aus diesem Repository gebaut ([release.yml](.github/workflows/release.yml)) — keine manuell
@@ -135,12 +143,17 @@ jedes Builds über die beiden folgenden Wege überprüfbar:
 ```powershell
 # Prüfsumme gegen die beigelegte SHA256SUMS.txt vergleichen (PowerShell)
 Get-FileHash .\Blitztext-<version>-win-portable.exe -Algorithm SHA256
+# alternativ mit Bordmitteln älterer Windows-Versionen:
+certutil -hashfile .\Blitztext-<version>-win-portable.exe SHA256
 ```
 
 ```bash
 # Build-Provenance prüfen (GitHub CLI): bestätigt, dass die .exe aus diesem Repo per CI gebaut wurde
 gh attestation verify Blitztext-<version>-win-portable.exe --repo edo-dzell/blitztext-app-windows
 ```
+
+Den berechneten Hash mit dem passenden Eintrag in der beigelegten `SHA256SUMS.txt` vergleichen —
+stimmen beide überein, ist die Datei unverändert.
 
 **Datenschutz:** Blitztext sammelt keine Nutzerdaten und sendet keine Telemetrie. Diktat-Audio
 geht ausschließlich an die vom Nutzer selbst konfigurierten Anbieter (eigener API-Key) oder an
@@ -221,10 +234,13 @@ native/      win-paste.exe-Quelle (mingw-w64 Cross-Build): Einfügen, Fokus-Prü
 <details>
 <summary><b>Windows SmartScreen zeigt „Unbekannter Herausgeber" — ist das gefährlich?</b></summary>
 
-Nein, das ist erwartbar: Die Releases sind (noch) nicht code-signiert (siehe
-[Code-Signing](#-code-signing--datenschutz)). Über „Weitere Informationen“ → „Trotzdem ausführen“
-lässt sich die `.exe` starten. Zur Verifikation liegt jedem Release `SHA256SUMS.txt` bei, und die
-Build-Provenance lässt sich per `gh attestation verify` gegen dieses Repository prüfen (siehe oben).
+Nein, das ist erwartbar: Die Releases sind (noch) nicht code-signiert — ein Antrag auf kostenlose
+Signierung bei der SignPath Foundation wurde gestellt und (Stand Juli 2026) mangels ausreichender
+externer Sichtbarkeit des Projekts abgelehnt, siehe [Code-Signing](#-code-signing--datenschutz).
+Über „Weitere Informationen“ → „Trotzdem ausführen“ lässt sich die `.exe` trotzdem starten. Zur
+Verifikation liegt jedem Release `SHA256SUMS.txt` bei (Prüfung z. B. mit `certutil -hashfile
+<datei> SHA256` oder PowerShells `Get-FileHash`), und die Build-Provenance lässt sich per
+`gh attestation verify` gegen dieses Repository prüfen (siehe oben).
 
 </details>
 
