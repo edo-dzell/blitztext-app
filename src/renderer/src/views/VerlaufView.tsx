@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { ArrowDownUp } from 'lucide-react'
 import type { BlitztextSettings } from '@main/settings/store'
 import type { VerlaufEintrag } from '@main/history/history-store'
 import { Card, CardContent } from '@/components/ui/card'
@@ -8,18 +9,21 @@ import ZweiEbenenShell from '@/components/ZweiEbenenShell'
 import { useBestaetigung } from '@/components/Bestaetigung'
 import { useHinweis } from '@/components/Hinweis'
 import { naechsteAuswahl } from '@/lib/verlauf-auswahl'
+import { istNeuesteZuerst, toggleSortierung } from '@/lib/verlauf-sortierung'
 import { laufKosten } from '@shared/pricing'
 
 interface Props {
   settings: BlitztextSettings
-  speichern: (next: BlitztextSettings) => Promise<void>
+  speichern: (next: BlitztextSettings, opts?: { still?: boolean }) => Promise<void>
 }
 
 // Verlauf in zwei Ebenen (VL-1): zweites Band mit verkürzten Einträgen → Detail mit vollem Inhalt.
 export default function VerlaufView({ settings, speichern }: Props) {
   const [eintraege, setEintraege] = useState<VerlaufEintrag[]>([])
   const [auswahl, setAuswahl] = useState<string | null>(null)
-  const [neuesteZuerst, setNeuesteZuerst] = useState(true)
+  // C2: Initial-State aus den persistierten Einstellungen; Umschalten aktualisiert lokal + speichert
+  // still (kein Toast bei jedem Klick).
+  const [neuesteZuerst, setNeuesteZuerst] = useState(() => istNeuesteZuerst(settings.verlaufSortierung))
   const gesperrt = settings.verlaufGesperrt
   const bestaetige = useBestaetigung()
   const zeige = useHinweis()
@@ -44,6 +48,12 @@ export default function VerlaufView({ settings, speichern }: Props) {
 
   async function umschalten(v: boolean) {
     await speichern({ ...settings, verlaufAktiv: v })
+  }
+
+  function sortierungUmschalten() {
+    const neu = toggleSortierung(settings.verlaufSortierung)
+    setNeuesteZuerst(istNeuesteZuerst(neu))
+    void speichern({ ...settings, verlaufSortierung: neu }, { still: true })
   }
 
   async function loeschen() {
@@ -121,13 +131,20 @@ export default function VerlaufView({ settings, speichern }: Props) {
             )}
           </div>
           {eintraege.length > 1 && (
-            <button
-              type="button"
-              className="self-start text-xs text-muted-foreground hover:text-foreground"
-              onClick={() => setNeuesteZuerst((v) => !v)}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-fit self-start px-2 text-xs text-muted-foreground"
+              onClick={sortierungUmschalten}
+              title={
+                neuesteZuerst
+                  ? 'Zu „Älteste zuerst" wechseln'
+                  : 'Zu „Neueste zuerst" wechseln'
+              }
             >
-              Sortierung: {neuesteZuerst ? 'Neueste zuerst ↓' : 'Älteste zuerst ↑'}
-            </button>
+              <ArrowDownUp className="size-3.5" />
+              {neuesteZuerst ? 'Neueste zuerst' : 'Älteste zuerst'}
+            </Button>
           )}
         </div>
       }

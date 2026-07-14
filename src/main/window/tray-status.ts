@@ -4,6 +4,15 @@
 import type { Tray } from 'electron'
 import type { WorkflowPhase } from '@main/workflow/runner'
 
+// A2/A4a: additive Suffixe (kombinierbar) — analog pill-status.ts. Tray-Tooltip ist der Nebenkanal
+// (Pille bleibt der Haupt-Indikator), aber die Typen/Formulierung bleiben synchron.
+function suffixe(phase: { istWiederholung?: boolean; dauertLaenger?: boolean }): string {
+  const teile: string[] = []
+  if (phase.istWiederholung) teile.push('erneuter Versuch')
+  if (phase.dauertLaenger) teile.push('dauert länger als üblich')
+  return teile.length > 0 ? ` (${teile.join(', ')})` : ''
+}
+
 /** Phase → Tooltip-Text. Rein, damit der Wortlaut ohne Electron testbar ist. */
 export function phaseTooltip(phase: WorkflowPhase): string {
   switch (phase.status) {
@@ -12,9 +21,9 @@ export function phaseTooltip(phase: WorkflowPhase): string {
     case 'aufnehmen':
       return 'Blitztext — Aufnahme …'
     case 'transkribieren':
-      return 'Blitztext — Transkribiere …'
+      return `Blitztext — Transkribiere …${suffixe(phase)}`
     case 'umschreiben':
-      return 'Blitztext — Schreibe um …'
+      return `Blitztext — Schreibe um …${suffixe(phase)}`
     case 'fertig':
       return 'Blitztext — Fertig'
     case 'teilErfolg':
@@ -35,6 +44,8 @@ export interface TrayMenuAktionen {
   abbrechen: () => void
   erneutVersuchen: () => void
   beenden: () => void
+  /** C5: öffnet die Release-Seite (nur relevant, wenn `updateVerfuegbar` gesetzt ist). */
+  oeffneUpdateSeite?: () => void
 }
 
 /** Live-Zustände, die den Aktiv-/Sichtbar-Zustand der Einträge bestimmen (pro Neuaufbau frisch gelesen). */
@@ -43,6 +54,11 @@ export interface TrayMenuZustand {
   beschaeftigt: boolean
   /** F1 (W3-B): true, wenn die letzte Aufnahme erneut verarbeitet werden kann → Retry-Eintrag aktiv. */
   kannErneutVersuchen: boolean
+  /**
+   * C5: gesetzt, sobald der Hintergrund-Check ein neueres Release gefunden hat — reine Daten (nicht
+   * schon formatiert), damit die Formatierung des Menütexts hier testbar bleibt (analog zum Bestand).
+   */
+  updateVerfuegbar?: { url: string; version: string } | null
 }
 
 /**
@@ -66,15 +82,28 @@ export function baueTrayMenuTemplate(
   zustand: TrayMenuZustand,
   aktionen: TrayMenuAktionen
 ): TrayMenuEintrag[] {
-  return [
+  const eintraege: TrayMenuEintrag[] = [
     { label: 'Einstellungen öffnen…', click: aktionen.einstellungenOeffnen },
     { label: 'Abbrechen', enabled: zustand.beschaeftigt, click: aktionen.abbrechen },
     {
       label: 'Letzte Aufnahme erneut verarbeiten',
       enabled: zustand.kannErneutVersuchen,
       click: aktionen.erneutVersuchen
-    },
-    { type: 'separator' },
-    { label: 'Beenden', click: aktionen.beenden }
+    }
   ]
+  // C5: dezenter, additiver Eintrag NUR wenn der Hintergrund-Check ein neueres Release gefunden hat.
+  if (zustand.updateVerfuegbar) {
+    const { version } = zustand.updateVerfuegbar
+    // Bugfix (W2-F1): `version` ist die REMOTE-Version (nicht mehr die lokale). Ist sie ausnahmsweise
+    // leer (kein `neueVersion` verfügbar, z. B. alter Cache-Eintrag), lieber ohne Versionsnummer
+    // anzeigen als eine falsche/irreführende — Fail-safe statt Falschanzeige.
+    const label = version ? `Update verfügbar – v${version} ansehen…` : 'Update verfügbar – ansehen…'
+    eintraege.push({ type: 'separator' })
+    eintraege.push({
+      label,
+      click: aktionen.oeffneUpdateSeite
+    })
+  }
+  eintraege.push({ type: 'separator' }, { label: 'Beenden', click: aktionen.beenden })
+  return eintraege
 }

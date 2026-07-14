@@ -50,6 +50,22 @@ export function apiKeyEntwurfGeaendert(keyInput: string): boolean {
 }
 
 /**
+ * C1: Die Preise-Pane (StatistikView) ist schmutzig, wenn die Modell-Overrides ODER ein gültig
+ * geänderter USD/EUR-Kurs vom gespeicherten Stand abweichen. Ein UNGÜLTIGER Kurs-Entwurf (z. B. NaN
+ * durch leeres/nicht-numerisches Feld) zählt bewusst NICHT als Änderung — sonst würde ein Tippfehler
+ * im Kursfeld den Speichern-Button aktivieren, obwohl gar nichts Gültiges zum Speichern vorliegt.
+ */
+export function preiseGeaendert(
+  overrides: unknown,
+  gespeicherteOverrides: unknown,
+  kursNum: number,
+  kursGueltig: boolean,
+  gespeicherterKurs: number
+): boolean {
+  return !tiefGleich(overrides, gespeicherteOverrides) || (kursGueltig && kursNum !== gespeicherterKurs)
+}
+
+/**
  * W1-E (P1-Datenverlust): Läuft eine Prompt-Assistent-Anfrage, ist der Workflow-Editor „dirty" —
  * die Antwort würde beim Remount (key={aktiv.id} in WorkflowsView) kommentarlos verloren gehen, weil
  * WorkflowEditor bei Auswahl-Wechsel neu erzeugt wird. Variante (a): Auswahl sperren statt (b) Antwort

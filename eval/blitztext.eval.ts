@@ -40,6 +40,10 @@ const rewrite = createCloudRewriteProvider({
  * per Definition ein nutzer-definierter, NICHT eingebauter Workflow) — dafür bauen wir eine minimale
  * statische Definition aus fall.customSystemPrompt, die genauso durch resolveSystemPrompt läuft wie
  * ein echter nutzer-definierter Workflow (builtin:false, promptModus:'statisch').
+ *
+ * v0.6.0: fall.tone wird, falls gesetzt, als def.tone durchgereicht — belegt, dass der neue
+ * statische Ton-Merge (nur bei explizit gesetztem def.tone, siehe prompt-builder.ts Bestandsschutz-
+ * Kommentar) die Treue-Invarianten nicht unterläuft. Optional, bricht nichts an bestehenden Fällen.
  */
 function workflowFuer(fall: EvalFall): WorkflowDefinition {
   if (fall.workflow === 'custom') {
@@ -55,7 +59,8 @@ function workflowFuer(fall: EvalFall): WorkflowDefinition {
       promptModus: 'statisch',
       systemPrompt: fall.customSystemPrompt,
       model: MODEL,
-      temperature: 0.3
+      temperature: 0.3,
+      ...(fall.tone ? { tone: fall.tone } : {})
     }
   }
   return getWorkflow(fall.workflow, BUILTIN_WORKFLOWS)

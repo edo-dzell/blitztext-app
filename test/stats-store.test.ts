@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { createStatsStore, type StatsFile } from '@main/stats/stats-store'
+import { createStatsStore, komprimiereAeltereAls, type StatsFile, type StatZeile } from '@main/stats/stats-store'
 
 function fakeFile(): StatsFile & { content: string | null } {
   const f = {
@@ -22,7 +22,7 @@ describe('createStatsStore', () => {
     const store = createStatsStore({ file: fakeFile() })
     await store.aufzeichnen({ workflowId: 'transcribe', audioSekunden: 10, asrModell: 'whisper-1' }, T)
     await store.aufzeichnen({ workflowId: 'transcribe', audioSekunden: 20, asrModell: 'whisper-1' }, T)
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(T)
     expect(s.zeilen).toHaveLength(1)
     expect(s.zeilen[0]!.anzahl).toBe(2)
     expect(s.zeilen[0]!.audioSekunden).toBe(30)
@@ -40,7 +40,7 @@ describe('createStatsStore', () => {
       },
       T
     )
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(T)
     expect(s.zeilen[0]!.promptTokens).toBe(1_000_000)
     expect(s.zeilen[0]!.completionTokens).toBe(250_000)
     expect(s.gesamtPromptTokens).toBe(1_000_000)
@@ -57,7 +57,7 @@ describe('createStatsStore', () => {
       { workflowId: 'calm', audioSekunden: 1, asrModell: 'whisper-1', chat: { model: 'gpt-4o', promptTokens: 200, completionTokens: 60 } },
       T
     )
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(T)
     expect(s.gesamtPromptTokens).toBe(300)
     expect(s.gesamtCompletionTokens).toBe(100)
   })
@@ -67,7 +67,7 @@ describe('createStatsStore', () => {
     const T2 = Date.UTC(2026, 5, 6, 9, 0, 0)
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 5, asrModell: 'whisper-1' }, T)
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 5, asrModell: 'whisper-1' }, T2)
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(T2)
     expect(s.zeilen.map((z) => z.datum).sort()).toEqual(['2026-06-05', '2026-06-06'])
   })
 
@@ -93,7 +93,7 @@ describe('createStatsStore', () => {
     const store = createStatsStore({ file: fakeFile() })
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 5, asrModell: 'whisper-1' }, T)
     await store.loeschen()
-    expect((await store.zusammenfassung()).zeilen).toEqual([])
+    expect((await store.zusammenfassung(T)).zeilen).toEqual([])
   })
 })
 
@@ -116,7 +116,7 @@ describe('createStatsStore — lokale Tagesgrenze', () => {
     const lokal0030 = Date.UTC(2026, 5, 4, 22, 30, 0)
     const store = createStatsStore({ file: fakeFile() })
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 5, asrModell: 'whisper-1' }, lokal0030)
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(lokal0030)
     expect(s.zeilen).toHaveLength(1)
     expect(s.zeilen[0]!.datum).toBe('2026-06-05')
   })
@@ -126,7 +126,7 @@ describe('createStatsStore — lokale Tagesgrenze', () => {
     const lokalMittag = Date.UTC(2026, 5, 5, 10, 0, 0)
     const store = createStatsStore({ file: fakeFile() })
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 5, asrModell: 'whisper-1' }, lokalMittag)
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(lokalMittag)
     expect(s.zeilen[0]!.datum).toBe('2026-06-05')
   })
 
@@ -135,7 +135,10 @@ describe('createStatsStore — lokale Tagesgrenze', () => {
     const jan = Date.UTC(2026, 0, 2, 0, 0, 0)
     const store = createStatsStore({ file: fakeFile() })
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 5, asrModell: 'whisper-1' }, jan)
-    const s = await store.zusammenfassung()
+    // jetztMs fix auf denselben Zeitpunkt: verhindert, dass die B1-Monats-Kompaktierung (90-Tage-
+    // Schwelle relativ zur echten Systemzeit) dieses Fixture nachträglich verändert — der Test prüft
+    // ausschließlich das Tages-Schlüsselformat direkt nach dem Aufzeichnen.
+    const s = await store.zusammenfassung(jan)
     expect(s.zeilen[0]!.datum).toMatch(/^\d{4}-\d{2}-\d{2}$/)
     expect(s.zeilen[0]!.datum).toBe('2026-01-02')
   })
@@ -150,7 +153,7 @@ describe('createStatsStore — lokale Tagesgrenze', () => {
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 1, asrModell: 'whisper-1' }, frueh)
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 1, asrModell: 'whisper-1' }, spaet)
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 1, asrModell: 'whisper-1' }, naechsterTag)
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(naechsterTag)
     expect(s.zeilen).toHaveLength(2)
     const nachDatum = Object.fromEntries(s.zeilen.map((z) => [z.datum, z.anzahl]))
     expect(nachDatum['2026-06-05']).toBe(2)
@@ -176,11 +179,233 @@ describe('createStatsStore — lokale Tagesgrenze', () => {
     // Neuer Lauf, lokal am 05.06., landet mit dem neuen (lokalen) Schlüssel.
     const lokal0030 = Date.UTC(2026, 5, 4, 22, 30, 0)
     await store.aufzeichnen({ workflowId: 't', audioSekunden: 3, asrModell: 'whisper-1' }, lokal0030)
-    const s = await store.zusammenfassung()
+    const s = await store.zusammenfassung(lokal0030)
     // Zwei getrennte Zeilen (Alt-Schlüssel wird NICHT rückwirkend migriert) — beide im gleichen Format,
     // beide lexikalisch sortierbar, Summen bleiben korrekt.
     expect(s.zeilen.map((z) => z.datum).sort()).toEqual(['2026-06-04', '2026-06-05'])
     expect(s.gesamtAnzahl).toBe(2)
     expect(s.gesamtAudioSekunden).toBe(8)
+  })
+})
+
+// B1: Monats-Kompaktierung — Zeilen älter als 90 Tage werden in `zusammenfassung()` auf Monatsebene
+// aggregiert (Speicherplatz/Übersicht), jüngere Zeilen bleiben auf Tagesebene unangetastet.
+describe('komprimiereAeltereAls (reine Funktion)', () => {
+  function zeile(teil: Partial<StatZeile> & Pick<StatZeile, 'datum'>): StatZeile {
+    return {
+      workflowId: 'transcribe',
+      anzahl: 1,
+      audioSekunden: 0,
+      asrModell: 'whisper-1',
+      chatModell: '',
+      promptTokens: 0,
+      completionTokens: 0,
+      ...teil
+    }
+  }
+
+  it('aggregiert mehrere Tage desselben Monats/Workflows/Modells zu einer Monatszeile', () => {
+    const zeilen: StatZeile[] = [
+      zeile({ datum: '2026-03-01', anzahl: 2, audioSekunden: 10, promptTokens: 100, completionTokens: 20 }),
+      zeile({ datum: '2026-03-15', anzahl: 3, audioSekunden: 15, promptTokens: 50, completionTokens: 10 }),
+      zeile({ datum: '2026-03-31', anzahl: 1, audioSekunden: 5, promptTokens: 25, completionTokens: 5 })
+    ]
+    const ergebnis = komprimiereAeltereAls(zeilen, '2026-06-01')
+    expect(ergebnis).toHaveLength(1)
+    expect(ergebnis[0]!.datum).toBe('2026-03')
+    expect(ergebnis[0]!.anzahl).toBe(6)
+    expect(ergebnis[0]!.audioSekunden).toBe(30)
+    expect(ergebnis[0]!.promptTokens).toBe(175)
+    expect(ergebnis[0]!.completionTokens).toBe(35)
+  })
+
+  it('hält verschiedene Workflows/Modelle im selben Monat getrennt', () => {
+    const zeilen: StatZeile[] = [
+      zeile({ datum: '2026-03-01', workflowId: 'transcribe', anzahl: 1 }),
+      zeile({ datum: '2026-03-02', workflowId: 'improve', chatModell: 'gpt-4o-mini', anzahl: 1 }),
+      zeile({ datum: '2026-03-03', workflowId: 'transcribe', asrModell: 'whisper-2', anzahl: 1 })
+    ]
+    const ergebnis = komprimiereAeltereAls(zeilen, '2026-06-01')
+    expect(ergebnis).toHaveLength(3)
+    expect(ergebnis.every((z) => z.datum === '2026-03')).toBe(true)
+  })
+
+  it('Grenzfall: Zeile GENAU an der Grenze bleibt eine Tageszeile (nicht kompaktiert)', () => {
+    const zeilen: StatZeile[] = [zeile({ datum: '2026-04-10', anzahl: 1 })]
+    const ergebnis = komprimiereAeltereAls(zeilen, '2026-04-10')
+    expect(ergebnis).toHaveLength(1)
+    expect(ergebnis[0]!.datum).toBe('2026-04-10')
+  })
+
+  it('Zeile einen Tag VOR der Grenze wird kompaktiert', () => {
+    const zeilen: StatZeile[] = [zeile({ datum: '2026-04-09', anzahl: 1 })]
+    const ergebnis = komprimiereAeltereAls(zeilen, '2026-04-10')
+    expect(ergebnis).toHaveLength(1)
+    expect(ergebnis[0]!.datum).toBe('2026-04')
+  })
+
+  it('ist idempotent: zweiter Lauf auf bereits kompaktierten Monatszeilen verändert nichts', () => {
+    const zeilen: StatZeile[] = [
+      zeile({ datum: '2026-03-01', anzahl: 2, audioSekunden: 10 }),
+      zeile({ datum: '2026-03-20', anzahl: 3, audioSekunden: 15 })
+    ]
+    const einmal = komprimiereAeltereAls(zeilen, '2026-06-01')
+    const zweimal = komprimiereAeltereAls(einmal, '2026-06-01')
+    expect(zweimal).toEqual(einmal)
+    expect(zweimal).toHaveLength(1)
+    expect(zweimal[0]!.anzahl).toBe(5)
+    expect(zweimal[0]!.audioSekunden).toBe(25)
+  })
+
+  it('führt bereits kompaktierte YYYY-MM-Zeilen mit gleichem Schlüssel weiter zusammen', () => {
+    // Simuliert zwei unabhängig kompaktierte Monatszeilen (z.B. aus zwei früheren Läufen), die beim
+    // erneuten Kompaktieren (Schlüssel: Monat+Workflow+Modelle) zusammengeführt werden müssen.
+    const zeilen: StatZeile[] = [
+      zeile({ datum: '2026-03', anzahl: 5, audioSekunden: 25, promptTokens: 10, completionTokens: 2 }),
+      zeile({ datum: '2026-03', anzahl: 1, audioSekunden: 3, promptTokens: 1, completionTokens: 1 })
+    ]
+    const ergebnis = komprimiereAeltereAls(zeilen, '2026-06-01')
+    expect(ergebnis).toHaveLength(1)
+    expect(ergebnis[0]!.datum).toBe('2026-03')
+    expect(ergebnis[0]!.anzahl).toBe(6)
+    expect(ergebnis[0]!.audioSekunden).toBe(28)
+    expect(ergebnis[0]!.promptTokens).toBe(11)
+    expect(ergebnis[0]!.completionTokens).toBe(3)
+  })
+
+  it('verarbeitet gemischte Formate (Tages- und Monatszeilen) korrekt nebeneinander', () => {
+    const zeilen: StatZeile[] = [
+      zeile({ datum: '2026-03-05', anzahl: 2 }), // alt, Tagesform → wird kompaktiert
+      zeile({ datum: '2026-02', anzahl: 4 }), // alt, bereits Monatsform → bleibt/verschmilzt
+      zeile({ datum: '2026-06-10', anzahl: 1 }) // jung → bleibt Tageszeile
+    ]
+    const ergebnis = komprimiereAeltereAls(zeilen, '2026-06-01')
+    const nachDatum = Object.fromEntries(ergebnis.map((z) => [z.datum, z.anzahl]))
+    expect(nachDatum['2026-03']).toBe(2)
+    expect(nachDatum['2026-02']).toBe(4)
+    expect(nachDatum['2026-06-10']).toBe(1)
+    expect(ergebnis).toHaveLength(3)
+  })
+
+  it('Gesamt-Invariante: Summe aller Felder vor Kompaktierung == Summe nach Kompaktierung', () => {
+    const zeilen: StatZeile[] = [
+      zeile({ datum: '2026-01-01', anzahl: 2, audioSekunden: 11, promptTokens: 7, completionTokens: 3 }),
+      zeile({ datum: '2026-01-15', workflowId: 'improve', chatModell: 'gpt-4o', anzahl: 5, audioSekunden: 20, promptTokens: 40, completionTokens: 8 }),
+      zeile({ datum: '2026-02-28', anzahl: 1, audioSekunden: 1, promptTokens: 1, completionTokens: 1 }),
+      zeile({ datum: '2026-06-10', anzahl: 3, audioSekunden: 9, promptTokens: 6, completionTokens: 2 }) // jung, bleibt Tageszeile
+    ]
+    const summe = (liste: StatZeile[], feld: keyof Pick<StatZeile, 'anzahl' | 'audioSekunden' | 'promptTokens' | 'completionTokens'>) =>
+      liste.reduce((acc, z) => acc + z[feld], 0)
+
+    const ergebnis = komprimiereAeltereAls(zeilen, '2026-06-01')
+
+    expect(summe(ergebnis, 'anzahl')).toBe(summe(zeilen, 'anzahl'))
+    expect(summe(ergebnis, 'audioSekunden')).toBe(summe(zeilen, 'audioSekunden'))
+    expect(summe(ergebnis, 'promptTokens')).toBe(summe(zeilen, 'promptTokens'))
+    expect(summe(ergebnis, 'completionTokens')).toBe(summe(zeilen, 'completionTokens'))
+  })
+})
+
+describe('createStatsStore.zusammenfassung — Monats-Kompaktierung (B1)', () => {
+  const jetzt2026_06_15 = Date.UTC(2026, 5, 15, 12, 0, 0) // 2026-06-15 12:00 UTC
+
+  it('kompaktiert Zeilen älter als 90 Tage und schreibt das Ergebnis zurück', async () => {
+    const file = fakeFile()
+    file.content = JSON.stringify([
+      { datum: '2026-01-01', workflowId: 't', anzahl: 1, audioSekunden: 5, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 },
+      { datum: '2026-01-20', workflowId: 't', anzahl: 2, audioSekunden: 3, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 },
+      { datum: '2026-06-14', workflowId: 't', anzahl: 1, audioSekunden: 9, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 }
+    ] satisfies StatZeile[])
+    const store = createStatsStore({ file })
+
+    const s = await store.zusammenfassung(jetzt2026_06_15)
+
+    const nachDatum = Object.fromEntries(s.zeilen.map((z) => [z.datum, z.anzahl]))
+    expect(nachDatum['2026-01']).toBe(3)
+    expect(nachDatum['2026-06-14']).toBe(1)
+    expect(s.gesamtAnzahl).toBe(4)
+    expect(s.gesamtAudioSekunden).toBe(17)
+
+    // Zurückgeschrieben: die Datei enthält jetzt die kompaktierte Form.
+    const persistiert = JSON.parse(file.content!) as StatZeile[]
+    expect(persistiert.map((z) => z.datum).sort()).toEqual(['2026-01', '2026-06-14'])
+  })
+
+  it('ist idempotent: zweiter Aufruf verändert die Datei nicht mehr (kein unnötiger Write)', async () => {
+    const file = fakeFile()
+    file.content = JSON.stringify([
+      { datum: '2026-01-01', workflowId: 't', anzahl: 1, audioSekunden: 5, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 }
+    ] satisfies StatZeile[])
+    const store = createStatsStore({ file })
+
+    await store.zusammenfassung(jetzt2026_06_15)
+    const inhaltNachErstemLauf = file.content
+
+    let schreibAufrufe = 0
+    const urspruenglichesWrite = file.write.bind(file)
+    file.write = async (next: string) => {
+      schreibAufrufe += 1
+      await urspruenglichesWrite(next)
+    }
+
+    const s2 = await store.zusammenfassung(jetzt2026_06_15)
+
+    expect(schreibAufrufe).toBe(0)
+    expect(file.content).toBe(inhaltNachErstemLauf)
+    expect(s2.zeilen).toHaveLength(1)
+    expect(s2.zeilen[0]!.datum).toBe('2026-01')
+    expect(s2.gesamtAnzahl).toBe(1)
+  })
+
+  it('nimmt KEINEN Write vor, wenn nichts zu kompaktieren ist (nur junge Zeilen)', async () => {
+    const file = fakeFile()
+    file.content = JSON.stringify([
+      { datum: '2026-06-10', workflowId: 't', anzahl: 1, audioSekunden: 5, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 }
+    ] satisfies StatZeile[])
+    const store = createStatsStore({ file })
+
+    let schreibAufrufe = 0
+    const urspruenglichesWrite = file.write.bind(file)
+    file.write = async (next: string) => {
+      schreibAufrufe += 1
+      await urspruenglichesWrite(next)
+    }
+
+    const s = await store.zusammenfassung(jetzt2026_06_15)
+
+    expect(schreibAufrufe).toBe(0)
+    expect(s.zeilen).toHaveLength(1)
+    expect(s.zeilen[0]!.datum).toBe('2026-06-10')
+  })
+
+  it('leere Statistik bleibt leer, kein Write', async () => {
+    const file = fakeFile()
+    const store = createStatsStore({ file })
+
+    let schreibAufrufe = 0
+    const urspruenglichesWrite = file.write.bind(file)
+    file.write = async (next: string) => {
+      schreibAufrufe += 1
+      await urspruenglichesWrite(next)
+    }
+
+    const s = await store.zusammenfassung(jetzt2026_06_15)
+
+    expect(schreibAufrufe).toBe(0)
+    expect(s.zeilen).toEqual([])
+    expect(s.gesamtAnzahl).toBe(0)
+  })
+
+  it('ohne übergebenes jetztMs funktioniert zusammenfassung() weiterhin (Default = aktuelle Zeit)', async () => {
+    const file = fakeFile()
+    file.content = JSON.stringify([
+      { datum: '2026-06-10', workflowId: 't', anzahl: 1, audioSekunden: 5, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 }
+    ] satisfies StatZeile[])
+    const store = createStatsStore({ file })
+
+    const s = await store.zusammenfassung()
+
+    expect(s.zeilen).toHaveLength(1)
+    expect(s.gesamtAnzahl).toBe(1)
   })
 })

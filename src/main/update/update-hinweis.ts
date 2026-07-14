@@ -17,6 +17,14 @@ export interface UpdateErgebnis {
   neuVerfuegbar: boolean
   /** Release-Seite zum Anzeigen/Verlinken; leer, wenn kein neueres Release bekannt ist. */
   url: string
+  /**
+   * Die REMOTE-Version (aus dem GitHub-Tag geparst, führendes „v" entfernt) — NUR gesetzt, wenn
+   * `neuVerfuegbar: true`. Fehlt hier bewusst bei „kein Update"/Fehlerfällen (kein Cache-Rauschen).
+   * Bugfix (W2-F1): Tray/UI zeigten vorher `aktuelleVersion` (die LOKALE Version) unter dem Label
+   * „Update verfügbar – vX" an — irreführend, weil X = die bereits installierte Version war, nicht
+   * die neue. `neueVersion` ist additiv; alte Konsumenten, die das Feld ignorieren, sind unberührt.
+   */
+  neueVersion?: string
 }
 
 /** Minimaler HTTP-Port — kapselt `fetch`, damit Tests nie echt ins Netz gehen. */
@@ -128,7 +136,10 @@ export async function pruefeAufUpdate(deps: {
     const ergebnis: UpdateErgebnis = {
       aktuelleVersion: deps.lokaleVersion,
       neuVerfuegbar,
-      url: neuVerfuegbar ? url : ''
+      url: neuVerfuegbar ? url : '',
+      // Führendes „v"/"V" abstreifen (GitHub-Tag-Konvention, siehe parseVersion) — die Anzeige soll
+      // „v0.6.0" zeigen (Label baut das „v" selbst davor), nicht „vv0.6.0" oder uneinheitlich.
+      neueVersion: neuVerfuegbar ? remoteVersion.trim().replace(/^[vV]/, '') : undefined
     }
 
     const etag = antwort.headers.get('etag') ?? undefined

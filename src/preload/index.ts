@@ -6,6 +6,7 @@ import type { StatsSummary } from '@main/stats/stats-store'
 import type { AutostartStatus } from '@main/autostart'
 import type { UpdateErgebnis } from '@main/update/update-hinweis'
 import type { DiagnoseErgebnis } from '@main/health'
+import type { WorkflowPhase } from '@main/workflow/runner'
 
 const api = {
   /** Health-Check der IPC-Bridge zwischen Renderer und Main-Prozess. */
@@ -24,7 +25,12 @@ const api = {
   /** Einstellungen (ohne Secrets) lesen/speichern (V2). */
   settings: {
     get: (): Promise<BlitztextSettings> => ipcRenderer.invoke('settings:get'),
-    save: (next: BlitztextSettings): Promise<void> => ipcRenderer.invoke('settings:save', next)
+    // C4/A4b: Rückgabewert zeigt an, ob die Einstellungen SOFORT übernommen wurden (true/undefined,
+    // Altverhalten) oder — weil gerade eine Aufnahme läuft — erst NACH deren Ende (false). Der
+    // Main-Handler liefert `false` in dieser Welle über einen parallelen Agenten; bis dahin ist der
+    // Rückgabewert zur Laufzeit `undefined` → Aufrufer MÜSSEN strikt auf `=== false` prüfen, nicht auf
+    // Falsy, sonst würde `undefined` fälschlich als „verschoben" gewertet.
+    save: (next: BlitztextSettings): Promise<boolean> => ipcRenderer.invoke('settings:save', next)
   },
   /** Prompt-Assistent: erzeugt einen System-Prompt-Entwurf (V2). */
   workflow: {
@@ -73,6 +79,15 @@ const api = {
   health: {
     diagnose: (mikrofonAnzahl: number): Promise<DiagnoseErgebnis> =>
       ipcRenderer.invoke('health:diagnose', mikrofonAnzahl)
+  },
+  /** C4: Live-Workflow-Phase fürs Settings-Fenster (Status-Indikator im Header). Gleiches
+   *  Abmelde-Muster wie history.onChanged (Listener-Referenz HIER erfasst). */
+  workflowStatus: {
+    onChanged: (cb: (phase: WorkflowPhase) => void): (() => void) => {
+      const listener = (_e: unknown, phase: WorkflowPhase): void => cb(phase)
+      ipcRenderer.on('workflow:status', listener)
+      return () => ipcRenderer.removeListener('workflow:status', listener)
+    }
   }
 }
 

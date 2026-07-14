@@ -4,7 +4,8 @@ import {
   workflowEntwurfGeaendert,
   einstellungenGeaendert,
   apiKeyEntwurfGeaendert,
-  assistentSperrtAuswahl
+  assistentSperrtAuswahl,
+  preiseGeaendert
 } from '@renderer/lib/dirty'
 import { defaultSettings } from '@main/settings/store'
 import { BUILTIN_WORKFLOWS } from '@shared/workflows'
@@ -72,5 +73,26 @@ describe('assistentSperrtAuswahl (W1-E — laufende Assistent-Anfrage sperrt Wor
   })
   it('true während eine Anfrage läuft', () => {
     expect(assistentSperrtAuswahl(true)).toBe(true)
+  })
+})
+
+describe('preiseGeaendert (C1 — Preise-Pane in StatistikView)', () => {
+  const overrides = { 'gpt-4o-mini': { input: 0.15, output: 0.6 } }
+
+  it('false bei unveränderten Overrides und unverändertem Kurs', () => {
+    expect(preiseGeaendert(overrides, overrides, 0.92, true, 0.92)).toBe(false)
+  })
+
+  it('true bei geänderten Overrides', () => {
+    const geaendert = { 'gpt-4o-mini': { input: 0.2, output: 0.6 } }
+    expect(preiseGeaendert(geaendert, overrides, 0.92, true, 0.92)).toBe(true)
+  })
+
+  it('true bei gültigem, geändertem Kurs', () => {
+    expect(preiseGeaendert(overrides, overrides, 1.05, true, 0.92)).toBe(true)
+  })
+
+  it('false bei UNGÜLTIGEM Kurs, selbst wenn die Zahl abweicht (z. B. NaN durch leeres Feld)', () => {
+    expect(preiseGeaendert(overrides, overrides, NaN, false, 0.92)).toBe(false)
   })
 })

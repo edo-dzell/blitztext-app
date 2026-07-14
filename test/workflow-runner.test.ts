@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest'
-import { createWorkflowRunner, entferneSteuerzeichen, type WorkflowRunnerDeps } from '@main/workflow/runner'
+import {
+  createWorkflowRunner,
+  entferneSteuerzeichen,
+  type WorkflowRunnerDeps,
+  type WorkflowPhase
+} from '@main/workflow/runner'
 import * as quality from '@main/transcription/quality'
 import { resolveSystemPrompt, buildSystemPrompt, kapsleTranskript } from '@main/rewrite/prompt-builder'
 import { getWorkflow, BUILTIN_WORKFLOWS, promptKennungFuer } from '@shared/workflows'
@@ -331,7 +336,7 @@ describe('createWorkflowRunner', () => {
     runner.start({ def: def('transcribe'), chatModell: 'm' })
     const stopP = runner.stop()
     await new Promise((r) => setTimeout(r, 0))
-    expect(runner.phase).toEqual({ status: 'transkribieren' })
+    expect(runner.phase).toEqual({ status: 'transkribieren', istWiederholung: false })
 
     runner.abbrechen()
     const terminal = await stopP
@@ -951,5 +956,171 @@ describe('createWorkflowRunner', () => {
     const terminal = await runner.erneutVersuchen()
     expect(terminal).toEqual({ status: 'idle' })
     expect(runner.kannErneutVersuchen()).toBe(false)
+  })
+
+  // --- A4a: istWiederholung-Flag (additiv) — Retry sichtbar in Pille/Tray ---
+
+  it('erneutVersuchen() liefert Phasen mit istWiederholung: true während Transkription/Umschreiben', async () => {
+    const rec = zaehlenderRecorder()
+    const phasen: WorkflowPhase[] = []
+    let versuch = 0
+    const runner = createWorkflowRunner(
+      makeDeps({
+        recorder: rec,
+        transcription: {
+          async transcribe() {
+            versuch++
+            if (versuch === 1) throw new Error('OpenAI-Fehler: 500')
+            return 'mein rohtext'
+          }
+        },
+        rewrite: { async rewrite() { return { text: 'umgeschrieben' } } },
+        sleep: async () => {}
+      })
+    )
+    runner.start({ def: def('improve'), chatModell: 'gpt-4o-mini' })
+    const ersterTerminal = await runner.stop()
+    expect(ersterTerminal).toMatchObject({ status: 'fehler', art: 'anbieter' })
+
+    runner.onPhase = (p) => phasen.push(p)
+    const zweiterTerminal = await runner.erneutVersuchen()
+
+    expect(zweiterTerminal).toEqual({ status: 'fertig', text: 'umgeschrieben' })
+    expect(phasen).toContainEqual({ status: 'transkribieren', istWiederholung: true })
+    expect(phasen).toContainEqual({ status: 'umschreiben', istWiederholung: true })
+  })
+
+  it('ein frischer stop()-Lauf liefert istWiederholung: undefined/false (kein falsches Retry-Label)', async () => {
+    const phasen: WorkflowPhase[] = []
+    const runner = createWorkflowRunner(makeDeps())
+    runner.onPhase = (p) => phasen.push(p)
+
+    runner.start({ def: def('improve'), chatModell: 'gpt-4o-mini' })
+    await runner.stop()
+
+    const transkribierenPhase = phasen.find((p) => p.status === 'transkribieren')
+    const umschreibenPhase = phasen.find((p) => p.status === 'umschreiben')
+    expect(transkribierenPhase).toMatchObject({ istWiederholung: false })
+    expect(umschreibenPhase).toMatchObject({ istWiederholung: false })
+  })
+
+  // --- A2: „Dauert länger …"-Zwischenmeldung (additiver Timer, Generation-Guard) ---
+
+  it('feuert nach Ablauf des Zwischen-Timers eine zweite onPhase-Emission mit dauertLaenger: true, solange die Phase noch aktiv ist', async () => {
+    let fireZwischenmeldung: () => void = () => {}
+    let zwischenmeldungGestartet = 0
+    const phasen: WorkflowPhase[] = []
+    // Transkription hängt, bis wir sie manuell auflösen — hält die Phase 'transkribieren' aktiv, damit
+    // der Zwischen-Timer feuern kann, während sie noch läuft.
+    let loeseTranskription: (v: string) => void = () => {}
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: {
+          async transcribe() {
+            return await new Promise<string>((resolve) => {
+              loeseTranskription = resolve
+            })
+          }
+        },
+        starteZwischenmeldungsTimer: (onTimeout) => {
+          zwischenmeldungGestartet++
+          fireZwischenmeldung = onTimeout
+          return () => {}
+        }
+      })
+    )
+    runner.onPhase = (p) => phasen.push(p)
+
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const stopP = runner.stop()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(zwischenmeldungGestartet).toBe(1)
+
+    fireZwischenmeldung()
+    expect(phasen).toContainEqual({
+      status: 'transkribieren',
+      istWiederholung: false,
+      dauertLaenger: true
+    })
+
+    // Lauf sauber beenden (kein hängendes Promise).
+    loeseTranskription('hallo')
+    await stopP
+  })
+
+  it('Guard: feuert NICHT, wenn die Phase inzwischen gewechselt hat (Timer aus einer verlassenen Phase)', async () => {
+    let fireZwischenmeldung: () => void = () => {}
+    const phasen: WorkflowPhase[] = []
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: { async transcribe() { return 'hallo' } },
+        starteZwischenmeldungsTimer: (onTimeout) => {
+          fireZwischenmeldung = onTimeout
+          return () => {}
+        }
+      })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    await runner.stop() // Lauf ist bereits terminal ('fertig'), bevor der Timer feuert.
+    runner.onPhase = (p) => phasen.push(p)
+
+    // Der beim Start der (längst verlassenen) Phase gemerkte Callback feuert jetzt verspätet.
+    fireZwischenmeldung()
+
+    expect(phasen).toEqual([]) // keine Wirkung mehr — Generation-Guard hat gegriffen.
+    expect(runner.phase).toEqual({ status: 'fertig', text: 'hallo' })
+  })
+
+  it('Timer wird beim Phasenwechsel/Abbruch gestoppt (kein Leak)', async () => {
+    let gestoppt = 0
+    let gestartet = 0
+    const runner = createWorkflowRunner(
+      makeDeps({
+        starteZwischenmeldungsTimer: () => {
+          gestartet++
+          return () => {
+            gestoppt++
+          }
+        }
+      })
+    )
+
+    runner.start({ def: def('improve'), chatModell: 'gpt-4o-mini' })
+    await runner.stop()
+
+    // Zwei Phasen durchlaufen (transkribieren, umschreiben) → je ein Timer gestartet UND gestoppt.
+    expect(gestartet).toBe(2)
+    expect(gestoppt).toBe(2)
+  })
+
+  it('Timer wird auch bei Abbruch während der Transkription gestoppt', async () => {
+    let gestoppt = 0
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: haengendeTranskription(),
+        starteZwischenmeldungsTimer: () => () => {
+          gestoppt++
+        }
+      })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const stopP = runner.stop()
+    await new Promise((r) => setTimeout(r, 0))
+
+    runner.abbrechen()
+    await stopP
+
+    expect(gestoppt).toBe(1)
+  })
+
+  it('pill-/tray-Label bleiben unbeeinflusst vom Zwischenmeldungs-Timer, solange er nicht feuert', async () => {
+    const runner = createWorkflowRunner(
+      makeDeps({ starteZwischenmeldungsTimer: () => () => {} })
+    )
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    await runner.stop()
+    expect(runner.phase).toEqual({ status: 'fertig', text: 'roh' })
   })
 })

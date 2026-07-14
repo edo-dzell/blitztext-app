@@ -39,8 +39,10 @@ export interface Ausgabe {
   /**
    * Vordergrundfenster-Handle beim Auslösen der Aufnahme erfassen (Weg B, W3-A), nativ via
    * win-paste.exe --hwnd. null = konnte nicht erfasst werden (Fallback aufs bisherige Einfügen).
+   * A1 (v0.6.0): asynchron (spawn statt spawnSync) — bereits vor dem ersten await gestartet, der
+   * eigentliche Prozess läuft im Hintergrund. Aufrufer müssen die W2-A-Generation danach erneut prüfen.
    */
-  erfasseFenster(): number | null
+  erfasseFenster(): Promise<number | null>
 }
 
 /** Abschluss-Daten eines fertigen Laufs für Verlauf + Statistik (Strang D). */
@@ -115,8 +117,8 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
     kontext: { label: string; asrModell: string; chatModell: string } | null
     fokusKontext: EinfügeKontext | null
   } | null = null
-  // W2-A: Generationszähler gegen zwei Start-Races. starteWorkflow hat vor runner.start() zwei awaits
-  // (load, apiKeys.has); die Reservierung `aktiveQuelle` allein reicht nicht:
+  // W2-A: Generationszähler gegen zwei Start-Races. starteWorkflow hat vor runner.start() DREI awaits
+  // (load, apiKeys.has, A1: erfasseFenster); die Reservierung `aktiveQuelle` allein reicht nicht:
   //  (1) Doppel-Start: die Reservierung erfolgt jetzt SOFORT beim Eintritt (vor dem ersten await),
   //      sodass ein zweiter, quasi-gleichzeitiger Aufruf am Guard scheitert.
   //  (2) Verlorener Abbruch: brichAb() während der Awaits setzte nur aktiveQuelle=null (der Runner ist
@@ -187,10 +189,13 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       }
       // Weg B (W3-A): NUR bei Hotkey (das Ergebnis wird eingefügt) das aktuelle Vordergrundfenster
       // erfassen — das ist das Paste-Ziel. Bei manueller Quelle wird angezeigt, nicht getippt → egal.
+      // A1 (v0.6.0): erfasseFenster() ist jetzt async (spawn statt spawnSync) → dritter Await-Punkt.
+      const erfasstesHwnd = quelle === 'hotkey' ? await deps.ausgabe.erfasseFenster() : null
+      // (2) Abbruch während des erfasseFenster-Awaits: wie beim load-/has-Await sauber aussteigen, ohne
+      // runner.start() — sonst liefe ein bereits abgebrochener Lauf trotzdem los (verlorener Abbruch).
+      if (veraltet()) return
       aktiverFokusKontext =
-        quelle === 'hotkey'
-          ? { fokusRueckkehr: settings.fokusRueckkehr, erfasstesHwnd: deps.ausgabe.erfasseFenster() }
-          : null
+        quelle === 'hotkey' ? { fokusRueckkehr: settings.fokusRueckkehr, erfasstesHwnd } : null
       deps.runner.start({
         def,
         chatModell: lauf.chatModell,

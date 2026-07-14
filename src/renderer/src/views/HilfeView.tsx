@@ -30,7 +30,7 @@ const INHALTE: Record<string, Inhalt> = {
     titel: 'Workflows',
     absaetze: [
       'Ein Workflow bestimmt, was nach dem Diktat passiert: reine Transkription oder zusätzliches Umschreiben per KI (z. B. sauber formulieren, Emojis ergänzen, ruhiger formulieren).',
-      'Eingebaute Workflows lassen sich anpassen (Modell, Temperatur, Ton, Emoji, Prompt) und jederzeit über „Auf Auslieferung zurücksetzen" auf den Werkszustand bringen. Eigene Workflows kannst du anlegen und löschen.'
+      'Eingebaute Workflows lassen sich anpassen (Modell, Temperatur, Ton, Emoji, Prompt) und jederzeit über „Auf Auslieferung zurücksetzen" auf den Werkszustand bringen. Ton und Emoji wirken auch bei eigenen/statischen Prompts, sobald sie dort explizit gesetzt sind. Eigene Workflows kannst du anlegen und löschen.'
     ],
     punkte: [
       'Jeder Workflow hat einen globalen Hotkey.',

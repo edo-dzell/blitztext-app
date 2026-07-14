@@ -6,8 +6,11 @@ import {
   laufKosten,
   EUR_PRO_USD,
   aufgelosteTabelle,
-  zeileKostenUsd
+  zeileKostenUsd,
+  PREISE,
+  preiseAusProvidernAbleiten
 } from '@shared/pricing'
+import { PROVIDER } from '@shared/providers'
 
 describe('pricing', () => {
   it('whisper-1: 0,006 USD pro Minute', () => {
@@ -143,5 +146,49 @@ describe('pricing', () => {
     )
     expect(k.usd).toBeCloseTo(0.012, 6)
     expect(k.eur).toBeCloseTo(0.012 * 0.9, 6)
+  })
+
+  // --- D3: PREISE wird aus der Provider-Registry abgeleitet (Drift-Schutz providers↔pricing) ---
+
+  it('PREISE enthält exakt die bisherigen Schlüssel + Werte (Drift-Schutz-Beweis: hartkodierte Alt-Literale)', () => {
+    // Diese Erwartungstabelle sind bewusst die alten, wörtlich kopierten PREISE-Literale von vor D3.
+    // Bricht dieser Test, hat sich ein Preis in providers.ts verändert (gewollt oder als Drift).
+    expect(PREISE).toEqual({
+      'whisper-1': { asrProMinuteUsd: 0.006 },
+      'gpt-4o-transcribe': { asrProMinuteUsd: 0.006 },
+      'gpt-4o-mini-transcribe': { asrProMinuteUsd: 0.003 },
+      'gpt-4o-mini': { inputPro1MUsd: 0.15, outputPro1MUsd: 0.6 },
+      'gpt-4o': { inputPro1MUsd: 2.5, outputPro1MUsd: 10.0 },
+      'whisper-large-v3-turbo': { asrProMinuteUsd: 0.04 / 60 },
+      'whisper-large-v3': { asrProMinuteUsd: 0.111 / 60 },
+      'llama-3.1-8b-instant': { inputPro1MUsd: 0.05, outputPro1MUsd: 0.08 },
+      'llama-3.3-70b-versatile': { inputPro1MUsd: 0.59, outputPro1MUsd: 0.79 },
+      'voxtral-mini-latest': { asrProMinuteUsd: 0.003 },
+      'mistral-small-latest': { inputPro1MUsd: 0.15, outputPro1MUsd: 0.6 },
+      'mistral-large-latest': { inputPro1MUsd: 0.5, outputPro1MUsd: 1.5 }
+    })
+  })
+
+  it('preiseAusProvidernAbleiten() liefert dieselbe Tabelle wie die exportierte PREISE-Konstante', () => {
+    expect(preiseAusProvidernAbleiten()).toEqual(PREISE)
+  })
+
+  it('jedes Modell in PROVIDER mit preis-Feld landet in PREISE', () => {
+    for (const provider of PROVIDER) {
+      for (const modell of [...provider.asrModelle, ...provider.chatModelle]) {
+        if (modell.preis) {
+          expect(PREISE[modell.id]).toEqual(modell.preis)
+        }
+      }
+    }
+  })
+
+  it('PREISE enthält keine Einträge ohne zugehöriges Registry-Modell', () => {
+    const registryIds = new Set(
+      PROVIDER.flatMap((p) => [...p.asrModelle, ...p.chatModelle]).map((m) => m.id)
+    )
+    for (const id of Object.keys(PREISE)) {
+      expect(registryIds.has(id)).toBe(true)
+    }
   })
 })

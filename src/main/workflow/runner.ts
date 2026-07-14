@@ -61,6 +61,13 @@ export interface WorkflowRunnerDeps {
    * hält evtl. minutenlang gedrückt). Ohne Angabe: AUFNAHME_WATCHDOG_MS via setTimeout. Im Test injizierbar.
    */
   starteAufnahmeWatchdog?: (onTimeout: () => void) => () => void
+  /**
+   * A2: additiver „Dauert länger …"-Timer für die Phasen `transkribieren`/`umschreiben`. Rein kosmetisch
+   * — feuert `onTimeout`, wenn die aktuelle Phase ungewöhnlich lange läuft, damit der Runner eine zweite
+   * `onPhase`-Emission mit `dauertLaenger: true` senden kann. Stört NICHT den 90s-Anbieter-Watchdog oder
+   * `mitRetry`. Ohne Angabe: DAUERT_LAENGER_MS via setTimeout. Im Test injizierbar.
+   */
+  starteZwischenmeldungsTimer?: (onTimeout: () => void) => () => void
   /** Backoff-Verzögerung zwischen netzwerk-Retries; injizierbar für Tests (Default echte Verzögerung). */
   sleep?: (ms: number) => Promise<void>
 }
@@ -110,8 +117,14 @@ export type TeilErfolgGrund = 'umschreibfehler' | 'beantwortet' | 'abgeschnitten
 export type WorkflowPhase =
   | { status: 'idle' }
   | { status: 'aufnehmen' }
-  | { status: 'transkribieren' }
-  | { status: 'umschreiben' }
+  // A4a: `istWiederholung` markiert additiv einen Lauf, der über erneutVersuchen() (W3-B, gehaltenes
+  // Audio) erneut ab Transkription gestartet wurde — Pille/Tray können das sichtbar machen. KEIN neuer
+  // Status (bricht keine bestehenden switch-Exhaustiveness-Checks), nur ein optionales Zusatzfeld.
+  // A2: `dauertLaenger` markiert additiv, dass dieselbe Phase ungewöhnlich lange läuft (Zwischenmeldung
+  // nach DAUERT_LAENGER_MS) — ebenfalls KEIN neuer Status, nur ein zweiter transition()-Aufruf mit
+  // geändertem Flag.
+  | { status: 'transkribieren'; istWiederholung?: boolean; dauertLaenger?: boolean }
+  | { status: 'umschreiben'; istWiederholung?: boolean; dauertLaenger?: boolean }
   | { status: 'fertig'; text: string }
   | { status: 'teilErfolg'; rohtext: string; warnung: string; grund: TeilErfolgGrund }
   | { status: 'fehler'; art: FehlerArt; message: string }
@@ -146,6 +159,10 @@ const NO_RECORDING_ERROR = 'Keine Aufnahme erkannt.'
 const AUFNAHME_WATCHDOG_MS = 10 * 60_000
 // Nutzergerichtete Meldung, wenn die Aufnahme-Phase in den Watchdog läuft (toter Renderer o. Ä.).
 const AUFNAHME_TIMEOUT_ERROR = 'Zeitüberschreitung bei der Aufnahme.'
+// A2: additiver „Dauert länger …"-Timer (20-30s) für transkribieren/umschreiben — komplett eigener
+// Mechanismus, NICHT mit dem 90s-Anbieter-Watchdog (starteWatchdog) zu verwechseln. Rein kosmetisch:
+// feuert nur eine zweite onPhase-Emission mit dauertLaenger:true, keine Wirkung auf den Kontrollfluss.
+const DAUERT_LAENGER_MS = 25_000
 // Interner Grund-Vermerk für den Treue-Abbruch (die nutzergerichtete Meldung baut die Sitzung aus `grund`).
 const BEANTWORTET_WARNUNG = 'Endtext wirkt wie eine Antwort auf das Diktat, nicht wie dessen Bearbeitung.'
 // Interner Grund-Vermerk, wenn der Anbieter am Token-Limit abgeschnitten hat (finish_reason='length').
@@ -190,6 +207,10 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   // ein erneuter Versuch sinnvoll ist (transienter Fehler / Teil-Erfolg). Bei 'fertig' oder Aufnahme-
   // Fehler (nichts Brauchbares) wird es verworfen. NIE auf Disk, NIE in den Verlauf (Datenschutz).
   let letzteAufnahme: RecordingResult | null = null
+  // A2: Generation-Zähler gegen Fehlfeuern des Zwischenmeldungs-Timers in eine längst verlassene Phase
+  // (analog sitzung.ts `laufGeneration`). Zentral in transition() erhöht — dort laufen ALLE Statuswechsel
+  // durch, das ist der einzige Ort, an dem der Guard zuverlässig ist.
+  let zwischenmeldungGeneration = 0
 
   const starteWatchdog =
     deps.starteWatchdog ??
@@ -202,6 +223,13 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     deps.starteAufnahmeWatchdog ??
     ((onTimeout: () => void) => {
       const t = setTimeout(onTimeout, AUFNAHME_WATCHDOG_MS)
+      return () => clearTimeout(t)
+    })
+
+  const starteZwischenmeldungsTimer =
+    deps.starteZwischenmeldungsTimer ??
+    ((onTimeout: () => void) => {
+      const t = setTimeout(onTimeout, DAUERT_LAENGER_MS)
       return () => clearTimeout(t)
     })
 
@@ -300,6 +328,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       // W3-B: Audio ab hier flüchtig halten (verwertbare Aufnahme). Ein späterer transienter Fehler /
       // Teil-Erfolg lässt einen Retry ab Transkription zu; ein 'fertig' verwirft es wieder (abschluss()).
       letzteAufnahme = recording
+      // stop() ist immer ein FRISCHER Lauf — istWiederholung bleibt hier default false.
       return verarbeiteAufnahme(recording)
     },
     kannErneutVersuchen() {
@@ -310,14 +339,21 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       if (letzteAufnahme === null) return phase
       // Frisches Diktat entfällt — direkt ab Transkription mit dem gehaltenen Audio.
       abgebrochen = false
-      return verarbeiteAufnahme(letzteAufnahme)
+      // A4a: dies IST der Wiederholungs-Pfad — Pille/Tray sollen das während Transkription/Umschreiben
+      // sichtbar machen. Reine Anzeige: Protokoll/Verlauf/Metrik bleiben unverändert (kein Nicht-Ziel-Bruch).
+      return verarbeiteAufnahme(letzteAufnahme, true)
     }
   }
 
   // Transkription → (Umschreiben) → Abschluss/Teil-Erfolg/Fehler. Wird von stop() (frisches Audio) und
   // von erneutVersuchen() (gehaltenes Audio, W3-B) geteilt. Setzt einen frischen AbortController +
   // Anbieter-Watchdog pro Durchlauf, damit auch ein Retry sauber abbrechbar/watchdog-gesichert ist.
-  async function verarbeiteAufnahme(recording: RecordingResult): Promise<WorkflowPhase> {
+  // `istWiederholung` (A4a, additiv): true nur, wenn dieser Durchlauf über erneutVersuchen() kam — geht
+  // NUR in die Phasen-Anzeige (transition), NICHT in Metrik/Verlauf/Protokoll.
+  async function verarbeiteAufnahme(
+    recording: RecordingResult,
+    istWiederholung = false
+  ): Promise<WorkflowPhase> {
     abgebrochen = false
     controller = new AbortController()
     let istTimeout = false
@@ -342,64 +378,79 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     // Reine Gliederung von verarbeiteAufnahme; Logik/Reihenfolge/Fehlerpfade unverändert. Nutzt die
     // Closure-Werte (signal/retryOpts/input) direkt; wirft weiter an die try/catch-Orchestrierung.
     async function transkribiere(): Promise<string | null> {
-      transition({ status: 'transkribieren' })
-      // Eigennamen nur bei ausreichend langer Aufnahme mitschicken (≥ 0,9 s), wie im Original.
-      const vocabularyHints = recording.durationSeconds >= 0.9 ? input?.customTerms ?? [] : []
-      const raw = await mitRetry(
-        () =>
-          deps.transcription.transcribe(recording.audio, {
-            language: input?.language,
-            vocabularyHints,
-            signal
-          }),
-        retryOpts
-      )
-      return deps.quality.rohtextAus(raw, recording.durationSeconds)
+      transition({ status: 'transkribieren', istWiederholung })
+      // A2: additiver Zwischenmeldungs-Timer — MUSS gestoppt werden, sobald die Phase verlassen wird
+      // (Erfolg, Fehler, Abbruch), sonst Leak/Fehlfeuern in eine andere Phase (finally deckt alle Pfade ab).
+      const stoppeZwischenmeldung = starteZwischenmeldung('transkribieren', istWiederholung)
+      try {
+        // Eigennamen nur bei ausreichend langer Aufnahme mitschicken (≥ 0,9 s), wie im Original.
+        const vocabularyHints = recording.durationSeconds >= 0.9 ? input?.customTerms ?? [] : []
+        const raw = await mitRetry(
+          () =>
+            deps.transcription.transcribe(recording.audio, {
+              language: input?.language,
+              vocabularyHints,
+              signal
+            }),
+          retryOpts
+        )
+        return deps.quality.rohtextAus(raw, recording.durationSeconds)
+      } finally {
+        stoppeZwischenmeldung()
+      }
     }
 
     // --- Umschreib-Phase: Rohtext → Endtext-Terminal-Phase (fertig / teilErfolg). ---
     // Reine Gliederung; Prompt-Auflösung, Token-Limit-, Treue- und Kennungs-Logik unverändert.
     async function schreibeUm(rohtext: string, def: WorkflowDefinition): Promise<WorkflowPhase> {
-      transition({ status: 'umschreiben' })
-      const system = deps.resolveSystemPrompt(def, input?.rewriteSettings)
-      // 0.3.1-Blocker-Fix: das bereits AUFGELÖSTE chatModell (aus aufloeseWorkflowLauf →
-      // aufgeloestesChatModell, inkl. Fremd-Modell-Fallback) ist die alleinige Wahrheitsquelle.
-      // NICHT mehr def.model bevorzugen — sonst ginge ein gepinntes OpenAI-Modell (Built-ins) gegen
-      // Mistral/Groq und stürzte ab. Der def.model-Vorrang steckt bereits korrekt in chatModell.
-      const model = input?.chatModell ?? ''
-      // Rohtext gekapselt senden (Daten-Rahmen, prompt-builder): zieht die Grenze „zu bearbeitende
-      // Daten" vs. „Anweisung", damit ein direkt ansprechendes Diktat nicht als Befehl befolgt wird.
-      const rewritten = await mitRetry(
-        () =>
-          deps.rewrite.rewrite(
-            { system, user: kapsleTranskript(rohtext) },
-            { model, temperature: def.temperature, signal }
-          ),
-        retryOpts
-      )
-      // Token-Limit (W1-D): der Anbieter hat die Antwort bei finish_reason='length' abgeschnitten.
-      // Der zurückgegebene Text ist unvollständig — weder als voller Erfolg einfügen noch dem
-      // Treue-Detektor zur Prüfung vorlegen (der prüft eine vollständige Bearbeitung). Rohtext retten.
-      if (rewritten.abgeschnitten) {
-        return teilErfolg(rohtext, recording.durationSeconds, ABGESCHNITTEN_WARNUNG, 'abgeschnitten')
+      transition({ status: 'umschreiben', istWiederholung })
+      // A2: additiver Zwischenmeldungs-Timer — MUSS gestoppt werden, sobald die Phase verlassen wird
+      // (Erfolg, Teil-Erfolg, Fehler, Abbruch), sonst Leak/Fehlfeuern in eine andere Phase (finally
+      // deckt alle Rückgabepfade dieser Funktion ab).
+      const stoppeZwischenmeldung = starteZwischenmeldung('umschreiben', istWiederholung)
+      try {
+        const system = deps.resolveSystemPrompt(def, input?.rewriteSettings)
+        // 0.3.1-Blocker-Fix: das bereits AUFGELÖSTE chatModell (aus aufloeseWorkflowLauf →
+        // aufgeloestesChatModell, inkl. Fremd-Modell-Fallback) ist die alleinige Wahrheitsquelle.
+        // NICHT mehr def.model bevorzugen — sonst ginge ein gepinntes OpenAI-Modell (Built-ins) gegen
+        // Mistral/Groq und stürzte ab. Der def.model-Vorrang steckt bereits korrekt in chatModell.
+        const model = input?.chatModell ?? ''
+        // Rohtext gekapselt senden (Daten-Rahmen, prompt-builder): zieht die Grenze „zu bearbeitende
+        // Daten" vs. „Anweisung", damit ein direkt ansprechendes Diktat nicht als Befehl befolgt wird.
+        const rewritten = await mitRetry(
+          () =>
+            deps.rewrite.rewrite(
+              { system, user: kapsleTranskript(rohtext) },
+              { model, temperature: def.temperature, signal }
+            ),
+          retryOpts
+        )
+        // Token-Limit (W1-D): der Anbieter hat die Antwort bei finish_reason='length' abgeschnitten.
+        // Der zurückgegebene Text ist unvollständig — weder als voller Erfolg einfügen noch dem
+        // Treue-Detektor zur Prüfung vorlegen (der prüft eine vollständige Bearbeitung). Rohtext retten.
+        if (rewritten.abgeschnitten) {
+          return teilErfolg(rohtext, recording.durationSeconds, ABGESCHNITTEN_WARNUNG, 'abgeschnitten')
+        }
+        // Etwaig zurückgespiegelte Markierungen entfernen, bevor cleanedTranscript trimmt.
+        const endtext = deps.quality.cleanedTranscript(entferneTranskriptMarken(rewritten.text))
+        // Treue-Detektor (v0.4.5, ADR-0018): hat das Modell das Diktat beantwortet statt es zu
+        // bearbeiten? Dann den (geglückten) Rohtext retten statt falschen Text einzufügen.
+        if (deps.treueDetektor?.wirktBeantwortet(rohtext, endtext)) {
+          return teilErfolg(rohtext, recording.durationSeconds, BEANTWORTET_WARNUNG, 'beantwortet')
+        }
+        // V5: Kennung des Prompt-Stands, der DIESEN Endtext erzeugt hat — NUR hier (Umschreib-Erfolg),
+        // reine Transkription (unten) bleibt ohne System-Prompt und damit ohne Kennung.
+        return abschluss(
+          rohtext,
+          endtext,
+          recording.durationSeconds,
+          rewritten.usage,
+          true,
+          promptKennungFuer(def, system)
+        )
+      } finally {
+        stoppeZwischenmeldung()
       }
-      // Etwaig zurückgespiegelte Markierungen entfernen, bevor cleanedTranscript trimmt.
-      const endtext = deps.quality.cleanedTranscript(entferneTranskriptMarken(rewritten.text))
-      // Treue-Detektor (v0.4.5, ADR-0018): hat das Modell das Diktat beantwortet statt es zu
-      // bearbeiten? Dann den (geglückten) Rohtext retten statt falschen Text einzufügen.
-      if (deps.treueDetektor?.wirktBeantwortet(rohtext, endtext)) {
-        return teilErfolg(rohtext, recording.durationSeconds, BEANTWORTET_WARNUNG, 'beantwortet')
-      }
-      // V5: Kennung des Prompt-Stands, der DIESEN Endtext erzeugt hat — NUR hier (Umschreib-Erfolg),
-      // reine Transkription (unten) bleibt ohne System-Prompt und damit ohne Kennung.
-      return abschluss(
-        rohtext,
-        endtext,
-        recording.durationSeconds,
-        rewritten.usage,
-        true,
-        promptKennungFuer(def, system)
-      )
     }
 
     // Gemerkter Rohtext für den catch: ist er gesetzt, gelang die Transkription und nur das Umschreiben
@@ -505,9 +556,29 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   }
 
   function transition(next: WorkflowPhase): WorkflowPhase {
+    // A2: JEDER Statuswechsel invalidiert eine zuvor gestartete Zwischenmeldung — zentral hier erhöht,
+    // damit der Guard im Timer-Callback (starteZwischenmeldung) wirksam ist, egal wie viele andere
+    // transition()-Aufrufe dazwischen liefen.
+    zwischenmeldungGeneration++
     phase = next
     runner.onPhase?.(next)
     return next
+  }
+
+  // A2: startet den additiven „Dauert länger …"-Timer für eine der beiden Anbieter-Phasen. Feuert NUR,
+  // wenn die beim Start gemerkte Generation noch aktuell ist (die Phase also nicht längst verlassen
+  // wurde) — sonst reines No-Op. Gibt den Stop-Thunk zurück (IMMER aufrufen, sobald die Phase verlassen
+  // wird: Erfolg, Fehler, Abbruch, Übergang in die nächste Phase — sonst Leak/Fehlfeuern).
+  // `istWiederholung` wird durchgereicht (A4a-Feld bleibt beim Zwischenmeldungs-transition erhalten).
+  function starteZwischenmeldung(
+    status: 'transkribieren' | 'umschreiben',
+    istWiederholung: boolean
+  ): () => void {
+    const meineGeneration = zwischenmeldungGeneration
+    return starteZwischenmeldungsTimer(() => {
+      if (zwischenmeldungGeneration !== meineGeneration) return // Phase längst gewechselt — No-Op
+      transition({ status, dauertLaenger: true, istWiederholung })
+    })
   }
 
   return runner

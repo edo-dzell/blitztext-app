@@ -1,39 +1,17 @@
 {
   "name": "blitztext-app",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Windows-Neuschrieb der Blitztext Speech-to-Text App (Electron + React + TypeScript)",
   "private": true,
   "author": "edo-dzell",
   "license": "MIT",
-  "homepage": "https://github.com/edo-dzell/blitztext-app-windows#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/edo-dzell/blitztext-app-windows.git"
-  },
-  "bugs": {
-    "url": "https://github.com/edo-dzell/blitztext-app-windows/issues"
-  },
-  "keywords": [
-    "speech-to-text",
-    "dictation",
-    "electron",
-    "windows",
-    "whisper",
-    "hotkey",
-    "transcription",
-    "tray-app",
-    "openai",
-    "groq",
-    "mistral",
-    "local-asr"
-  ],
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "start": "electron-vite preview",
     "build": "electron-vite build",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint \"src/renderer/**/*.{ts,tsx}\"",
+    "lint": "eslint \"src/main/**/*.ts\" \"src/shared/**/*.ts\" \"src/renderer/**/*.{ts,tsx}\"",
     "test": "vitest run",
     "test:watch": "vitest",
     "deadcode": "ts-prune | grep -v '(used in module)' || true",

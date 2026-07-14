@@ -14,7 +14,14 @@ import { entscheideFokusRueckkehr } from '@main/output/fokus-rueckkehr'
 
 export interface Zwischenablage {
   lies(): string
-  schreib(text: string): void
+  /**
+   * F2 (Review R2, v0.6.0): Promise statt fire-and-forget-`void`. Die A1-Umstellung von
+   * `schreibUeberHelfer` (spawnSync → spawn+Promise) machte das Schreiben async, ohne dass der
+   * Aufrufer hier je darauf gewartet hätte — bei langsamem `--set-clip` (z.B. AV-Scan) lief die
+   * Drift-Prüfung/Paste-Strategie bereits auf der ALTEN Zwischenablage. Der Service muss den
+   * Abschluss (Erfolg ODER Fallback) abwarten, BEVOR er die Drift-Prüfung/Strategien startet.
+   */
+  schreib(text: string): Promise<void>
 }
 
 export interface EinfügeStrategie {
@@ -59,7 +66,10 @@ export function createPasteService(deps: PasteServiceDeps): PasteService {
   return {
     async einfügen(text, kontext) {
       const vorher = deps.zwischenablage.lies()
-      deps.zwischenablage.schreib(text)
+      // F2: erst wenn das Schreiben abgeschlossen ist (Erfolg ODER Fallback), weiter zur
+      // Drift-Prüfung/den Strategien — sonst könnten set-clip und paste als unabhängige Prozesse
+      // rennen (siehe Zwischenablage.schreib-Doku oben).
+      await deps.zwischenablage.schreib(text)
 
       // Weg B (ADR-0011): nur prüfen, wenn Kontext + Provider vorhanden sind. entscheideFokusRueckkehr
       // liefert restauriere=true NUR bei echtem Drift (Feature an, erfasstesHwnd gesetzt, aktuelles
@@ -89,7 +99,11 @@ export function createPasteService(deps: PasteServiceDeps): PasteService {
           // Inhalts-Guard: nur zurücksetzen, wenn die Zwischenablage noch unseren Text trägt —
           // sonst hätte der Nutzer zwischenzeitlich etwas kopiert (vgl. macOS Marker-Check).
           const wiederherstellen = (): void => {
-            if (deps.zwischenablage.lies() === text) deps.zwischenablage.schreib(vorher)
+            // Bewusst fire-and-forget (void): wiederherstellen() selbst ist synchron `void` (vom
+            // Adapter per `setTimeout` aufgerufen, niemand wartet danach auf einen weiteren Schritt) —
+            // anders als beim Schreiben VOR dem Paste gibt es hier keine nachfolgende Aktion, die auf
+            // den Abschluss angewiesen wäre.
+            if (deps.zwischenablage.lies() === text) void deps.zwischenablage.schreib(vorher)
           }
           return { erfolg: true, strategie: strategie.name, wiederherstellen }
         }

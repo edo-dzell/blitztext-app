@@ -51,7 +51,7 @@ describe('createMainComposition', () => {
         zeigeEinstellungen: vi.fn(),
         melde: vi.fn(),
         inZwischenablage: vi.fn(),
-        erfasseFenster: vi.fn(() => null)
+        erfasseFenster: vi.fn(async () => null)
       },
       apiKeys: { has: async () => false, get: async () => null, set: async () => {}, clear: async () => {}, maske: async () => null },
       settingsFile: { read: async () => null, write: async () => {} },
@@ -97,7 +97,7 @@ describe('createMainComposition', () => {
         zeigeEinstellungen: vi.fn(),
         melde: vi.fn(),
         inZwischenablage: vi.fn(),
-        erfasseFenster: vi.fn(() => null)
+        erfasseFenster: vi.fn(async () => null)
       },
       apiKeys: { has: async () => true, get: async () => 'sk', set: async () => {}, clear: async () => {}, maske: async () => null },
       settingsFile: { read: async () => null, write: async () => {} },
@@ -146,7 +146,7 @@ describe('createMainComposition', () => {
         zeigeEinstellungen: vi.fn(),
         melde: vi.fn(),
         inZwischenablage: vi.fn(),
-        erfasseFenster: vi.fn(() => null)
+        erfasseFenster: vi.fn(async () => null)
       },
       apiKeys: { has: async () => true, get: async () => 'sk', set: async () => {}, clear: async () => {}, maske: async () => null },
       settingsFile: { read: async () => null, write: async () => {} },

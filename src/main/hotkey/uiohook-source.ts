@@ -8,6 +8,7 @@
 import { uIOhook, type UiohookKeyboardEvent } from 'uiohook-napi'
 import { keycodeZuName } from '@main/hotkey/uiohook-keymap'
 import type { KeyEvent } from '@main/hotkey/matcher'
+import { NOOP_PERF, type PerfInstrumentierung } from '@main/diagnostics/perf-instrumentierung'
 
 /** Minimaler Hook-Vertrag (Teil von uIOhook) → injizierbar für Tests ohne nativen Hook. */
 export interface UiohookQuelle {
@@ -26,12 +27,20 @@ export interface UiohookQuelleDeps {
    * „Hotkey-Erkennung" sichtbar, OHNE die Start-Logik umzubauen (rein additiv).
    */
   onStatus?(aktiv: boolean): void
+  /**
+   * R5 (Perf, opt-in): Latenz-Zeitstempel keydown → Dispatch-Ende. Default `NOOP_PERF` (de facto
+   * Null-Overhead — ein no-op-Funktionsaufruf pro Event, keine Allokation/kein Timer). Nur bei
+   * `BLITZTEXT_PERF=1` verdrahtet die Composition eine echte `createPerfInstrumentierung()`.
+   */
+  perf?: PerfInstrumentierung
 }
 
 /** Startet den Hook und gibt einen Stopp-Thunk zurück (für app.will-quit). */
 export function starteUiohookQuelle(deps: UiohookQuelleDeps): () => void {
   const hook = deps.hook ?? uIOhook
+  const perf = deps.perf ?? NOOP_PERF
   const handler = (type: 'down' | 'up') => (e: UiohookKeyboardEvent): void => {
+    const marker = perf.erfasseStart()
     const key = keycodeZuName(e.keycode)
     // Modifier-Maske mitgeben: libuiohook resynct sie nach UIPI-Blockaden (erhöhte Fenster,
     // Secure Desktop) aus GetAsyncKeyState — der Matcher räumt damit verlorene Keyups auf.
@@ -42,6 +51,7 @@ export function starteUiohookQuelle(deps: UiohookQuelleDeps): () => void {
         modifiers: { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey }
       })
     }
+    perf.erfasseEnde(marker)
   }
   hook.on('keydown', handler('down'))
   hook.on('keyup', handler('up'))

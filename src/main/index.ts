@@ -8,7 +8,8 @@ import {
   Notification,
   screen,
   nativeTheme,
-  powerMonitor
+  powerMonitor,
+  shell
 } from 'electron'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
@@ -30,6 +31,7 @@ import {
 } from '@main/secrets/ciphertext-file'
 import { createStatsFile } from '@main/stats/stats-file'
 import { starteUiohookQuelle } from '@main/hotkey/uiohook-source'
+import { createPerfInstrumentierung, NOOP_PERF } from '@main/diagnostics/perf-instrumentierung'
 import { createDefaultAutostart } from '@main/autostart'
 import { createUpdateHoler } from '@main/update/update-holer'
 import { createUpdateCacheFile } from '@main/update/update-cache-file'
@@ -76,6 +78,21 @@ let pillWindow: BrowserWindow | null = null
 let pillFehlerTimer: ReturnType<typeof setTimeout> | null = null
 let stopUiohook: () => void = () => {}
 let isQuitting = false
+
+// C5: Zustand des Update-Hintergrund-Checks (Start-Check ~1min, danach ~6h-Intervall). Der bestehende
+// 24h-Mindestabstand + ETag-Cache in pruefeAufUpdate() bleibt die Spam-Bremse — der Timer hier fragt
+// nur regelmäßig „darf/soll jetzt geprüft werden", die Kernlogik entscheidet den Rest (inkl. Opt-in,
+// live aus den Settings gelesen). null = kein neueres Release bekannt (oder Opt-in aus).
+let updateVerfuegbar: { url: string; version: string } | null = null
+let updateStartTimer: ReturnType<typeof setTimeout> | null = null
+let updateIntervallTimer: ReturnType<typeof setInterval> | null = null
+
+// R5 (Perf-Diagnose, opt-in, .scratch/PERF-MESSANLEITUNG-R5.md): NUR bei gesetztem env-Flag eine
+// echte Ringpuffer-Instrumentierung anlegen — sonst NOOP_PERF (kein Ringpuffer, kein Timer, keine
+// Allokation außer dem einen no-op-Objekt-Literal). Der Hot-Path in uiohook-source.ts bleibt im
+// Aus-Zustand bei zwei no-op-Funktionsaufrufen pro Event (vernachlässigbar ggü. dem Hook selbst).
+const perf =
+  process.env['BLITZTEXT_PERF'] === '1' ? createPerfInstrumentierung() : NOOP_PERF
 
 // Dunkle Taskleiste → helles Icon, helle Taskleiste → dunkles Icon (Windows kennt keine Template-
 // Images; shouldUseDarkColors ist die beste verfügbare Näherung, ADR-Recherche §5).
@@ -168,8 +185,11 @@ function createRecorderWindow(): BrowserWindow {
 // schwarzem Kasten: app.disableHardwareAcceleration() — HITL-Entscheidung).
 function createPillWindow(): BrowserWindow {
   const window = new BrowserWindow({
-    width: 260,
-    height: 56,
+    // A3: moderat vergrößert (statt 260×56), damit CSS-Umbruch (pill.html) lange Fehlertexte/Labels
+    // (z. B. Anbieter-Fehlermeldungen) nicht abschneidet. Fixe Größe bleibt bewusst (kein dynamisches
+    // setBounds pro Nachricht — Resize-Flackern, siehe Design-Doc A3).
+    width: 320,
+    height: 88,
     show: false,
     frame: false,
     transparent: true,
@@ -219,11 +239,22 @@ function baueTrayMenu(comp: MainComposition): void {
   tray.setContextMenu(
     Menu.buildFromTemplate(
       baueTrayMenuTemplate(
-        { beschaeftigt: comp.beschaeftigt(), kannErneutVersuchen: comp.kannErneutVersuchen() },
+        {
+          beschaeftigt: comp.beschaeftigt(),
+          kannErneutVersuchen: comp.kannErneutVersuchen(),
+          updateVerfuegbar
+        },
         {
           einstellungenOeffnen: showSettings,
           abbrechen: () => comp.brichAb(),
           erneutVersuchen: () => comp.erneutVersuchen(),
+          // C5: folgt dem einzigen bisherigen URL-Öffnen-Muster im Projekt — es gibt noch keins in
+          // src/main (grep bestätigt), daher hier neu mit shell.openExternal (Standard-Electron-Weg für
+          // externe Links, kein interner Navigations-/URL-Guard nötig, da die URL aus der GitHub-
+          // Releases-API des eigenen Forks stammt, nicht aus Nutzereingabe).
+          oeffneUpdateSeite: () => {
+            if (updateVerfuegbar) void shell.openExternal(updateVerfuegbar.url)
+          },
           beenden: () => {
             isQuitting = true
             app.quit()
@@ -232,6 +263,23 @@ function baueTrayMenu(comp: MainComposition): void {
       )
     )
   )
+}
+
+// C5: ein Check-Durchlauf — fragt comp.pruefeUpdate() (respektiert live Opt-in + 24h-Cache intern),
+// hält das Ergebnis im Modul-State vor und zieht das Tray-Menü nach. Schaltet der Nutzer das Opt-in
+// währenddessen aus, liefert pruefeUpdate() automatisch wieder neuVerfuegbar:false → updateVerfuegbar
+// wird beim NÄCHSTEN Tick korrekt auf null zurückgesetzt (kein Sonderfall nötig).
+async function fuehreUpdateCheckAus(comp: MainComposition): Promise<void> {
+  const ergebnis = await comp.pruefeUpdate()
+  // Bugfix (W2-F1): vorher stand hier `ergebnis.aktuelleVersion` — das ist die LOKALE (bereits
+  // installierte) Version, nicht die neue. Zeigte irreführend „Update verfügbar – v<installierte
+  // Version>" an. `neueVersion` trägt die tatsächliche Remote-Version (nur gesetzt bei
+  // neuVerfuegbar); fehlt sie ausnahmsweise (z. B. alter Cache-Eintrag ohne das Feld), lieber KEINE
+  // Versionsnummer zeigen als eine falsche → Fallback ohne Nummer, siehe baueTrayMenuTemplate.
+  updateVerfuegbar = ergebnis.neuVerfuegbar
+    ? { url: ergebnis.url, version: ergebnis.neueVersion ?? '' }
+    : null
+  baueTrayMenu(comp)
 }
 
 // Optionale Windows-Toast-Aktion (F1): ein beschrifteter Button in der Notification (nicht nur der
@@ -317,7 +365,9 @@ function registerIpc(apiKeys: ApiKeyVault, comp: MainComposition): void {
     const aktuell = await comp.einstellungen.load()
     const zusammengefuehrt = { ...next, apiKeyStatus: aktuell.apiKeyStatus }
     await comp.einstellungen.save(zusammengefuehrt)
-    comp.aktualisiere(zusammengefuehrt)
+    // A4b: Rückgabewert durchreichen (true=sofort übernommen, false=verschoben bis Lauf-Ende) — der
+    // Renderer (App.tsx speichern()) zeigt bei false einen abweichenden Hinweis.
+    return comp.aktualisiere(zusammengefuehrt)
   })
 
   // V2: Prompt-Assistent (Chat-Anbieter) — ohne Key des Standard-Anbieters klare Fehlermeldung.
@@ -437,6 +487,15 @@ if (!gotTheLock) {
     baueTrayMenu(comp)
     showSettings()
 
+    // C5: Update-Hintergrund-Check — Start-Check nach ~1min (App-Start nicht verzögern), danach
+    // alle ~6h. comp.pruefeUpdate() liest das Opt-in LIVE aus den Settings und bremst über den
+    // bestehenden 24h-Mindestabstand/ETag-Cache selbst (kein Netz-Spam). .unref(), damit die Timer
+    // einen App-Exit nicht künstlich offenhalten; Cleanup zusätzlich explizit bei will-quit.
+    updateStartTimer = setTimeout(() => void fuehreUpdateCheckAus(comp), 60_000)
+    updateStartTimer.unref()
+    updateIntervallTimer = setInterval(() => void fuehreUpdateCheckAus(comp), 6 * 60 * 60_000)
+    updateIntervallTimer.unref()
+
     // Runner-Phase → Tray-Tooltip + fokusfreie Status-Pille (stiehlt keinen Fokus, ADR-0007).
     comp.sitzung.onStatus = (phase) => {
       // Nach Lauf-Ende ausstehende Settings-Änderungen übernehmen (während eines Laufs gespeichert).
@@ -450,19 +509,31 @@ if (!gotTheLock) {
       }
       baueTrayMenu(comp) // „Abbrechen"-Aktivzustand nachziehen
       if (tray) spiegleStatus(tray, phase)
+
+      // C4-main: Aufnahme-Indikator fürs Settings-Fenster. Gezielt NUR an settingsWindow (analog
+      // history:changed), nicht an alle Fenster (anders als theme:systemChanged). sendeAn prüft bereits
+      // null/isDestroyed — kein zusätzliches isVisible()-Gate (siehe Design-Doc C4-main: ein Event an
+      // ein verstecktes, aber existierendes Fenster ist harmlos/Standard-Electron).
+      // Payload = die ROHE WorkflowPhase (nicht die bereits gemappte PillenStatus) — der Renderer-Hook
+      // (use-workflow-status.ts) mappt selbst über pillenStatus(), damit `dauerMs` & Co. bei Bedarf ohne
+      // Main-Änderung mitgenommen werden können.
+      sendeAn(settingsWindow, 'workflow:status', phase)
+
+      // Status-Pille (fokusfrei, Recorder-Fenster) nutzt weiterhin die gemappte PillenStatus lokal hier.
+      const s = pillenStatus(phase)
       if (!pillWindow) return
       if (pillFehlerTimer) {
         clearTimeout(pillFehlerTimer)
         pillFehlerTimer = null
       }
-      const s = pillenStatus(phase)
       if (s.sichtbar) {
         pillWindow.webContents.send('pill:status', s.label)
         positioniertePille(pillWindow)
         pillWindow.showInactive()
         // Fehler/Teil-Erfolg bleiben sonst stehen (kein weiteres onStatus bis zum nächsten Lauf) → auto-ausblenden.
+        // A3: Anzeigedauer kommt aus pillenStatus() (nach Textlänge gestaffelt, gedeckelt) statt fixer 4000ms.
         if (phase.status === 'fehler' || phase.status === 'teilErfolg') {
-          pillFehlerTimer = setTimeout(() => pillWindow?.hide(), 4000)
+          pillFehlerTimer = setTimeout(() => pillWindow?.hide(), s.dauerMs ?? 4000)
         }
       } else {
         pillWindow.hide()
@@ -471,9 +542,11 @@ if (!gotTheLock) {
 
     // Globaler Hotkey über uiohook → verarbeiteTaste → Sitzung (ersetzt den globalShortcut-Platzhalter).
     // onStatus speist den Start-Erfolg in den Health-Check „Hotkey-Erkennung" (W3-ε).
+    // perf: NOOP_PERF im Normalbetrieb (siehe oben) — nur bei BLITZTEXT_PERF=1 eine echte Messung.
     stopUiohook = starteUiohookQuelle({
       verarbeiteTaste: comp.verarbeiteTaste,
-      onStatus: (aktiv) => comp.setzeHotkeyHookAktiv(aktiv)
+      onStatus: (aktiv) => comp.setzeHotkeyHookAktiv(aktiv),
+      perf
     })
 
     // W3-γ: Registry-Autostart-Eintrag an das gespeicherte `autostart`-Feld angleichen (heilt einen
@@ -504,5 +577,9 @@ if (!gotTheLock) {
 
   app.on('will-quit', () => {
     stopUiohook()
+    perf.stoppe() // No-Op bei NOOP_PERF; verhindert einen hängenden Log-Timer bei BLITZTEXT_PERF=1
+    // C5: Update-Timer aufräumen (Start-Timeout kann beim Beenden noch ausstehen, Intervall läuft sonst weiter).
+    if (updateStartTimer) clearTimeout(updateStartTimer)
+    if (updateIntervallTimer) clearInterval(updateIntervallTimer)
   })
 }

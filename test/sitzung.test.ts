@@ -29,6 +29,8 @@ interface MakeOpts {
   protokollWirft?: boolean
   /** Vom erfasseFenster-Port zurückgegebenes HWND beim Aufnahme-Start (Weg B, W3-A). */
   erfasstesHwnd?: number | null
+  /** A1 (v0.6.0, NUR makeSitzungMitTorSteuerung): staut die erfasseFenster-Auflösung in einem eigenen Tor. */
+  gateErfasseFenster?: boolean
 }
 
 function makeSitzung(opts: MakeOpts = {}) {
@@ -115,7 +117,10 @@ function makeSitzung(opts: MakeOpts = {}) {
       calls.meldeErneut.push(aktionen?.erneut)
     },
     inZwischenablage: (t) => calls.inZwischenablage.push(t),
-    erfasseFenster: () => {
+    // A1 (v0.6.0): erfasseFenster ist jetzt async — der Fake liefert direkt ein aufgelöstes Promise
+    // (kein künstliches Warten nötig für die bestehenden Tests; siehe makeSitzungMitTorSteuerung für
+    // den gate-gesteuerten Race-Test).
+    erfasseFenster: async () => {
       calls.erfasseFenster++
       return opts.erfasstesHwnd ?? null
     }
@@ -528,8 +533,15 @@ describe('createSitzung', () => {
       anzeigen: [] as string[],
       zeigeEinstellungen: 0,
       melde: [] as FehlerMeldung[],
-      inZwischenablage: [] as string[]
+      inZwischenablage: [] as string[],
+      erfasseFenster: 0
     }
+    // A1 (v0.6.0): erfasseFenster ist jetzt der DRITTE Await-Punkt in starteWorkflow (nach load/has).
+    // Standardmäßig löst der Fake sofort auf (Microtask), damit die bestehenden W2-A-Tests (die nur das
+    // load-Tor steuern) unverändert durchlaufen. Ist `gateErfasseFenster` gesetzt, staut der Fake seine
+    // Auflösung in einer EIGENEN Tor-Warteschlange — für den neuen Race-Test, der GENAU an diesem Await
+    // abbrechen will.
+    let toreLoesenFenster: Array<() => void> = []
     const ausgabe: Ausgabe = {
       einfügen: (t) => calls.einfügen.push(t),
       anzeigen: (t) => calls.anzeigen.push(t),
@@ -538,7 +550,13 @@ describe('createSitzung', () => {
       },
       melde: (f) => calls.melde.push(f),
       inZwischenablage: (t) => calls.inZwischenablage.push(t),
-      erfasseFenster: () => null
+      erfasseFenster: () => {
+        calls.erfasseFenster++
+        if (!opts.gateErfasseFenster) return Promise.resolve(opts.erfasstesHwnd ?? null)
+        return new Promise((resolve) => {
+          toreLoesenFenster.push(() => resolve(opts.erfasstesHwnd ?? null))
+        })
+      }
     }
 
     const apiKeys = {
@@ -556,7 +574,23 @@ describe('createSitzung', () => {
       await tick()
       await tick()
     }
-    return { sitzung, calls, recorder, oeffneTore, wartendeTore: () => toreLoesen.length }
+    // A1: analog zu oeffneTore, aber fürs erfasseFenster-Tor (nur relevant mit gateErfasseFenster).
+    async function oeffneFensterTor(): Promise<void> {
+      const tore = toreLoesenFenster
+      toreLoesenFenster = []
+      for (const t of tore) t()
+      await tick()
+      await tick()
+    }
+    return {
+      sitzung,
+      calls,
+      recorder,
+      oeffneTore,
+      oeffneFensterTor,
+      wartendeTore: () => toreLoesen.length,
+      wartendeFensterTore: () => toreLoesenFenster.length
+    }
   }
 
   it('W2-A/1: zwei quasi-gleichzeitige starteWorkflow starten den Runner nur EINMAL', async () => {
@@ -607,6 +641,39 @@ describe('createSitzung', () => {
     await sitzung.stoppe()
     expect(calls.einfügen).toEqual(['hallo'])
     expect(sitzung.beschaeftigt()).toBe(false)
+  })
+
+  // A1 (v0.6.0): erfasseFenster() ist jetzt async — DRITTER Await-Punkt in starteWorkflow (nach
+  // load/apiKeys.has). Die W2-A-Generationsprüfung muss auch NACH diesem Await erneut greifen, sonst
+  // gewinnt ein brichAb() während des erfasseFenster-awaits nicht mehr (verlorener Abbruch, Variante (2)
+  // aus dem Kommentar oben) und runner.start() liefe trotzdem an.
+  it('W2-A/4: brichAb während des erfasseFenster-Awaits verhindert den Start und hinterlässt keine Reservierung', async () => {
+    const { sitzung, recorder, calls, oeffneTore, oeffneFensterTor, wartendeFensterTore } =
+      makeSitzungMitTorSteuerung({ gateErfasseFenster: true })
+
+    const p = sitzung.starteWorkflow('transcribe', 'hotkey')
+    // load + apiKeys.has durchlaufen lassen → der Lauf hängt jetzt GENAU im erfasseFenster-Await.
+    await oeffneTore()
+    expect(wartendeFensterTore()).toBe(1)
+    // Der Nutzer bricht ab, WÄHREND erfasseFenster() noch aussteht.
+    sitzung.brichAb()
+    // Erst danach löst erfasseFenster auf; starteWorkflow läuft weiter — darf aber NICHT mehr starten.
+    await oeffneFensterTor()
+    await p
+
+    expect(recorder.started).toBe(0)
+    expect(sitzung.beschaeftigt()).toBe(false)
+    expect(calls.einfügen).toEqual([])
+    expect(calls.anzeigen).toEqual([])
+
+    // Kein Zustands-Leck: eine frische Auslösung nach dem Abbruch läuft sauber an (auch über das
+    // erfasseFenster-Tor hinweg).
+    const p2 = sitzung.starteWorkflow('transcribe', 'hotkey')
+    await oeffneTore()
+    await oeffneFensterTor()
+    await p2
+    expect(recorder.started).toBe(1)
+    expect(sitzung.beschaeftigt()).toBe(true)
   })
 
   // --- W3-A: Fokus-Rückkehr (ADR-0011 Weg B) — HWND beim Start erfassen, an einfügen durchreichen ---

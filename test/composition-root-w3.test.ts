@@ -21,7 +21,7 @@ function basisDeps(overrides: Partial<CompositionDeps> = {}): CompositionDeps {
       zeigeEinstellungen: vi.fn(),
       melde: vi.fn(),
       inZwischenablage: vi.fn(),
-      erfasseFenster: vi.fn(() => null)
+      erfasseFenster: vi.fn(async () => null)
     },
     apiKeys: {
       has: async () => true,

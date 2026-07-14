@@ -7,6 +7,7 @@
 
 import {
   createHotkeyMatcher,
+  type HotkeyAction,
   type HotkeyMatcher,
   type KeyEvent,
   type RecordingMode
@@ -45,25 +46,41 @@ export function createHotkeyDispatcher(config: HotkeyDispatcherConfig): HotkeyDi
   let aktiv: { workflow: WorkflowId; matcher: HotkeyMatcher } | null = null
 
   return {
+    // Perf (B2): früher hier 1 Zwischenarray (`map`) + N Objekt-Spreads + 1-2 `find`-Closures
+    // pro Tastendruck (uiohook ist ein globaler Hook — JEDER Tastendruck systemweit läuft
+    // hier durch). Jetzt: eine einzige `for`-Schleife ohne Zwischenarray/-objekte. Verhalten
+    // bewusst UNVERÄNDERT: die Schleife läuft immer bis zum Ende — jeder Matcher bekommt
+    // JEDES Event (Tasten-Tracking der nicht-aktiven/nicht-gewinnenden Matcher muss akkurat
+    // bleiben), auch wenn ein früherer Matcher bereits `start` liefert. Ein naiver Loop mit
+    // frühem `return` bei `start` würde das brechen (siehe Test „alle registrierten Matcher
+    // werden bei JEDEM Event gefüttert…").
     handle(event) {
-      // Alle Matcher fortschreiben, damit ihr Tasten-Tracking akkurat bleibt.
-      const treffer = eintraege.map((e) => ({ ...e, aktion: e.matcher.handle(event) }))
-
       if (aktiv) {
         const aktiverMatcher = aktiv.matcher
-        const eigener = treffer.find((t) => t.matcher === aktiverMatcher)
-        if (eigener && (eigener.aktion === 'stop' || eigener.aktion === 'cancel')) {
+        let aktionDesAktiven: HotkeyAction | null = null
+        for (const e of eintraege) {
+          const a = e.matcher.handle(event)
+          if (e.matcher === aktiverMatcher) aktionDesAktiven = a
+        }
+        if (aktionDesAktiven === 'stop' || aktionDesAktiven === 'cancel') {
           const workflow = aktiv.workflow
           aktiv = null
-          return { aktion: eigener.aktion, workflow }
+          return { aktion: aktionDesAktiven, workflow }
         }
         return null // ein Workflow aktiv → andere Auslösungen ignorieren
       }
 
-      const gestartet = treffer.find((t) => t.aktion === 'start')
-      if (!gestartet) return null
-      aktiv = { workflow: gestartet.workflow, matcher: gestartet.matcher }
-      return { aktion: 'start', workflow: gestartet.workflow }
+      // „Erster Treffer gewinnt" (wie zuvor durch `treffer.find`) über den `!gefunden`-Guard:
+      // ein späterer gleichzeitiger `start` in derselben `eintraege`-Reihenfolge überschreibt
+      // `gefunden` NICHT mehr, obwohl sein Matcher trotzdem gefüttert wird.
+      let gefunden: { workflow: WorkflowId; matcher: HotkeyMatcher } | null = null
+      for (const e of eintraege) {
+        const a = e.matcher.handle(event)
+        if (a === 'start' && !gefunden) gefunden = { workflow: e.workflow, matcher: e.matcher }
+      }
+      if (!gefunden) return null
+      aktiv = gefunden
+      return { aktion: 'start', workflow: gefunden.workflow }
     },
 
     setzeZurueck() {

@@ -12,7 +12,7 @@
 ![Electron](https://img.shields.io/badge/Electron-33-47848F?style=flat-square&logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-087EA4?style=flat-square&logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strikt-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-714%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-811%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
 
 [**⬇️ Download**](https://github.com/edo-dzell/blitztext-app-windows/releases/latest) ·
 [Vergleich zum Original](#-stark-erweitert-windows-port-vs-macos-original) ·
@@ -78,16 +78,17 @@ Idee zur Alltags-App aus:
 | **API-Key-Verwaltung** | ✅ Ein Key **pro Anbieter**, verschlüsselt per Windows DPAPI | Eigener OpenAI-Key |
 | **Workflows** | ✅ Die vier Klassiker **plus eigene Workflows** mit eigenen Prompts (z. B. Übersetzen DE → EN) | 4 feste Workflows |
 | **Sprachen** | ✅ Eingabe- und Ausgabesprache pro Workflow aus 23 Sprachen — auf Deutsch diktieren, z. B. auf Englisch einfügen | — |
-| **Ton & Emojis** | ✅ Pro Workflow regelbar: Ton (formal/neutral/locker) und Emoji-Dichte (aus–viel) | — |
+| **Ton & Emojis** | ✅ Pro Workflow regelbar: Ton (formal/neutral/locker) und Emoji-Dichte (aus–viel) — auch bei eigenen und auf statischen Text umgestellten Prompts | — |
 | **Prompt-Editor** | ✅ Prompts anpassen, mit Versions-Historie und Wiederherstellen | — |
-| **Verlauf** | ✅ Alle Diktate mit Kosten, Datum, Sortierung und Löschen — inkl. Prompt-Stand je Eintrag | — |
+| **Verlauf** | ✅ Alle Diktate mit Kosten, Datum, Sortierung und Löschen — inkl. Prompt-Stand je Eintrag; gewählte Sortierung bleibt über einen Neustart hinweg erhalten | — |
 | **Statistik** | ✅ Token-Summen und Kosten, mit editierbarer Preistabelle | — |
 | **Design** | ✅ Hell/Dunkel (nach System oder manuell), Tray-Icon folgt dem Theme | — |
-| **Diktier-UX** | ✅ Fokusfreie Status-Pille, Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar, Mikrofon wählbar | Menubar-Icon |
+| **Diktier-UX** | ✅ Fokusfreie Status-Pille (bricht lange Fehlermeldungen um, statt sie abzuschneiden), Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar, Mikrofon wählbar, spürbar flüssigerer Diktat-Start | Menubar-Icon |
+| **Live-Feedback** | ✅ Erneuter-Versuch-Kennzeichnung bei Audio-Retry, „dauert länger als üblich"-Hinweis bei langsamen Läufen, dezenter Status-Punkt im Einstellungsfenster während ein Diktat läuft | — |
 | **Sicheres Einfügen** | ✅ Prüft vor dem Einfügen, ob noch dasselbe Fenster im Fokus ist — bei Fokuswechsel wird **nicht** blind getippt, sondern der Text landet in der Zwischenablage mit Hinweis. Steuerzeichen werden gefiltert; Diktate bleiben aus dem Windows-Zwischenablageverlauf | — |
 | **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte) | — |
-| **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis (kein Auto-Update, keine Telemetrie) | — |
-| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* statt es umzuschreiben, und legt dann den Rohtext in die Zwischenablage statt falschen Text einzufügen), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 714 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis im Tray (kein Auto-Update, keine Telemetrie), ehrlicher Hinweis beim Speichern während einer laufenden Aufnahme | — |
+| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* statt es umzuschreiben, und legt dann den Rohtext in die Zwischenablage statt falschen Text einzufügen), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 811 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
 
 <sup>Vergleich auf Basis des öffentlichen README des Originals (Stand Juni 2026).</sup>
 

@@ -105,4 +105,50 @@ describe('starteUiohookQuelle', () => {
     expect(onStatus).toHaveBeenCalledWith(false)
     expect(() => stop()).not.toThrow() // No-Op-Stopp-Thunk
   })
+
+  // B3 (R5, Perf, opt-in): additive Verdrahtung, ändert NICHTS an der bestehenden Struktur.
+  // Ohne `perf`-Dep (alle Tests oben) bleibt das Verhalten unverändert (Default NOOP_PERF).
+  it('ruft bei injiziertem perf-Fake erfasseStart/erfasseEnde für jedes keydown/keyup-Event auf', () => {
+    const f = fakeHook()
+    const aufrufe: string[] = []
+    const perf = {
+      erfasseStart: vi.fn(() => {
+        aufrufe.push('start')
+        return 42
+      }),
+      erfasseEnde: vi.fn((marker: number) => {
+        aufrufe.push(`ende:${marker}`)
+      }),
+      ringpuffer: () => [],
+      stoppe: vi.fn()
+    }
+    starteUiohookQuelle({ verarbeiteTaste: vi.fn(), hook: f.hook, perf })
+
+    f.feuere('keydown', 0x0e1d) // ControlRight
+    f.feuere('keyup', 0x0e1d)
+
+    expect(perf.erfasseStart).toHaveBeenCalledTimes(2)
+    expect(perf.erfasseEnde).toHaveBeenCalledTimes(2)
+    expect(perf.erfasseEnde).toHaveBeenNthCalledWith(1, 42)
+    expect(perf.erfasseEnde).toHaveBeenNthCalledWith(2, 42)
+    // Reihenfolge pro Event: erst erfasseStart, dann erfasseEnde (keydown, dann keyup):
+    expect(aufrufe).toEqual(['start', 'ende:42', 'start', 'ende:42'])
+  })
+
+  it('ruft perf auch für ungemappte Keycodes auf (Latenz des Hook-Aufrufs selbst, nicht nur der Verarbeitung)', () => {
+    const f = fakeHook()
+    const perf = {
+      erfasseStart: vi.fn(() => 1),
+      erfasseEnde: vi.fn(),
+      ringpuffer: () => [],
+      stoppe: vi.fn()
+    }
+    const verarbeiteTaste = vi.fn()
+    starteUiohookQuelle({ verarbeiteTaste, hook: f.hook, perf })
+
+    f.feuere('keydown', 0xffff) // ungemappt
+    expect(verarbeiteTaste).not.toHaveBeenCalled()
+    expect(perf.erfasseStart).toHaveBeenCalledTimes(1)
+    expect(perf.erfasseEnde).toHaveBeenCalledTimes(1)
+  })
 })

@@ -50,6 +50,7 @@ describe('createSettingsStore', () => {
       autostart: true,
       mikrofonDeviceId: 'geraet-abc',
       updateHinweisAktiv: true,
+      verlaufSortierung: 'aeltesteZuerst' as const,
       workflows: [
         {
           id: 'transcribe',
@@ -140,6 +141,35 @@ describe('createSettingsStore', () => {
     expect(d.autostart).toBe(false)
     expect(d.mikrofonDeviceId).toBe('')
     expect(d.updateHinweisAktiv).toBe(false)
+  })
+
+  // C2: verlaufSortierung — Migration feldweise wie theme (includes-Check + Fallback auf Default).
+  it('defaultSettings: verlaufSortierung ist neuesteZuerst', () => {
+    expect(defaultSettings().verlaufSortierung).toBe('neuesteZuerst')
+  })
+
+  it('alte Datei ohne verlaufSortierung ⇒ Default neuesteZuerst', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(JSON.stringify({ language: 'de' }))
+    })
+    const loaded = await store.load()
+    expect(loaded.verlaufSortierung).toBe('neuesteZuerst')
+  })
+
+  it('verlaufSortierung round-trippt (aeltesteZuerst)', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(JSON.stringify({ verlaufSortierung: 'aeltesteZuerst' }))
+    })
+    const loaded = await store.load()
+    expect(loaded.verlaufSortierung).toBe('aeltesteZuerst')
+  })
+
+  it('ungültiger verlaufSortierung-Wert fällt auf den Default zurück', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(JSON.stringify({ verlaufSortierung: 'zufaellig' }))
+    })
+    const loaded = await store.load()
+    expect(loaded.verlaufSortierung).toBe('neuesteZuerst')
   })
 
   it('seedet die vier eingebauten Workflows ohne vorhandenes File', async () => {

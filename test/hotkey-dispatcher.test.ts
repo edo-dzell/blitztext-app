@@ -64,6 +64,58 @@ describe('createHotkeyDispatcher', () => {
   })
 })
 
+// B2 (Perf): Allokations-Umbau von `map`+`find` auf eine einzige `for`-Schleife MUSS die
+// Arbitrierung exakt erhalten — insbesondere „alle Matcher füttern" und „erster Treffer
+// gewinnt". Diese Tests sind das Kernvertrags-Netz für den Umbau (kein Verhaltens-Diff).
+describe('B2: Verhaltensgleichheit nach dem Allokations-Umbau', () => {
+  it('bei mehreren gleichzeitig komplettierenden Chords gewinnt der ERSTE in bindungen-Reihenfolge', () => {
+    // Beide Chords bestehen nur aus ControlRight → ein einzelnes Down-Event komplettiert
+    // BEIDE Matcher gleichzeitig. Der Dispatcher muss trotzdem „erster Eintrag gewinnt"
+    // liefern (das ist genau der Fall, den ein naiver `!gefunden`-loser Loop bräche).
+    const geteilteBindungen = [
+      { chord: ['ControlRight'], workflow: 'improve' as const },
+      { chord: ['ControlRight'], workflow: 'calm' as const }
+    ]
+    const d = createHotkeyDispatcher({ bindungen: geteilteBindungen, mode: 'hold' })
+    expect(d.handle({ type: 'down', key: 'ControlRight' })).toEqual({
+      aktion: 'start',
+      workflow: 'improve' // erster Eintrag in bindungen, nicht 'calm'
+    })
+  })
+
+  it('alle registrierten Matcher werden bei JEDEM Event gefüttert, auch wenn ein früherer Matcher bereits start liefert', () => {
+    // dispatcher.ts hat keinen Matcher-Injection-Port (Matcher werden intern aus den Chords
+    // gebaut) — der Kernvertrag „kein Matcher wird übersprungen" wird deshalb über echtes
+    // Tasten-Tracking nachgewiesen: der ZWEITE Chord teilt sich seine erste Taste (KeyJ) mit
+    // dem KOMPLETTEN ersten Chord. Komplettiert der erste Chord (→ 'start', improve wird
+    // aktiv), MUSS der zweite Matcher das KeyJ-Down trotzdem sehen und tracken — sonst bräche
+    // ein früher Loop-Ausstieg genau das (das ist der im Design-Dokument beschriebene
+    // Kern-Unterschied zu einem naiven early-return-Loop).
+    const gemeinsam = [
+      { chord: ['ControlRight', 'KeyJ'], workflow: 'improve' as const },
+      { chord: ['KeyJ', 'KeyK'], workflow: 'calm' as const }
+    ]
+    const d = createHotkeyDispatcher({ bindungen: gemeinsam, mode: 'hold' })
+
+    d.handle({ type: 'down', key: 'ControlRight' })
+    // KeyJ komplettiert improve (erster Eintrag, 'start') UND muss vom zweiten Matcher (calm)
+    // getrackt werden, obwohl improve sofort aktiv wird und calm für DIESES Event „verliert".
+    expect(d.handle({ type: 'down', key: 'KeyJ' })).toEqual({ aktion: 'start', workflow: 'improve' })
+    // improve ist jetzt aktiv → calm-Auslösungen werden ignoriert (kein eigener Return-Wert),
+    // aber calms Matcher wird für dieses KeyK-Down trotzdem gefüttert:
+    expect(d.handle({ type: 'down', key: 'KeyK' })).toBeNull()
+    // improve abbrechen (gibt den Dispatcher wieder frei) und improves Tasten vollständig
+    // loslassen, damit ein neues KeyJ-Down NICHT erneut improves Chord komplettiert:
+    expect(d.handle({ type: 'down', key: 'Escape' })).toEqual({ aktion: 'cancel', workflow: 'improve' })
+    d.handle({ type: 'up', key: 'ControlRight' })
+    d.handle({ type: 'up', key: 'KeyJ' })
+    // calm hält (laut Tracking) bereits KeyK aus dem vorherigen, „ignorierten" Event → ein
+    // frisches KeyJ-Down komplettiert calms Chord [KeyJ, KeyK] sofort. Das ist nur möglich,
+    // wenn calm das KeyK-Down oben tatsächlich gesehen und getrackt hat (kein Loop-Überspringen).
+    expect(d.handle({ type: 'down', key: 'KeyJ' })).toEqual({ aktion: 'start', workflow: 'calm' })
+  })
+})
+
 // Bug v0.4.0: verlorenes Win-Keyup (Win+L/UAC/erhöhtes Fenster) → transcribe startete bei
 // LinksStrg allein. Heilung über die Modifier-Maske + expliziter Reset (powerMonitor).
 describe('Selbstheilung & Reset', () => {

@@ -58,6 +58,8 @@ export interface BlitztextSettings {
   mikrofonDeviceId: string
   /** Opt-in Update-Hinweis (W3-δ). Default AUS — KEIN Netzabruf ohne ausdrückliche Zustimmung. */
   updateHinweisAktiv: boolean
+  /** Sortierrichtung im Verlauf (C2). Default 'neuesteZuerst'. Migration wie `theme` (includes-Check). */
+  verlaufSortierung: 'neuesteZuerst' | 'aeltesteZuerst'
 }
 
 // Default-Anbieter = OpenAI. ASR auf die moderne Generation `gpt-4o-mini-transcribe` (v0.2.4, per
@@ -103,7 +105,8 @@ export function defaultSettings(): BlitztextSettings {
     apiKeyStatus: {},
     autostart: false,
     mikrofonDeviceId: '',
-    updateHinweisAktiv: false
+    updateHinweisAktiv: false,
+    verlaufSortierung: 'neuesteZuerst'
   }
 }
 
@@ -320,7 +323,12 @@ function parseSettings(raw: unknown): BlitztextSettings {
     // Neue W3-Felder (3.2). Migration-sicher: alte Datei ohne diese Felder ⇒ konservativer Default.
     autostart: o.autostart === true, // Default AUS
     mikrofonDeviceId: typeof o.mikrofonDeviceId === 'string' ? o.mikrofonDeviceId : d.mikrofonDeviceId,
-    updateHinweisAktiv: o.updateHinweisAktiv === true // Opt-in, Default AUS
+    updateHinweisAktiv: o.updateHinweisAktiv === true, // Opt-in, Default AUS
+    verlaufSortierung: (['neuesteZuerst', 'aeltesteZuerst'] as const).includes(
+      o.verlaufSortierung as never
+    )
+      ? (o.verlaufSortierung as BlitztextSettings['verlaufSortierung'])
+      : d.verlaufSortierung
   }
 }
 

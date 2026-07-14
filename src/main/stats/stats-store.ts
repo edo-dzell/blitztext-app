@@ -13,7 +13,8 @@ export interface StatNutzung {
 }
 
 export interface StatZeile {
-  datum: string // YYYY-MM-DD
+  // YYYY-MM-DD (Tagesauflösung, jünger als 90 Tage) ODER YYYY-MM (monatskompaktiert, älter; B1).
+  datum: string
   workflowId: string
   anzahl: number
   audioSekunden: number
@@ -42,9 +43,13 @@ export interface StatsFile {
 
 export interface StatsStore {
   aufzeichnen(nutzung: StatNutzung, jetztMs: number): Promise<void>
-  zusammenfassung(): Promise<StatsSummary>
+  zusammenfassung(jetztMs?: number): Promise<StatsSummary>
   loeschen(): Promise<void>
 }
+
+/** Anzahl Tage, ab der Tageszeilen in `zusammenfassung()` auf Monatsebene kompaktiert werden (B1). */
+const KOMPAKTIERUNGS_SCHWELLE_TAGE = 90
+const TAG_MS = 24 * 60 * 60 * 1000
 
 function datumAus(jetztMs: number): string {
   // YYYY-MM-DD in LOKALER Zeit (v0.5.0-Fix): vorher UTC via toISOString(), wodurch Läufe zwischen
@@ -65,6 +70,57 @@ function datumAus(jetztMs: number): string {
 
 function schluessel(z: Pick<StatZeile, 'datum' | 'workflowId' | 'asrModell' | 'chatModell'>): string {
   return [z.datum, z.workflowId, z.asrModell, z.chatModell].join('|')
+}
+
+/** 'YYYY-MM-DD' → 'YYYY-MM'; bereits kompaktierte 'YYYY-MM'-Werte (Länge 7) bleiben unverändert. */
+function monatVon(datum: string): string {
+  return datum.slice(0, 7)
+}
+
+/**
+ * Aggregiert Zeilen mit `datum < grenzeDatum` (lexikalischer Vergleich, ISO-Präfixe sind sortierstabil)
+ * auf Monatsebene (Schlüssel: monat|workflowId|asrModell|chatModell). Zeilen ab der Grenze bleiben
+ * unverändert (Tagesauflösung). Bereits monatskompaktierte Zeilen (datum-Länge 7, 'YYYY-MM') werden
+ * anhand desselben Präfix-Vergleichs erneut erfasst und mit gleichlautenden Schlüsseln idempotent
+ * zusammengeführt (mehrfaches Kompaktieren verändert die Summen nicht mehr).
+ *
+ * Reine Funktion, keine Seiteneffekte — der Aufrufer entscheidet, ob/wann geschrieben wird.
+ */
+export function komprimiereAeltereAls(zeilen: StatZeile[], grenzeDatum: string): StatZeile[] {
+  const ergebnis: StatZeile[] = []
+  const indexNachSchluessel = new Map<string, number>()
+
+  for (const z of zeilen) {
+    if (z.datum >= grenzeDatum) {
+      // Jung genug: unverändert übernehmen (Tagesauflösung bleibt erhalten).
+      ergebnis.push({ ...z })
+      continue
+    }
+    const monat = monatVon(z.datum)
+    const k = schluessel({ datum: monat, workflowId: z.workflowId, asrModell: z.asrModell, chatModell: z.chatModell })
+    const bestehenderIdx = indexNachSchluessel.get(k)
+    if (bestehenderIdx === undefined) {
+      indexNachSchluessel.set(k, ergebnis.length)
+      ergebnis.push({
+        datum: monat,
+        workflowId: z.workflowId,
+        anzahl: z.anzahl,
+        audioSekunden: z.audioSekunden,
+        asrModell: z.asrModell,
+        chatModell: z.chatModell,
+        promptTokens: z.promptTokens,
+        completionTokens: z.completionTokens
+      })
+    } else {
+      const ziel = ergebnis[bestehenderIdx]!
+      ziel.anzahl += z.anzahl
+      ziel.audioSekunden += z.audioSekunden
+      ziel.promptTokens += z.promptTokens
+      ziel.completionTokens += z.completionTokens
+    }
+  }
+
+  return ergebnis
 }
 
 export function createStatsStore({ file }: { file: StatsFile }): StatsStore {
@@ -106,8 +162,15 @@ export function createStatsStore({ file }: { file: StatsFile }): StatsStore {
       if (idx < 0) zeilen.push(ziel)
       await file.write(JSON.stringify(zeilen))
     },
-    async zusammenfassung() {
-      const zeilen = await ladeAlle()
+    async zusammenfassung(jetztMs = Date.now()) {
+      const geladen = await ladeAlle()
+      const grenzeDatum = datumAus(jetztMs - KOMPAKTIERUNGS_SCHWELLE_TAGE * TAG_MS)
+      const kompaktiert = komprimiereAeltereAls(geladen, grenzeDatum)
+      const hatSichVeraendert = JSON.stringify(kompaktiert) !== JSON.stringify(geladen)
+      if (hatSichVeraendert) {
+        await file.write(JSON.stringify(kompaktiert))
+      }
+      const zeilen = kompaktiert
       let gesamtAnzahl = 0
       let gesamtAudioSekunden = 0
       let gesamtPromptTokens = 0

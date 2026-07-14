@@ -4,7 +4,20 @@
 //   (RESEARCH §4: kein Sofort-Restore wegen Race; 1,5 s wie macOS). Port bleibt synchron `void`
 //   (RESEARCH §4 Naht-Mismatch) — der Adapter besitzt das Async.
 // - anzeigen / zeigeEinstellungen: an die Fenster-Schicht (index.ts) delegiert.
-// Nicht headless verifizierbar (Electron clipboard + spawn) — Laufzeit-Abnahme auf Windows.
+// A1 (v0.6.0): `erfasseFenster` (Ausgabe-Port) UND `schreibUeberHelfer` (Zwischenablage-Schreiben)
+// laufen über `spawn`+Promise statt `spawnSync` — der Aufrufer (sitzung.ts) awaitet erfasseFenster()
+// bereits (async starteWorkflow), blockiert also nicht mehr den Event-Loop. NUR das zweite `--hwnd`
+// unmittelbar vor dem Paste (Weg-B-Drift-Gate, `aktuellesFenster` unten) bleibt bewusst synchron.
+// F2 (Review R2, v0.6.0, Fix): die A1-Umstellung machte `Zwischenablage.schreib` kurzzeitig
+// fire-and-forget — der PasteService rief `schreib()` ohne await auf und startete danach sofort die
+// Drift-Prüfung/Paste-Strategien, obwohl `--set-clip` (spawn) noch lief. Bei einem langsamen Helfer
+// (z.B. AV-Scan) konnte so der ALTE Zwischenablage-Inhalt eingefügt werden, still und ohne Fehler.
+// Behoben: `Zwischenablage.schreib` gibt jetzt `Promise<void>` zurück; `paste-service.ts` awaitet es
+// VOR der Drift-Prüfung. Betrifft NUR das Schreiben vor dem Paste — `inZwischenablage` (Teil-Erfolg,
+// kein nachfolgender Paste) bleibt bewusst synchron `void`/fire-and-forget.
+// Nicht headless verifizierbar (Electron clipboard + spawn) — Laufzeit-Abnahme auf Windows. Die neue
+// `hwndVonHelferAsync`-Logik ist als eigene, exportierte Funktion mit injizierbarem spawnFn isoliert
+// testbar (siehe test/paste-adapter-hwnd.test.ts).
 
 import { app, clipboard } from 'electron'
 import { spawn, spawnSync } from 'node:child_process'
@@ -71,6 +84,8 @@ function prozessErfolg(spawnFn: typeof spawn, command: string, args: string[]): 
  * als Dezimalzahl auf stdout. Synchron, weil die Weg-B-Prüfung genau zwischen „Zwischenablage gesetzt"
  * und „Paste ausgelöst" laufen muss (ein async-Fenster dazwischen wäre selbst driftanfällig). null =
  * Helfer fehlt/scheitert/liefert nichts Parsbares → der PasteService fällt aufs bisherige Einfügen zurück.
+ * A1 (v0.6.0): BEWUSST die einzige verbleibende synchrone Helfer-Abfrage im Adapter — NICHT anfassen
+ * (Drift-Schutz unmittelbar vor dem Paste, siehe `aktuellesFenster` unten).
  */
 function hwndVonHelfer(spawnSyncFn: typeof spawnSync, command: string, args: string[]): number | null {
   try {
@@ -85,6 +100,61 @@ function hwndVonHelfer(spawnSyncFn: typeof spawnSync, command: string, args: str
   }
 }
 
+// Timeout für die HWND-Erfassung beim Auslösen (A1): identisch zum bisherigen spawnSync-timeout (2000ms).
+const HWND_ASYNC_TIMEOUT_MS = 2000
+
+/**
+ * Async-Pendant zu `hwndVonHelfer` für den `Ausgabe.erfasseFenster`-Port (A1, v0.6.0): erfasst das
+ * Vordergrundfenster beim AUSLÖSEN der Aufnahme, NICHT unmittelbar vor dem Paste (das bleibt
+ * `hwndVonHelfer`, synchron). Läuft über `spawn` statt `spawnSync`, damit `sitzung.ts` beim Awaiten
+ * den Event-Loop nicht blockiert. `spawnSync` kennt eine native `timeout`-Option — `spawn` nicht, daher
+ * hier ein manueller Timer, der bei Ablauf den Kind-Prozess killt und mit `null` auflöst; der Timer wird
+ * in JEDEM Terminalpfad (exit/error/timeout) gecleart, um kein Leck zu hinterlassen. Eigenständig
+ * exportiert (statt in der Closure von `createPasteAusgabe` versteckt), damit sie isoliert mit einem
+ * Fake-`spawn` testbar ist — analog zu `prozessErfolg`.
+ */
+export function hwndVonHelferAsync(
+  spawnFn: typeof spawn,
+  command: string,
+  args: string[],
+  timeoutMs = HWND_ASYNC_TIMEOUT_MS
+): Promise<number | null> {
+  return new Promise((resolve) => {
+    try {
+      const kind = spawnFn(command, args, { windowsHide: true })
+      let stdout = ''
+      let erledigt = false
+      const timer = setTimeout(() => {
+        if (erledigt) return
+        erledigt = true
+        kind.kill()
+        resolve(null)
+      }, timeoutMs)
+      kind.stdout?.on('data', (chunk) => {
+        stdout += chunk
+      })
+      kind.once('error', () => {
+        if (erledigt) return
+        erledigt = true
+        clearTimeout(timer)
+        resolve(null)
+      })
+      kind.once('exit', (code) => {
+        if (erledigt) return
+        erledigt = true
+        clearTimeout(timer)
+        if (code !== 0) return resolve(null)
+        const roh = stdout.trim()
+        if (!/^\d+$/.test(roh)) return resolve(null)
+        const hwnd = Number.parseInt(roh, 10)
+        resolve(Number.isSafeInteger(hwnd) && hwnd > 0 ? hwnd : null)
+      })
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
 export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
   const spawnFn = deps.spawnFn ?? spawn
   const delayMs = deps.delayMs ?? RESTORE_DELAY_MS
@@ -97,22 +167,51 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
   // in die Zwischenablage-Historie / Cloud-Sync gelangen. Fällt der Helfer aus (fehlt/scheitert/leerer
   // Text → status != 0), greift der Electron-clipboard-Fallback. `lies` bleibt Electron (nur für den
   // marker-geschützten Restore-Vergleich; kein Sensitivitäts-Belang).
-  function schreibUeberHelfer(text: string): boolean {
-    try {
-      const r = spawnSyncFn(helferPfad, ['--set-clip'], {
-        input: text,
-        windowsHide: true,
-        timeout: 2000
-      })
-      return r.status === 0
-    } catch {
-      return false
-    }
+  // A1 (v0.6.0): spawn+Promise statt spawnSync. `input` gibt es bei spawn nicht als Option — stdin wird
+  // manuell beschrieben (write+end). Timeout (2000ms, wie bisher) manuell nachgebaut (kein natives Flag).
+  function schreibUeberHelfer(text: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      try {
+        const kind = spawnFn(helferPfad, ['--set-clip'], { windowsHide: true })
+        let erledigt = false
+        const timer = setTimeout(() => {
+          if (erledigt) return
+          erledigt = true
+          kind.kill()
+          resolve(false)
+        }, 2000)
+        kind.once('error', () => {
+          if (erledigt) return
+          erledigt = true
+          clearTimeout(timer)
+          resolve(false)
+        })
+        kind.once('exit', (code) => {
+          if (erledigt) return
+          erledigt = true
+          clearTimeout(timer)
+          resolve(code === 0)
+        })
+        kind.stdin?.write(text)
+        kind.stdin?.end()
+      } catch {
+        resolve(false)
+      }
+    })
   }
   const zwischenablage: Zwischenablage = {
     lies: () => clipboard.readText(),
-    schreib: (text) => {
-      if (!schreibUeberHelfer(text)) clipboard.writeText(text)
+    // F2 (Review R2, v0.6.0): awaitable statt fire-and-forget. Der PasteService wartet jetzt auf den
+    // Abschluss (Erfolg ODER Fallback), bevor die Drift-Prüfung/Paste-Strategien laufen — vorher
+    // (spawnSync) war das implizit garantiert, seit A1 (spawn+Promise) nicht mehr. Fehler crashen
+    // weiterhin nicht: catch → Electron-clipboard-Fallback, die Promise löst danach normal auf.
+    schreib: async (text) => {
+      try {
+        const erfolg = await schreibUeberHelfer(text)
+        if (!erfolg) clipboard.writeText(text)
+      } catch {
+        clipboard.writeText(text)
+      }
     }
   }
 
@@ -149,6 +248,9 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
     strategien,
     zeigeManuellenHinweis: () => deps.fenster.zeigeManuellenHinweis(),
     // Weg B: aktuellen Vordergrund synchron vom Helfer holen; null = unbekannt → kein Drift-Urteil.
+    // A1 (v0.6.0): BEWUSST SYNCHRON, NICHT auf hwndVonHelferAsync umstellen — dieser Aufruf sitzt genau
+    // zwischen „Zwischenablage gesetzt" und „Paste ausgelöst" (Drift-Gate); ein async-Fenster hier wäre
+    // selbst driftanfällig. Siehe Kommentar bei hwndVonHelfer oben.
     aktuellesFenster: () => hwndVonHelfer(spawnSyncFn, helferPfad, ['--hwnd']),
     // Drift erkannt: Text liegt schon in der Zwischenablage, dem Nutzer den Strg+V-Hinweis melden.
     zeigeDriftHinweis: () => deps.fenster.melde(fokusDriftMeldung())
@@ -174,9 +276,16 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
     zeigeEinstellungen: () => deps.fenster.zeigeEinstellungen(),
     melde: (fehler, aktionen) => deps.fenster.melde(fehler, aktionen),
     // Teil-Erfolg: Rohtext in die Zwischenablage legen und liegen lassen (kein Restore — der Nutzer fügt
-    // selbst mit Strg+V ein). Bewusst KEIN Auto-Paste.
-    inZwischenablage: (text) => zwischenablage.schreib(text),
+    // selbst mit Strg+V ein). Bewusst KEIN Auto-Paste danach — der `Ausgabe`-Port `inZwischenablage`
+    // bleibt darum synchron `void`/fire-and-forget (F2): anders als bei `einfügen` folgt hier keine
+    // Drift-Prüfung/Paste-Strategie, die auf den Abschluss angewiesen wäre. Fehler crashen nicht
+    // (schreib() selbst fängt intern ab); trotzdem sichtbar loggen statt still zu verschlucken.
+    inZwischenablage: (text) => {
+      void zwischenablage.schreib(text).catch((err) => console.error('inZwischenablage fehlgeschlagen (ignoriert):', err))
+    },
     // Weg B (W3-A): Vordergrundfenster beim Auslösen erfassen (natives `--hwnd`). null = nicht erfassbar.
-    erfasseFenster: () => hwndVonHelfer(spawnSyncFn, helferPfad, ['--hwnd'])
+    // A1 (v0.6.0): async (spawn statt spawnSync) — sitzung.ts awaitet das bereits (starteWorkflow ist
+    // async), blockiert den Event-Loop beim Auslösen also nicht mehr.
+    erfasseFenster: () => hwndVonHelferAsync(spawnFn, helferPfad, ['--hwnd'])
   }
 }

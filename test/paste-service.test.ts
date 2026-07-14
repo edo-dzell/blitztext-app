@@ -5,7 +5,7 @@ function fakeZwischenablage(initial = '') {
   let inhalt = initial
   return {
     lies: () => inhalt,
-    schreib: (t: string) => {
+    schreib: async (t: string) => {
       inhalt = t
     }
   }
@@ -110,7 +110,7 @@ describe('createPasteService', () => {
     const ergebnis = await service.einfügen('eingefügt')
     if (!ergebnis.erfolg) throw new Error('sollte erfolgreich sein')
 
-    zwischenablage.schreib('etwas anderes vom Nutzer') // Nutzer kopiert zwischenzeitlich etwas
+    await zwischenablage.schreib('etwas anderes vom Nutzer') // Nutzer kopiert zwischenzeitlich etwas
     ergebnis.wiederherstellen()
 
     expect(zwischenablage.lies()).toBe('etwas anderes vom Nutzer') // NICHT überschrieben (Inhalts-Guard)
@@ -206,6 +206,131 @@ describe('createPasteService — Fokus-Drift (Weg B)', () => {
     })
 
     const ergebnis = await service.einfügen('text')
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(ergebnis).toMatchObject({ erfolg: true })
+  })
+})
+
+// F2 (Review R2, v0.6.0): Regressionsschutz für den Major-Befund — die A1-Umstellung von
+// `schreibUeberHelfer` auf spawn+Promise machte `Zwischenablage.schreib` fire-and-forget; der Service
+// startete Drift-Prüfung/Strategien, BEVOR das Schreiben abgeschlossen war. Bei langsamem Helfer
+// (AV-Scan o.ä.) landete so der ALTE Zwischenablage-Inhalt im Ziel-Fenster — still, ohne Fehler.
+describe('createPasteService — Reihenfolge: Zwischenablage-Schreiben VOR Drift-Prüfung/Strategien', () => {
+  /** Zwischenablage-Fake mit einem von außen steuerbaren, VERZÖGERTEN schreib() + Aufruf-Protokoll. */
+  function fakeVerzoegerteZwischenablage(initial = '') {
+    let inhalt = initial
+    const protokoll: string[] = []
+    let loeseAuf: (() => void) | undefined
+    return {
+      protokoll,
+      // Von außen aufgerufen, um den ausstehenden schreib()-Aufruf gezielt abzuschließen.
+      loeseSchreibenAuf: () => loeseAuf?.(),
+      api: {
+        lies: () => inhalt,
+        schreib: (t: string) =>
+          new Promise<void>((resolve) => {
+            protokoll.push(`schreib-start:${t}`)
+            loeseAuf = () => {
+              inhalt = t
+              protokoll.push(`schreib-ende:${t}`)
+              resolve()
+            }
+          })
+      }
+    }
+  }
+
+  it('Drift-Prüfung (aktuellesFenster) läuft erst NACH abgeschlossenem Zwischenablage-Schreiben', async () => {
+    const fake = fakeVerzoegerteZwischenablage('alt')
+    const helfer = strategie('helfer', true)
+
+    const service = createPasteService({
+      zwischenablage: fake.api,
+      strategien: [helfer.s],
+      zeigeManuellenHinweis: () => {},
+      aktuellesFenster: () => {
+        fake.protokoll.push('drift-pruefung')
+        return null
+      }
+    })
+
+    const einfuegenPromise = service.einfügen('neuer text', { fokusRueckkehr: true, erfasstesHwnd: 100 })
+
+    // Solange schreib() noch nicht aufgelöst ist, darf weder die Drift-Prüfung noch eine
+    // Einfüge-Strategie gelaufen sein (bei altem fire-and-forget-Code wäre das hier bereits verletzt).
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fake.protokoll).toEqual(['schreib-start:neuer text'])
+    expect(helfer.spy.aufrufe).toBe(0)
+
+    fake.loeseSchreibenAuf()
+    await einfuegenPromise
+
+    expect(fake.protokoll).toEqual(['schreib-start:neuer text', 'schreib-ende:neuer text', 'drift-pruefung'])
+    expect(helfer.spy.aufrufe).toBe(1)
+  })
+
+  it('Paste-Strategie startet erst NACH abgeschlossenem Zwischenablage-Schreiben (ohne Fokus-Kontext)', async () => {
+    const fake = fakeVerzoegerteZwischenablage('alt')
+    const helfer: { s: EinfügeStrategie; spy: { aufrufe: number } } = {
+      spy: { aufrufe: 0 },
+      s: {
+        name: 'helfer',
+        versuch: async () => {
+          fake.protokoll.push('strategie-versuch')
+          helfer.spy.aufrufe++
+          return true
+        }
+      }
+    }
+
+    const service = createPasteService({
+      zwischenablage: fake.api,
+      strategien: [helfer.s],
+      zeigeManuellenHinweis: () => {}
+    })
+
+    const einfuegenPromise = service.einfügen('text')
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fake.protokoll).toEqual(['schreib-start:text'])
+    expect(helfer.spy.aufrufe).toBe(0)
+
+    fake.loeseSchreibenAuf()
+    await einfuegenPromise
+
+    expect(fake.protokoll).toEqual(['schreib-start:text', 'schreib-ende:text', 'strategie-versuch'])
+  })
+
+  it('Regressionsschutz Fallback-Pfad: Helfer scheitert → clipboard.writeText-Fallback → Strategien laufen trotzdem', async () => {
+    // Simuliert paste-adapter.ts: schreibUeberHelfer() scheitert, der Fallback (clipboard.writeText)
+    // greift — die zurückgegebene Promise löst danach normal auf, der Service darf NICHT vor Abschluss
+    // des Fallbacks weiterlaufen.
+    let inhalt = 'alt'
+    const protokoll: string[] = []
+    const zwischenablage = {
+      lies: () => inhalt,
+      schreib: async (t: string) => {
+        protokoll.push('helfer-scheitert')
+        // Fallback, wie im echten Adapter: clipboard.writeText(text) im catch/Misserfolgs-Zweig.
+        await Promise.resolve()
+        inhalt = t
+        protokoll.push('fallback-writeText')
+      }
+    }
+    const helfer = strategie('helfer', true)
+
+    const service = createPasteService({
+      zwischenablage,
+      strategien: [helfer.s],
+      zeigeManuellenHinweis: () => {}
+    })
+
+    const ergebnis = await service.einfügen('text')
+
+    expect(protokoll).toEqual(['helfer-scheitert', 'fallback-writeText'])
+    expect(inhalt).toBe('text')
     expect(helfer.spy.aufrufe).toBe(1)
     expect(ergebnis).toMatchObject({ erfolg: true })
   })

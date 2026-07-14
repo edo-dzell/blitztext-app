@@ -273,6 +273,17 @@ export function resolveSystemPrompt(
     prompt = berechneterPrompt(def, settings)
   } else {
     prompt = def.systemPrompt
+    // v0.6.0 Option b, Bestandsschutz: nur explizit gesetzte Workflow-Felder, kein globaler Fallback
+    // (ADR-0022). Statische (nutzer-definierte) Workflows OHNE def.tone/def.emojiDensity bleiben damit
+    // byte-identisch zu vorher — anders als bei berechneterPrompt greift hier NIE settings.tone/
+    // settings.emojiDensity als Ersatz, sonst würde jeder bestehende statische Workflow beim nächsten
+    // Speichern plötzlich den globalen Ton/Emoji-Zusatz bekommen, den er nie angefordert hat.
+    if (def.tone) {
+      prompt += '\n' + TONE_LINES[def.tone]
+    }
+    if (def.emojiDensity && def.emojiDensity !== 'aus') {
+      prompt += '\n' + emojiDichteZeile(def.emojiDensity)
+    }
     if (settings.customTerms && settings.customTerms.length > 0) {
       prompt +=
         '\n\nWichtig: Diese Eigennamen und Fachbegriffe müssen exakt so geschrieben werden: ' +
@@ -349,6 +360,13 @@ const DENSITY_INSTRUCTIONS: Record<'wenig' | 'mittel' | 'viel', string> = {
   viel: 'Setze großzügig Emojis ein, gerne mehrere pro Satz.'
 }
 
+// v0.6.0 (Option b): aus buildEmojiPrompt extrahiert (DRY), damit resolveSystemPrompt dieselbe
+// Formulierung für den statischen Emoji-Merge nutzt. buildEmojiPrompt ruft sie unverändert weiter
+// auf → deren Output bleibt byte-identisch.
+function emojiDichteZeile(dichte: 'wenig' | 'mittel' | 'viel'): string {
+  return DENSITY_INSTRUCTIONS[dichte]
+}
+
 function buildEmojiPrompt(settings: RewriteSettings): string {
   const dichte = settings.emojiDensity ?? 'mittel'
   if (dichte === 'aus') {
@@ -360,7 +378,7 @@ function buildEmojiPrompt(settings: RewriteSettings): string {
   }
   return (
     'Du erhältst ein gesprochenes Transkript. Gib den Text möglichst originalgetreu zurück, aber ' +
-    `füge passende Emojis ein. ${DENSITY_INSTRUCTIONS[dichte]} Korrigiere offensichtliche Sprach- und ` +
+    `füge passende Emojis ein. ${emojiDichteZeile(dichte)} Korrigiere offensichtliche Sprach- und ` +
     'Grammatikfehler. Behalte den Stil und die Bedeutung bei. Gib NUR den Text mit Emojis zurück, keine Erklärungen.'
   )
 }

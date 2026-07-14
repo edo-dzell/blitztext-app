@@ -74,3 +74,38 @@ describe('preload theme.onSystemChanged (Abmeldung, S21-Rest)', () => {
     expect(cb2).toHaveBeenCalledWith(true)
   })
 })
+
+describe('preload workflowStatus.onChanged (C4, gleiches Muster wie history.onChanged)', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    ;(globalThis as unknown as { process: { contextIsolated: boolean } }).process = {
+      ...process,
+      contextIsolated: false
+    }
+  })
+
+  it('registriert einen Listener auf workflow:status und liefert eine Abmelde-Funktion', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      workflowStatus: { onChanged: (cb: (phase: unknown) => void) => () => void }
+    }
+
+    const cb = vi.fn()
+    const abmelden = api.workflowStatus.onChanged(cb)
+
+    expect(ipcRenderer.listenerCount('workflow:status')).toBe(1)
+
+    const phase = { status: 'aufnehmen' }
+    ipcRenderer.emit('workflow:status', {}, phase)
+    expect(cb).toHaveBeenCalledWith(phase)
+
+    abmelden()
+
+    expect(ipcRenderer.listenerCount('workflow:status')).toBe(0)
+
+    // Ein Event NACH der Abmeldung erreicht den Callback nicht mehr.
+    ipcRenderer.emit('workflow:status', {}, { status: 'fertig' })
+    expect(cb).toHaveBeenCalledTimes(1)
+  })
+})

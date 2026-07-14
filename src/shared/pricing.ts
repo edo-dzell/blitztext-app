@@ -5,39 +5,37 @@
 // v0.3 (P7): Die Default-Tabelle (PREISE) lässt sich nutzer-seitig per Overrides überschreiben
 // (Settings.preisOverrides) und der USD→EUR-Kurs ist editierbar (Settings.usdEurKurs). Alle neuen
 // Parameter sind OPTIONAL mit Default = Bestandsverhalten → byte-identische Altaufrufe.
+//
+// D3 (Strang-Konsolidierung): PREISE wird nicht mehr getrennt gepflegt, sondern aus der Modell-Registry
+// (providers.ts, Feld `ModellInfo.preis`) ABGELEITET (`preiseAusProvidernAbleiten`) → Drift-Schutz:
+// „welche Modelle gibt es" und „was kosten sie" leben an einer Stelle. ModellPreis zieht mit nach
+// providers.ts um; hier nur re-exportiert, damit bestehende Importe (`@shared/pricing`) unverändert
+// bleiben. Abhängigkeitsrichtung: pricing → providers (providers importiert nichts aus pricing).
 
-export interface ModellPreis {
-  /** ASR-Preis pro Audiominute (USD). */
-  asrProMinuteUsd?: number
-  /** Chat-Preis pro 1 Mio. Input-Token (USD). */
-  inputPro1MUsd?: number
-  /** Chat-Preis pro 1 Mio. Output-Token (USD). */
-  outputPro1MUsd?: number
-}
+import { PROVIDER, type ModellPreis } from './providers'
+
+export type { ModellPreis } from './providers'
 
 export type PreisTabelle = Record<string, ModellPreis>
 /** Nutzer-Overrides je Modell-Id (feldweise; gesetzte Felder gewinnen über die Default-Tabelle). */
 export type PreisOverrides = Record<string, ModellPreis>
 
-export const PREISE: PreisTabelle = {
-  // OpenAI (Transcribe-Preise als Minuten-Näherung — die ganze Tabelle ist eine Schätzung)
-  'whisper-1': { asrProMinuteUsd: 0.006 },
-  'gpt-4o-mini-transcribe': { asrProMinuteUsd: 0.003 },
-  'gpt-4o-transcribe': { asrProMinuteUsd: 0.006 },
-  'gpt-4o-mini': { inputPro1MUsd: 0.15, outputPro1MUsd: 0.6 },
-  'gpt-4o': { inputPro1MUsd: 2.5, outputPro1MUsd: 10.0 },
-  // Groq (Audio pro Stunde → pro Minute)
-  'whisper-large-v3': { asrProMinuteUsd: 0.111 / 60 },
-  'whisper-large-v3-turbo': { asrProMinuteUsd: 0.04 / 60 },
-  'llama-3.3-70b-versatile': { inputPro1MUsd: 0.59, outputPro1MUsd: 0.79 },
-  'llama-3.1-8b-instant': { inputPro1MUsd: 0.05, outputPro1MUsd: 0.08 },
-  // Mistral — Stand 2026-07, vor Rechnungsrelevanz prüfen. Quelle: https://mistral.ai/pricing/api/
-  // 'latest'-Alias löst aktuell auf: mistral-small-latest → Mistral Small 4, mistral-large-latest →
-  // Mistral Large 3, voxtral-mini-latest → Voxtral Mini Transcribe 2 (Transcriptions-Endpoint).
-  'mistral-small-latest': { inputPro1MUsd: 0.15, outputPro1MUsd: 0.6 },
-  'mistral-large-latest': { inputPro1MUsd: 0.5, outputPro1MUsd: 1.5 },
-  'voxtral-mini-latest': { asrProMinuteUsd: 0.003 }
+/**
+ * Leitet die Default-Preistabelle aus der Provider-Registry ab: iteriert alle ASR-/Chat-Modelle aller
+ * Anbieter (inkl. 'custom', dessen Kataloge aber leer sind) und sammelt die `preis`-Felder je
+ * Modell-Id. Modelle ohne `preis` tauchen NICHT in der Tabelle auf (kein Falschwert `{}`).
+ */
+export function preiseAusProvidernAbleiten(): PreisTabelle {
+  const out: PreisTabelle = {}
+  for (const provider of PROVIDER) {
+    for (const modell of [...provider.asrModelle, ...provider.chatModelle]) {
+      if (modell.preis) out[modell.id] = modell.preis
+    }
+  }
+  return out
 }
+
+export const PREISE: PreisTabelle = preiseAusProvidernAbleiten()
 
 // Feldweiser Merge: gesetzte Override-Felder gewinnen, fehlende behalten den Default (undefined-Felder
 // werden NICHT übernommen, damit ein Teil-Override nicht andere Felder löscht).

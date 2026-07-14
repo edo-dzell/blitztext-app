@@ -38,7 +38,7 @@ describe('pruefeAufUpdate — Opt-in-Gate', () => {
     const ergebnis = await pruefeAufUpdate({ optIn: false, lokaleVersion: LOKALE_VERSION, holer, speicher })
 
     expect(holer.fetch).not.toHaveBeenCalled()
-    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '' })
+    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '', neueVersion: undefined })
   })
 })
 
@@ -56,6 +56,21 @@ describe('pruefeAufUpdate — neues Release verfügbar', () => {
     expect(ergebnis.neuVerfuegbar).toBe(true)
     expect(ergebnis.aktuelleVersion).toBe(LOKALE_VERSION)
     expect(ergebnis.url).toBe('https://github.com/edo-dzell/blitztext-app-windows/releases/tag/v0.5.0')
+    // Bugfix (W2-F1): neueVersion = die REMOTE-Version (führendes „v" abgestreift), NICHT die lokale.
+    expect(ergebnis.neueVersion).toBe('0.5.0')
+  })
+
+  it('neueVersion bleibt unabhängig vom lokalen "v"-Präfix im Tag konsistent (kein doppeltes "v")', async () => {
+    const holer = fakeHolerMitAntwort({
+      status: 200,
+      body: { tag_name: 'V0.9.9', html_url: 'https://example.test/release' }
+    })
+    const speicher = fakeSpeicher()
+
+    const ergebnis = await pruefeAufUpdate({ optIn: true, lokaleVersion: LOKALE_VERSION, holer, speicher })
+
+    expect(ergebnis.neuVerfuegbar).toBe(true)
+    expect(ergebnis.neueVersion).toBe('0.9.9')
   })
 
   it('speichert den Cache-Eintrag inkl. ETag nach einem erfolgreichen Abruf', async () => {
@@ -82,7 +97,7 @@ describe('pruefeAufUpdate — kein neues Release', () => {
 
     const ergebnis = await pruefeAufUpdate({ optIn: true, lokaleVersion: LOKALE_VERSION, holer, speicher })
 
-    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '' })
+    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '', neueVersion: undefined })
   })
 
   it('ältere Remote-Version (Downgrade-Tag/Draft eines alten Releases) ⇒ false', async () => {
@@ -93,6 +108,7 @@ describe('pruefeAufUpdate — kein neues Release', () => {
 
     expect(ergebnis.neuVerfuegbar).toBe(false)
     expect(ergebnis.url).toBe('')
+    expect(ergebnis.neueVersion).toBeUndefined()
   })
 
   it('semver-Edge: 0.5.0 vs 0.5.0 (lokal bereits die neueste) ⇒ false', async () => {
@@ -121,7 +137,7 @@ describe('pruefeAufUpdate — Robustheit', () => {
 
     const ergebnis = await pruefeAufUpdate({ optIn: true, lokaleVersion: LOKALE_VERSION, holer, speicher })
 
-    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '' })
+    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '', neueVersion: undefined })
   })
 
   it('Rate-Limit (403) ⇒ still false, kein Cache-Schreiben (nächster Start darf erneut fragen)', async () => {
@@ -148,7 +164,7 @@ describe('pruefeAufUpdate — Robustheit', () => {
 
     const ergebnis = await pruefeAufUpdate({ optIn: true, lokaleVersion: LOKALE_VERSION, holer, speicher })
 
-    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '' })
+    expect(ergebnis).toEqual({ aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: false, url: '', neueVersion: undefined })
   })
 
   it('unerwartete Antwort-Form (kein tag_name) ⇒ still false', async () => {
@@ -158,6 +174,7 @@ describe('pruefeAufUpdate — Robustheit', () => {
     const ergebnis = await pruefeAufUpdate({ optIn: true, lokaleVersion: LOKALE_VERSION, holer, speicher })
 
     expect(ergebnis.neuVerfuegbar).toBe(false)
+    expect(ergebnis.neueVersion).toBeUndefined()
   })
 
   it('kaputter/nicht lesbarer Cache (lesen() wirft) ⇒ wie „kein Cache" behandelt, kein Absturz', async () => {
@@ -170,6 +187,7 @@ describe('pruefeAufUpdate — Robustheit', () => {
     const ergebnis = await pruefeAufUpdate({ optIn: true, lokaleVersion: LOKALE_VERSION, holer, speicher })
 
     expect(ergebnis.neuVerfuegbar).toBe(true)
+    expect(ergebnis.neueVersion).toBe('0.5.0')
   })
 })
 
@@ -194,6 +212,35 @@ describe('pruefeAufUpdate — Cache verhindert Doppelabfrage', () => {
     expect(holer.fetch).not.toHaveBeenCalled()
     expect(ergebnis.url).toBe('https://example.test/cached') // gecachtes Ergebnis unverändert geliefert
     expect(ergebnis.neuVerfuegbar).toBe(true)
+    // Cache-Eintrag im ALTEN Schema (ohne neueVersion, z. B. von vor diesem Bugfix geschrieben) →
+    // kein Crash, liefert einfach undefined statt einer falschen Versionsnummer.
+    expect(ergebnis.neueVersion).toBeUndefined()
+  })
+
+  it('frischer Cache MIT neueVersion (neues Schema) ⇒ wird unverändert durchgereicht (Roundtrip)', async () => {
+    const holer = fakeHolerMitAntwort({ status: 200, body: { tag_name: 'v0.9.0', html_url: 'https://example.test/release' } })
+    const speicher = fakeSpeicher({
+      geprueftAmMs: 1_000,
+      etag: 'W/"alt"',
+      letztesErgebnis: {
+        aktuelleVersion: LOKALE_VERSION,
+        neuVerfuegbar: true,
+        url: 'https://example.test/cached',
+        neueVersion: '0.9.0'
+      }
+    })
+
+    const ergebnis = await pruefeAufUpdate({
+      optIn: true,
+      lokaleVersion: LOKALE_VERSION,
+      holer,
+      speicher,
+      jetztMs: () => 1_000 + 60_000,
+      mindestabstandMs: 24 * 60 * 60 * 1000
+    })
+
+    expect(holer.fetch).not.toHaveBeenCalled()
+    expect(ergebnis.neueVersion).toBe('0.9.0')
   })
 
   it('abgelaufener Cache (Mindestabstand überschritten) ⇒ fragt erneut', async () => {
@@ -214,6 +261,7 @@ describe('pruefeAufUpdate — Cache verhindert Doppelabfrage', () => {
 
     expect(holer.fetch).toHaveBeenCalledTimes(1)
     expect(ergebnis.url).toBe('https://example.test/neu')
+    expect(ergebnis.neueVersion).toBe('0.6.0')
   })
 
   it('304 Not Modified (ETag bestätigt) ⇒ übernimmt gecachtes Ergebnis, aktualisiert Zeitstempel', async () => {
@@ -221,7 +269,12 @@ describe('pruefeAufUpdate — Cache verhindert Doppelabfrage', () => {
     const speicher = fakeSpeicher({
       geprueftAmMs: 0,
       etag: 'W/"stabil"',
-      letztesErgebnis: { aktuelleVersion: LOKALE_VERSION, neuVerfuegbar: true, url: 'https://example.test/bereits-bekannt' }
+      letztesErgebnis: {
+        aktuelleVersion: LOKALE_VERSION,
+        neuVerfuegbar: true,
+        url: 'https://example.test/bereits-bekannt',
+        neueVersion: '0.7.0'
+      }
     })
 
     const ergebnis = await pruefeAufUpdate({
@@ -235,7 +288,9 @@ describe('pruefeAufUpdate — Cache verhindert Doppelabfrage', () => {
 
     expect(ergebnis.url).toBe('https://example.test/bereits-bekannt')
     expect(ergebnis.neuVerfuegbar).toBe(true)
+    expect(ergebnis.neueVersion).toBe('0.7.0') // Roundtrip: 304 übernimmt neueVersion aus dem Cache
     expect(speicher.eintrag?.geprueftAmMs).toBe(99_999) // Zeitstempel aufgefrischt
+    expect(speicher.eintrag?.letztesErgebnis.neueVersion).toBe('0.7.0') // bleibt auch beim Neu-Schreiben erhalten
   })
 
   it('sendet den gespeicherten ETag als If-None-Match-Header bei erneutem Abruf', async () => {

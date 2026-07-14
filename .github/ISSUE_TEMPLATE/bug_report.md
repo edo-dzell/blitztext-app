@@ -26,7 +26,7 @@ Was ist stattdessen passiert?
 
 ## Umgebung
 
-- **Blitztext-Version:** (z. B. v0.5.0 — siehe „Über“ in der App oder der Release-Tag der `.exe`)
+- **Blitztext-Version:** (z. B. v0.6.0 — siehe „Über“ in der App oder der Release-Tag der `.exe`)
 - **Windows-Version:** (z. B. Windows 11 23H2 — `winver` eingeben)
 - **Genutzter Anbieter:** (OpenAI / Groq / Mistral / eigener OpenAI-kompatibler oder lokaler
   Endpunkt — kein Key oder Endpunkt-URL nötig, nur der Typ reicht)

@@ -161,6 +161,107 @@ describe('resolveSystemPrompt (V2 Strang C)', () => {
   })
 })
 
+describe('Ton/Emoji-Merge bei statischen Prompts (v0.6.0, Option b)', () => {
+  // Bestandsschutz: NUR def.tone/def.emojiDensity lösen den Merge aus, NIEMALS der globale
+  // settings.tone/settings.emojiDensity-Fallback — sonst würden bestehende statische Workflows ohne
+  // gesetzte Felder plötzlich beim nächsten Speichern einen ungewollten Ton-/Emoji-Zusatz bekommen.
+  const basis: WorkflowDefinition = {
+    id: 'x',
+    label: 'x',
+    summary: '',
+    builtin: false,
+    rewrites: true,
+    promptModus: 'statisch',
+    systemPrompt: 'Basis.',
+    model: '',
+    temperature: 0.3
+  }
+
+  it('statisch + def.tone gesetzt: Ton-Zeile ist enthalten', () => {
+    const def: WorkflowDefinition = { ...basis, tone: 'formal' }
+    const prompt = resolveSystemPrompt(def)
+    expect(prompt).toContain('formellen, professionellen Ton')
+  })
+
+  it('statisch OHNE def.tone: KEINE Ton-Zeile — Prompt beginnt exakt mit def.systemPrompt (Bestandsschutz)', () => {
+    const prompt = resolveSystemPrompt(basis)
+    expect(prompt.startsWith('Basis.')).toBe(true)
+    expect(prompt).not.toContain('professionellen Ton')
+    expect(prompt).not.toContain('neutralen, klaren Ton')
+    expect(prompt).not.toContain('lockeren, natürlichen Ton')
+  })
+
+  it('statisch OHNE def.tone: der globale settings.tone-Fallback wirkt NICHT (Bestandsschutz)', () => {
+    // Anders als bei berechneterPrompt darf hier settings.tone NICHT einspringen.
+    const prompt = resolveSystemPrompt(basis, { tone: 'casual' })
+    expect(prompt).not.toContain('lockeren, natürlichen Ton')
+  })
+
+  it('statisch + def.emojiDensity "mittel": Emoji-Zeile ist enthalten', () => {
+    const def: WorkflowDefinition = { ...basis, emojiDensity: 'mittel' }
+    const prompt = resolveSystemPrompt(def)
+    expect(prompt).toContain('etwa alle 1-2 Sätze')
+  })
+
+  it('statisch + def.emojiDensity "aus": KEINE Emoji-Zeile', () => {
+    const def: WorkflowDefinition = { ...basis, emojiDensity: 'aus' }
+    const prompt = resolveSystemPrompt(def)
+    expect(prompt).not.toContain('Setze')
+  })
+
+  it('statisch OHNE def.emojiDensity: KEINE Emoji-Zeile — auch nicht über den globalen Fallback', () => {
+    const prompt = resolveSystemPrompt(basis, { emojiDensity: 'viel' })
+    expect(prompt).not.toContain('Setze')
+    expect(prompt.startsWith('Basis.')).toBe(true)
+  })
+
+  it('Ordnung: Ton/Emoji-Zeilen stehen VOR dem customTerms-Anhang', () => {
+    const def: WorkflowDefinition = { ...basis, tone: 'neutral', emojiDensity: 'wenig' }
+    const prompt = resolveSystemPrompt(def, { customTerms: ['Acme'] })
+    const tonPos = prompt.indexOf('neutralen, klaren Ton')
+    const emojiPos = prompt.indexOf('maximal 1-2 pro Absatz')
+    const begriffePos = prompt.indexOf('Eigennamen und Fachbegriffe')
+    expect(tonPos).toBeGreaterThan(-1)
+    expect(emojiPos).toBeGreaterThan(tonPos)
+    expect(begriffePos).toBeGreaterThan(emojiPos)
+  })
+
+  it('Kombination Ton+Emoji+customTerms+ausgabeSprache: DATEN_RAHMEN bleibt der letzte Block', () => {
+    const def: WorkflowDefinition = {
+      ...basis,
+      tone: 'formal',
+      emojiDensity: 'viel',
+      ausgabeSprache: 'en'
+    }
+    const prompt = resolveSystemPrompt(def, { customTerms: ['Widget'] })
+    expect(prompt.startsWith('Basis.')).toBe(true)
+    expect(prompt).toContain('formellen, professionellen Ton')
+    expect(prompt).toContain('mehrere pro Satz')
+    expect(prompt).toContain('Eigennamen und Fachbegriffe müssen exakt so geschrieben werden: Widget')
+    expect(prompt).toContain('AUSSCHLIESSLICH auf Englisch')
+    // DATEN_RAHMEN muss der ALLERLETZTE Block bleiben (Rezenz-Anti-Injection, ADR-0018).
+    const rahmenStart = prompt.indexOf('Der zu bearbeitende Text steht zwischen')
+    expect(rahmenStart).toBeGreaterThan(-1)
+    expect(prompt.endsWith(prompt.slice(rahmenStart))).toBe(true)
+    expect(prompt.indexOf(RAHMEN_MARKER)).toBeGreaterThan(rahmenStart)
+  })
+
+  it('berechnet-Pfad bleibt unverändert (Regression): identisch zu buildSystemPrompt + Rahmen', () => {
+    const improve = getWorkflow('improve', BUILTIN_WORKFLOWS)
+    const settings = { tone: 'casual' as const, emojiDensity: 'wenig' as const }
+    const aufgeloest = resolveSystemPrompt(improve, settings)
+    expect(aufgeloest.startsWith(buildSystemPrompt('improve', settings))).toBe(true)
+    expect(aufgeloest).toContain(RAHMEN_MARKER)
+  })
+
+  it('buildEmojiPrompt bleibt byte-identisch (Regression der DRY-Extraktion emojiDichteZeile)', () => {
+    expect(buildSystemPrompt('emoji', { emojiDensity: 'wenig' })).toContain('maximal 1-2 pro Absatz')
+    expect(buildSystemPrompt('emoji', { emojiDensity: 'mittel' })).toContain('etwa alle 1-2 Sätze')
+    expect(buildSystemPrompt('emoji', { emojiDensity: 'viel' })).toContain('mehrere pro Satz')
+    expect(buildSystemPrompt('emoji', { emojiDensity: 'aus' })).toContain('OHNE')
+  })
+})
+
 describe('Built-in-Prompt-Edit (#24)', () => {
   it('wandleAufStatisch füllt den statischen Prompt mit dem berechneten Text', () => {
     const improve = getWorkflow('improve', BUILTIN_WORKFLOWS)

@@ -10,7 +10,7 @@ import {
   type PreisOverrides
 } from '@shared/pricing'
 import { preisModellListen } from '@/lib/preis-modelle'
-import { tiefGleich } from '@/lib/dirty'
+import { preiseGeaendert } from '@/lib/dirty'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -204,9 +204,13 @@ function PreisePane({ settings, speichern }: Props) {
 
   const kursNum = Number(kurs)
   const kursGueltig = Number.isFinite(kursNum) && kursNum > 0
-  const geaendert =
-    !tiefGleich(overrides, settings.preisOverrides) ||
-    (kursGueltig && kursNum !== settings.usdEurKurs)
+  const geaendert = preiseGeaendert(
+    overrides,
+    settings.preisOverrides,
+    kursNum,
+    kursGueltig,
+    settings.usdEurKurs
+  )
 
   useEffect(() => registriereDirty('preise', () => geaendert), [registriereDirty, geaendert])
 

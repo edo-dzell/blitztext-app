@@ -14,10 +14,11 @@ import { berechneKaltstart } from '@/lib/kaltstart'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useTheme } from '@/lib/use-theme'
+import { useWorkflowStatus } from '@/lib/use-workflow-status'
 import { useHinweis } from '@/components/Hinweis'
 import { useNavGuard } from '@/components/NavGuard'
-import EinstellungenView from './views/EinstellungenView'
-import WorkflowsView from './views/WorkflowsView'
+import EinstellungenView from './views/einstellungen/EinstellungenView'
+import WorkflowsView from './views/workflows/WorkflowsView'
 import VerlaufView from './views/VerlaufView'
 import StatistikView from './views/StatistikView'
 import HilfeView from './views/HilfeView'
@@ -49,6 +50,7 @@ export default function App() {
   const [hilfeTopic, setHilfeTopic] = useState<string | undefined>(undefined)
 
   useTheme(settings?.theme)
+  const workflowStatus = useWorkflowStatus()
   const zeige = useHinweis()
   const { versucheNavigation } = useNavGuard()
 
@@ -59,11 +61,22 @@ export default function App() {
   // Gemeinsamer Speicherpfad (Workflows/Einstellungen/Verlauf) → generischer Erfolg-/Fehler-Toast (P6).
   // Fehler werden hier abgefangen (heute schweigt die App bei Speicherfehlern); kein Rethrow, damit
   // der Busy-Zustand der Aufrufer sauber zurückgesetzt wird.
-  async function speichern(next: BlitztextSettings): Promise<void> {
+  // A4b: Läuft gerade eine Aufnahme, verschiebt der Main-Prozess die Übernahme der Einstellungen bis
+  // zu deren Ende und liefert dafür `false` zurück — WICHTIG: strikt `=== false` prüfen (nicht falsy!),
+  // denn bis der parallele Main-Agent den Handler entsprechend erweitert hat, ist der Rückgabewert zur
+  // Laufzeit `undefined` (Altverhalten = sofort übernommen, kein Info-Toast).
+  // `opts.still` unterdrückt jeden Toast (Vorleistung für den Verlauf-Agenten: automatische
+  // Zwischenspeicherungen sollen nicht bei jedem Tastendruck aufploppen).
+  async function speichern(next: BlitztextSettings, opts?: { still?: boolean }): Promise<void> {
     try {
-      await window.blitztext.settings.save(next)
+      const uebernommen = await window.blitztext.settings.save(next)
       setSettings(next)
-      zeige('Gespeichert.', 'erfolg')
+      if (opts?.still) return
+      if (uebernommen === false) {
+        zeige('Gespeichert — wird nach der laufenden Aufnahme übernommen.', 'info')
+      } else {
+        zeige('Gespeichert.', 'erfolg')
+      }
     } catch (err) {
       zeige(`Speichern fehlgeschlagen: ${err instanceof Error ? err.message : String(err)}`, 'fehler')
     }
@@ -118,17 +131,27 @@ export default function App() {
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex shrink-0 items-center justify-between border-b px-8 py-5">
           <h1 className="text-xl font-semibold tracking-tight">{TITEL[section]}</h1>
-          {section !== 'about' && section !== 'help' && (
-            <button
-              type="button"
-              onClick={() => oeffneHilfe(section)}
-              title="Hilfe zu dieser Seite"
-              aria-label="Hilfe zu dieser Seite"
-              className="cursor-pointer rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground"
-            >
-              <HelpCircle className="size-5" />
-            </button>
-          )}
+          <div className="flex items-center gap-3">
+            {/* C4: dezenter Live-Indikator — nur sichtbar, während eine Aufnahme/Verarbeitung läuft
+                (workflow:status aus dem Main-Prozess). Rein informativ, kein interaktives Element. */}
+            {workflowStatus.sichtbar && (
+              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <span className="size-2 animate-pulse rounded-full bg-emerald-500" aria-hidden />
+                <span>{workflowStatus.label}</span>
+              </div>
+            )}
+            {section !== 'about' && section !== 'help' && (
+              <button
+                type="button"
+                onClick={() => oeffneHilfe(section)}
+                title="Hilfe zu dieser Seite"
+                aria-label="Hilfe zu dieser Seite"
+                className="cursor-pointer rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-foreground"
+              >
+                <HelpCircle className="size-5" />
+              </button>
+            )}
+          </div>
         </header>
         {zweiEbenen ? (
           <div className="min-h-0 flex-1">

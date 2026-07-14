@@ -77,7 +77,7 @@ export default function ZweiEbenenShell({
                   type="button"
                   title="Löschen"
                   onClick={e.onLoeschen}
-                  className="mr-1 shrink-0 cursor-pointer rounded p-1.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+                  className="mr-1 shrink-0 cursor-pointer rounded p-1.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100 group-focus-within:opacity-100"
                 >
                   <Trash2 className="size-4" />
                 </button>

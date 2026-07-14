@@ -8,14 +8,20 @@ import {
   type ReactNode
 } from 'react'
 import { cn } from '@/lib/utils'
+import { blendetAutomatischAus, istDringend } from '@/lib/hinweis-verhalten'
 
 // App-weite Toasts (P6) — handgerollt nach dem Bestaetigung.tsx-Muster (Context + Overlay, keine Deps).
 // Für OPERATIONSERGEBNISSE (gespeichert/gelöscht/zurückgesetzt/Key getestet …), NICHT für laufende
-// Validierungs-Zustände (die bleiben inline). Erfolg blendet automatisch aus; Fehler bleibt stehen
-// (manuell schließen). Zwei Live-Regionen für Barrierefreiheit: status (höflich) / alert (bestimmt).
+// Validierungs-Zustände (die bleiben inline). Erfolg/Info blenden automatisch aus; Fehler bleibt stehen
+// (manuell schließen). Zwei Live-Regionen für Barrierefreiheit: status (höflich, erfolg+info) / alert
+// (bestimmt, fehler). Die Verzweigungslogik (welcher Typ blendet aus/ist dringend) sitzt in
+// lib/hinweis-verhalten.ts, isoliert testbar.
 // Nutzung: const zeige = useHinweis(); zeige('Gespeichert.', 'erfolg').
 
-export type HinweisTyp = 'erfolg' | 'fehler'
+// A4b: 'info' ist für NEUTRALE Hinweise ohne Erfolg-/Fehler-Wertung (z. B. „wird nach der laufenden
+// Aufnahme übernommen") — verhält sich wie 'erfolg' (blendet aus, status-Live-Region), nur die
+// Darstellung ist neutral statt grün.
+export type HinweisTyp = 'erfolg' | 'info' | 'fehler'
 
 interface Hinweis {
   id: string
@@ -48,8 +54,8 @@ export function HinweisProvider({ children }: { children: ReactNode }) {
     (text: string, typ: HinweisTyp = 'erfolg') => {
       const id = globalThis.crypto.randomUUID()
       setHinweise((hs) => [...hs, { id, text, typ }])
-      // Erfolg blendet automatisch aus; Fehler bleibt (manuell schließen).
-      if (typ === 'erfolg') {
+      // Erfolg/Info blenden automatisch aus; Fehler bleibt (manuell schließen).
+      if (blendetAutomatischAus(typ)) {
         timers.current.set(
           id,
           setTimeout(() => entfernen(id), ERFOLG_MS)
@@ -68,20 +74,21 @@ export function HinweisProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  const erfolge = hinweise.filter((h) => h.typ === 'erfolg')
-  const fehler = hinweise.filter((h) => h.typ === 'fehler')
+  // status (höflich) bekommt alles NICHT-Dringende (erfolg + info); alert (bestimmt) nur Fehler.
+  const nichtDringend = hinweise.filter((h) => !istDringend(h.typ))
+  const dringend = hinweise.filter((h) => istDringend(h.typ))
 
   return (
     <Ctx.Provider value={zeige}>
       {children}
       <div className="pointer-events-none fixed bottom-4 right-4 z-[200] flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2">
         <div role="status" aria-live="polite" className="flex flex-col gap-2">
-          {erfolge.map((h) => (
+          {nichtDringend.map((h) => (
             <ToastKarte key={h.id} hinweis={h} onClose={() => entfernen(h.id)} />
           ))}
         </div>
         <div role="alert" aria-live="assertive" className="flex flex-col gap-2">
-          {fehler.map((h) => (
+          {dringend.map((h) => (
             <ToastKarte key={h.id} hinweis={h} onClose={() => entfernen(h.id)} />
           ))}
         </div>
@@ -91,16 +98,21 @@ export function HinweisProvider({ children }: { children: ReactNode }) {
 }
 
 function ToastKarte({ hinweis, onClose }: { hinweis: Hinweis; onClose: () => void }) {
+  const symbol = hinweis.typ === 'erfolg' ? '✓' : hinweis.typ === 'info' ? 'ℹ' : '!'
   return (
     <div className="pointer-events-auto flex items-start gap-2 rounded-md border bg-card px-4 py-3 text-sm text-card-foreground shadow-lg">
       <span
         aria-hidden
         className={cn(
           'mt-px shrink-0 font-bold',
-          hinweis.typ === 'erfolg' ? 'text-success' : 'text-destructive'
+          hinweis.typ === 'erfolg' && 'text-success',
+          // Kein info-Farbtoken im Theme (index.css hat nur --success/--destructive/--warning) →
+          // Fallback text-sky-600/dark:text-sky-400, siehe Report.
+          hinweis.typ === 'info' && 'text-sky-600 dark:text-sky-400',
+          hinweis.typ === 'fehler' && 'text-destructive'
         )}
       >
-        {hinweis.typ === 'erfolg' ? '✓' : '!'}
+        {symbol}
       </span>
       <span className="min-w-0 flex-1">{hinweis.text}</span>
       <button
