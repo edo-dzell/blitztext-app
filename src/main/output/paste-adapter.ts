@@ -15,6 +15,10 @@
 // Behoben: `Zwischenablage.schreib` gibt jetzt `Promise<void>` zurück; `paste-service.ts` awaitet es
 // VOR der Drift-Prüfung. Betrifft NUR das Schreiben vor dem Paste — `inZwischenablage` (Teil-Erfolg,
 // kein nachfolgender Paste) bleibt bewusst synchron `void`/fire-and-forget.
+// A2 (v0.7.3): `schreibUeberHelfer` gegen einen weggerissenen Helfer-Prozess (Task-Manager-Kill/Crash)
+// gehärtet — ein stdin-'error'-Listener + write-Fehler-Callback + try/catch fangen EPIPE/
+// ERR_STREAM_DESTROYED ab (sonst uncaughtException → App-Absturz); Degradation läuft über den
+// bestehenden clipboard.writeText-Fallback, geloggt als `paste.helfer_stdin_fehl` (text-frei).
 // Nicht headless verifizierbar (Electron clipboard + spawn) — Laufzeit-Abnahme auf Windows. Die neue
 // `hwndVonHelferAsync`-Logik ist als eigene, exportierte Funktion mit injizierbarem spawnFn isoliert
 // testbar (siehe test/paste-adapter-hwnd.test.ts).
@@ -225,8 +229,40 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
           clearTimeout(timer)
           resolve(code === 0)
         })
-        kind.stdin?.write(text)
-        kind.stdin?.end()
+        // A2 (v0.7.3): EPIPE-Härtung. Wird der Helfer-Prozess weggerissen (Task-Manager-Kill, Crash),
+        // während wir noch in stdin schreiben, feuert stdin ein 'error'-Ereignis (EPIPE/
+        // ERR_STREAM_DESTROYED). OHNE eigenen Listener eskaliert Node das zu einer uncaughtException →
+        // App-Absturz. Hier abfangen: gleiche erledigt-Guard/clearTimeout-Mechanik wie exit/error, dann
+        // sauber als Fehlschlag auflösen (der Aufrufer fällt auf clipboard.writeText zurück). Nur der
+        // Umstand wird geloggt, NIE der Text (Redaction).
+        kind.stdin?.on('error', () => {
+          if (erledigt) return
+          erledigt = true
+          clearTimeout(timer)
+          log.warnung('paste.helfer_stdin_fehl')
+          resolve(false)
+        })
+        // write kann synchron werfen (ERR_STREAM_DESTROYED, wenn stdin schon zerstört ist) ODER den
+        // Fehler asynchron an den Callback reichen — beides führt in den identischen Degradations-Pfad
+        // wie das 'error'-Ereignis oben (idempotent über die erledigt-Guard). try/catch fängt den
+        // synchronen Wurf; der Callback fängt die asynchrone Variante.
+        try {
+          kind.stdin?.write(text, (fehler) => {
+            if (!fehler) return
+            if (erledigt) return
+            erledigt = true
+            clearTimeout(timer)
+            log.warnung('paste.helfer_stdin_fehl')
+            resolve(false)
+          })
+          kind.stdin?.end()
+        } catch {
+          if (erledigt) return
+          erledigt = true
+          clearTimeout(timer)
+          log.warnung('paste.helfer_stdin_fehl')
+          resolve(false)
+        }
       } catch {
         resolve(false)
       }

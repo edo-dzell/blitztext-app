@@ -10,6 +10,12 @@ import { EventEmitter } from 'node:events'
 import { ipcMain } from 'electron'
 import { createRecorder } from '@main/recording/recorder-adapter'
 
+// v0.7.3 (A1): createRecorder registriert einen DAUERHAFTEN 'recorder:error'-Listener. Der Fake-ipcMain
+// wird über die ganze Datei geteilt, sodass die vielen createRecorder-Aufrufe die 10er-Default-Grenze
+// überschreiten (reines Test-Artefakt: die echte App hat einen einzigen Recorder). Limit anheben, damit
+// keine MaxListenersExceededWarning die Testausgabe verrauscht.
+;(ipcMain as unknown as EventEmitter).setMaxListeners(100)
+
 function fakeFenster() {
   return { webContents: { send: vi.fn() } } as never
 }
@@ -98,17 +104,23 @@ describe('createRecorder', () => {
   })
 
   it('render-process-gone während wartendem stop() → Promise rejected + Listener aufgeräumt', async () => {
+    const ee = ipcMain as unknown as EventEmitter
     const fenster = fakeFensterMitEvents()
+    // v0.7.3 (A1): createRecorder registriert jetzt EINEN dauerhaften 'recorder:error'-Listener
+    // (externer Aufnahme-Fehlerkanal), der die stop()-Lebensdauer überdauert. Der Fake-ipcMain wird über
+    // die ganze Datei geteilt, also Baseline JETZT (nach createRecorder) messen und Deltas prüfen.
     const recorder = createRecorder(fenster as never)
+    const fehlerBasis = ee.listenerCount('recorder:error') // = dauerhafte Listener inkl. dem neuen
     const stopP = recorder.stop()
 
     // Renderer stirbt (Crash) → das Event muss den wartenden stop() auflösen.
     fenster.webContents.emit('render-process-gone', {}, { reason: 'crashed' })
 
     await expect(stopP).rejects.toThrow()
-    // Keine verwaisten once-Listener auf ipcMain zurückgelassen.
-    expect((ipcMain as unknown as EventEmitter).listenerCount('recorder:result')).toBe(0)
-    expect((ipcMain as unknown as EventEmitter).listenerCount('recorder:error')).toBe(0)
+    // Keine verwaisten once-Listener auf ipcMain zurückgelassen — der once('recorder:result') ist weg,
+    // und der once('recorder:error') des stop() ist weg (nur der dauerhafte Listener bleibt, Delta 0).
+    expect(ee.listenerCount('recorder:result')).toBe(0)
+    expect(ee.listenerCount('recorder:error')).toBe(fehlerBasis)
   })
 
   it('destroyed-Event während wartendem stop() → Promise rejected', async () => {
@@ -123,8 +135,11 @@ describe('createRecorder', () => {
 
   it('Doppel-stop(): zweiter Aufruf löst keine verwaisten once-Listener aus; keiner hängt für immer', async () => {
     const fenster = fakeFensterMitEvents()
-    const recorder = createRecorder(fenster as never)
     const ee = ipcMain as unknown as EventEmitter
+    const recorder = createRecorder(fenster as never)
+    // v0.7.3 (A1): der dauerhafte externe 'recorder:error'-Listener zählt fortan mit → Baseline messen
+    // und Deltas prüfen (der geteilte Fake-ipcMain akkumuliert sonst über die Datei).
+    const fehlerBasis = ee.listenerCount('recorder:error')
 
     const erst = recorder.stop()
     // Der erste stop() muss durch den zweiten sauber abgelöst werden (AbortError), nicht hängen bleiben.
@@ -132,9 +147,10 @@ describe('createRecorder', () => {
     const zweit = recorder.stop()
 
     // Kein Listener-Leak: der abgelöste erste stop() darf seine once-Listener nicht zurücklassen —
-    // nur je EIN offener Listener pro Kanal (der des zweiten stop()).
+    // nur je EIN offener once-Listener pro Kanal (der des zweiten stop()); bei recorder:error zusätzlich
+    // der dauerhafte externe Listener (Baseline), daher Delta +1.
     expect(ee.listenerCount('recorder:result')).toBe(1)
-    expect(ee.listenerCount('recorder:error')).toBe(1)
+    expect(ee.listenerCount('recorder:error')).toBe(fehlerBasis + 1)
 
     ee.emit('recorder:result', {}, {
       buffer: new ArrayBuffer(2),
@@ -145,8 +161,65 @@ describe('createRecorder', () => {
     expect(await erstErgebnis).toBe('rejected') // erster stop() abgelöst → kein Hänger
     await expect(zweit).resolves.toBeDefined() // zweiter stop() liefert das Ergebnis
 
-    // Am Ende keine verwaisten Listener.
+    // Am Ende keine verwaisten once-Listener mehr — nur der dauerhafte externe Listener bleibt (Baseline).
     expect(ee.listenerCount('recorder:result')).toBe(0)
-    expect(ee.listenerCount('recorder:error')).toBe(0)
+    expect(ee.listenerCount('recorder:error')).toBe(fehlerBasis)
+  })
+
+  // --- v0.7.3 (A1): dauerhafter externer Aufnahme-Fehlerkanal (recorder:error außerhalb von stop()) ---
+
+  it('externer recorder:error OHNE laufenden stop() → onFehler-Callback wird mit der Meldung gerufen', () => {
+    const ee = ipcMain as unknown as EventEmitter
+    const recorder = createRecorder(fakeFenster())
+    const gemeldet: string[] = []
+    recorder.onFehler?.((m) => gemeldet.push(m))
+
+    // Aufnahme läuft (kein stop() aktiv), das Mikrofon fällt aus → der Renderer sendet recorder:error.
+    ee.emit('recorder:error', {}, 'Mikrofon exklusiv belegt')
+
+    expect(gemeldet).toEqual(['Mikrofon exklusiv belegt'])
+  })
+
+  it('externer recorder:error WÄHREND eines wartenden stop() → NUR der stop()-Reject, KEINE Doppelmeldung', async () => {
+    const ee = ipcMain as unknown as EventEmitter
+    const recorder = createRecorder(fakeFenster())
+    const gemeldet: string[] = []
+    recorder.onFehler?.((m) => gemeldet.push(m))
+
+    const stopP = recorder.stop() // stop läuft → der dauerhafte Listener muss sich raushalten (stopLaeuft)
+    ee.emit('recorder:error', {}, 'Aufnahme kaputt')
+
+    await expect(stopP).rejects.toThrow(/Aufnahme kaputt/)
+    // Der stop()-once-Listener hat den Fehler verarbeitet; der externe Callback DARF nicht auch feuern.
+    expect(gemeldet).toEqual([])
+  })
+
+  it('start(): sendeSicher schlägt fehl (zerstörtes Fenster) → onFehler meldet „Aufnahme-Fenster nicht verfügbar."', () => {
+    const fenster = fakeFensterMitEvents()
+    fenster.destroyed = true
+    fenster.webContents.destroyed = true
+    const recorder = createRecorder(fenster as never)
+    const gemeldet: string[] = []
+    recorder.onFehler?.((m) => gemeldet.push(m))
+
+    recorder.start() // send scheitert → der Nutzer bekäme sonst nie ein stop()-Ergebnis
+
+    expect(gemeldet).toEqual(['Aufnahme-Fenster nicht verfügbar.'])
+  })
+
+  it('externer recorder:error NACH abgeschlossenem stop() (Listener dauerhaft) → onFehler feuert wieder', async () => {
+    const ee = ipcMain as unknown as EventEmitter
+    const recorder = createRecorder(fakeFenster())
+    const gemeldet: string[] = []
+    recorder.onFehler?.((m) => gemeldet.push(m))
+
+    // Ein stop() sauber abschließen (setzt stopLaeuft wieder auf false via aufraeumen()).
+    const stopP = recorder.stop()
+    ee.emit('recorder:result', {}, { buffer: new ArrayBuffer(2), durationSeconds: 1, mimeType: 'audio/webm' })
+    await stopP
+
+    // Danach ein externer Fehler (nächste Aufnahme): der dauerhafte Listener greift wieder.
+    ee.emit('recorder:error', {}, 'späterer Ausfall')
+    expect(gemeldet).toEqual(['späterer Ausfall'])
   })
 })

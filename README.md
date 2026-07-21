@@ -12,7 +12,7 @@
 ![Electron](https://img.shields.io/badge/Electron-33-47848F?style=flat-square&logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-087EA4?style=flat-square&logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strikt-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-949%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-1097%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
 
 [**⬇️ Download**](https://github.com/edo-dzell/blitztext-app-windows/releases/latest) ·
 [Vergleich zum Original](#-stark-erweitert-windows-port-vs-macos-original) ·
@@ -86,9 +86,9 @@ Idee zur Alltags-App aus:
 | **Diktier-UX** | ✅ Fokusfreie Status-Pille (bricht lange Fehlermeldungen um, statt sie abzuschneiden), Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar, Mikrofon wählbar, spürbar flüssigerer Diktat-Start | Menubar-Icon |
 | **Live-Feedback** | ✅ Erneuter-Versuch-Kennzeichnung bei Audio-Retry, „dauert länger als üblich"-Hinweis bei langsamen Läufen, dezenter Status-Punkt im Einstellungsfenster während ein Diktat läuft | — |
 | **Sicheres Einfügen** | ✅ Prüft vor dem Einfügen, ob noch dasselbe Fenster im Fokus ist — bei Fokuswechsel wird **nicht** blind getippt, sondern der Text landet in der Zwischenablage mit Hinweis. Steuerzeichen werden gefiltert; Diktate bleiben aus dem Windows-Zwischenablageverlauf | — |
-| **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte) | — |
-| **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis im Tray (kein Auto-Update, keine Telemetrie), ehrlicher Hinweis beim Speichern während einer laufenden Aufnahme | — |
-| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* oder stillschweigend Aussagen weglässt statt es originalgetreu umzuschreiben, und weist ehrlich darauf hin statt den Verlust zu verschleiern), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 1050 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte). Scheitert der Mikrofon-Zugriff, erscheint der Fehler **sofort** in der Status-Pille statt still zu verpuffen; abgestürzte interne Fenster (Aufnahme/Pille) heilen sich selbst; ein sterbender Einfüge-Helfer kann die App nicht abstürzen lassen (sauberer Zwischenablage-Fallback) | — |
+| **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis im Tray (kein Auto-Update, keine Telemetrie), ehrlicher Hinweis beim Speichern während einer laufenden Aufnahme, atomar geschriebene Einstellungen (ein Absturz beim Speichern zerstört die `settings.json` nicht; ist sie doch beschädigt, wird sie als `settings.json.korrupt` gerettet statt still auf Werkseinstellungen zurückgesetzt) | — |
+| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* oder stillschweigend Aussagen weglässt statt es originalgetreu umzuschreiben, und weist ehrlich darauf hin statt den Verlust zu verschleiern), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 1097 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
 | **Diagnose-Log** | ✅ Lokales, **text-freies** Ereignislog für die Fehlersuche (nie Diktate, Texte oder API-Keys — nur Ereignisse, Dauern, Längen); verlässt nie das Gerät, ~1-MB-Deckel, Debug-Stufe per Schalter, Ordner-öffnen/Löschen in den Einstellungen | — |
 | **Wörterbuch** | ✅ Eigene Begriffe (Namen, Fachwörter) per Chips-Editor hinterlegen, damit die Transkription sie korrekt schreibt — inkl. Budget-Anzeige; ein Begriff lässt sich direkt aus dem Verlauf heraus übernehmen | — |
 | **Verlauf: Änderungen zeigen** | ✅ Auf Wunsch ein Wortvergleich zwischen Rohdiktat und umgeschriebenem Text je Verlaufseintrag | — |
@@ -291,7 +291,9 @@ oben) — beides bestätigt, dass die Datei unverändert aus dem CI-Lauf dieses 
 Prüfe zuerst die Windows-Mikrofonberechtigung für Desktop-Apps (Einstellungen → Datenschutz &
 Sicherheit → Mikrofon). Die App bringt außerdem eine Selbstdiagnose („Ampel“) in den Einstellungen
 mit, die Mikrofon, API-Key, Anbieter-Erreichbarkeit und Hotkey-Erkennung einzeln prüft und bei
-fehlendem oder nicht ermittelbarem Mikrofon einen konkreten Hinweis anzeigt.
+fehlendem oder nicht ermittelbarem Mikrofon einen konkreten Hinweis anzeigt. Scheitert der
+Mikrofon-Zugriff erst, während du die Aufnahme-Taste gedrückt hältst, erscheint der Fehler seit
+v0.7.3 **sofort in der Status-Pille** — kein stiller Fehlschlag mehr.
 
 </details>
 

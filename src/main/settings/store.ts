@@ -89,6 +89,12 @@ const DEFAULT_ANBIETER: AnbieterKonfig = {
 export interface SettingsFile {
   read(): Promise<string | null>
   write(content: string): Promise<void>
+  /**
+   * Korruptions-Rettung (v0.7.3, A3): benennt eine unlesbare Datei nach settings.json.korrupt um,
+   * damit der nächste Start nicht dieselbe kaputte Datei wieder ablehnt. Optional — Fake-Ports ohne
+   * diese Methode sind weiter gültig; der Store ruft sie nur mit `?.()`. Wirft NIE (best effort).
+   */
+  beiseiteLegen?(): Promise<void>
 }
 
 export interface SettingsStore {
@@ -367,18 +373,34 @@ function parseSettings(raw: unknown): BlitztextSettings {
   }
 }
 
-export function createSettingsStore({ file }: { file: SettingsFile }): SettingsStore {
+export function createSettingsStore({
+  file,
+  aufKorruption
+}: {
+  file: SettingsFile
+  /**
+   * Korruptions-Callback (v0.7.3, A3): wird gerufen, wenn die Datei existiert, aber nicht lesbar/
+   * parsebar ist (JSON.parse ODER parseSettings wirft). Optional; No-Op-Default → alle bestehenden
+   * Aufrufer kompilieren unverändert. Der Empfänger (Phase B) loggt/benachrichtigt; der Store loggt
+   * bewusst NICHT selbst (keine log-Dep im Kern). Eine fehlende Datei ist KEINE Korruption.
+   */
+  aufKorruption?: () => void
+}): SettingsStore {
   return {
     async load() {
       const raw = await file.read()
-      if (raw === null) return defaultSettings()
-      let parsed: unknown
+      if (raw === null) return defaultSettings() // fehlende Datei = frische Installation, keine Korruption
       try {
-        parsed = JSON.parse(raw)
+        // JSON.parse UND parseSettings defensiv kapseln: auch ein struktureller Absturz in der
+        // feldweisen Migration (unerwarteter Wert) darf den Start nicht verhindern.
+        return parseSettings(JSON.parse(raw))
       } catch {
+        // Kaputte Datei beiseitelegen (→ settings.json.korrupt), damit der nächste Start sie nicht
+        // erneut ablehnt; dann Callback und Defaults. beiseiteLegen/Callback wirft nie.
+        await file.beiseiteLegen?.()
+        aufKorruption?.()
         return defaultSettings()
       }
-      return parseSettings(parsed)
     },
     async save(settings) {
       // Zweite Verteidigungslinie (defense-in-depth): normalisiert auch dann, wenn ein künftiger

@@ -50,4 +50,31 @@ describe('createStatsFile (fs-Wrapper)', () => {
     await file.write('neu')
     expect(await file.read()).toBe('neu')
   })
+
+  // A3 (v0.7.3): atomarer Roundtrip — keine zurückbleibende .tmp-Datei.
+  it('atomarer Roundtrip: keine .tmp-Datei bleibt nach dem write zurück', async () => {
+    const file = createStatsFile(pfad)
+    await file.write('{"n":2}')
+    expect(await file.read()).toBe('{"n":2}')
+    const tmp = createStatsFile(`${pfad}.tmp`)
+    expect(await tmp.read()).toBeNull()
+  })
+
+  it('Absturz-Simulation: schlägt das Ersetzen fehl, bleibt die alte Datei unversehrt (Ziel-Verzeichnis nur-lesbar)', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return
+
+    const unterordner = join(dir, 'ro')
+    const direkt = join(unterordner, 'stats.json')
+    const file = createStatsFile(direkt)
+    await file.write('alt-gut')
+
+    const { chmod } = await import('node:fs/promises')
+    await chmod(unterordner, 0o500)
+    try {
+      await expect(file.write('neu-halb')).rejects.toBeTruthy()
+    } finally {
+      await chmod(unterordner, 0o700)
+    }
+    expect(await file.read()).toBe('alt-gut')
+  })
 })

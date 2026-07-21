@@ -1,6 +1,7 @@
 import { app } from 'electron'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { ersetzeAtomar } from '@main/fs/ersetze-atomar'
 import type { StatsFile } from './stats-store'
 
 // Statistik-Datei (text-frei, unverschlüsselt) im userData-Verzeichnis — pro Benutzer (ADR-0005).
@@ -18,8 +19,12 @@ export function createStatsFile(
       }
     },
     async write(content) {
+      // Atomar (v0.7.3, A3): tmp schreiben, dann Windows-erprobt umbenennen — ein Absturz mitten im
+      // Schreiben lässt die alte Statistik-Datei unversehrt statt sie halb zu überschreiben.
       await mkdir(dirname(filePath), { recursive: true })
-      await writeFile(filePath, content, 'utf-8')
+      const tmp = `${filePath}.tmp`
+      await writeFile(tmp, content, 'utf-8')
+      await ersetzeAtomar(tmp, filePath)
     }
   }
 }

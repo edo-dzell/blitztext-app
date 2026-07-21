@@ -152,6 +152,11 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   //      Jeder Start bucht eine Generation; brichAb()/stoppe() erhöhen sie. Nach jedem await prüft der
   //      Start, ob SEINE Generation noch aktuell ist — sonst steigt er aus, ohne runner.start().
   let laufGeneration = 0
+  // v0.7.3 (A1): Re-Entrancy-Wächter fürs onPhase-Routing eines UNERWARTETEN Terminal-Fehlers. Der
+  // reguläre Weg (stoppe()/erneutVersuchen()) ruft verarbeiteTerminal() selbst und erzeugt dabei über
+  // runner-interne transition()-Aufrufe onPhase-Emissionen — der onPhase-Handler darf DIE nicht ein
+  // zweites Mal routen. Solange dieses Flag steht, hält sich das onPhase-Routing komplett raus.
+  let imTerminalRouting = false
 
   const sitzung: Sitzung = {
     async starteWorkflow(workflow, quelle) {
@@ -278,14 +283,22 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       const quelle = aktiveQuelle
       const kontext = aktiverKontext
       const fokusKontext = aktiverFokusKontext
-      const terminal = await deps.runner.stop()
-      aktiveQuelle = null
-      aktiverKontext = null
-      aktiverFokusKontext = null
-      // Fix B: das HWND-Versprechen erst JETZT auflösen (nach runner.stop(), vor dem Routen) — zum
-      // Stop-Zeitpunkt fast immer schon da; der 2000ms-Adapter-Timeout deckelt das Restwarten.
-      const eingefügterKontext = await loeseFokusKontext(fokusKontext)
-      verarbeiteTerminal(terminal, quelle, kontext, eingefügterKontext)
+      // v0.7.3 (A1): das onPhase-Routing (unerwarteter Terminal-Fehler) muss sich raushalten, solange
+      // WIR den Terminal-Zustand regulär verarbeiten — sonst routete es den von runner.stop() erzeugten
+      // Terminal-Phasenwechsel ein zweites Mal. try/finally, damit das Flag auch bei einem Wurf fällt.
+      imTerminalRouting = true
+      try {
+        const terminal = await deps.runner.stop()
+        aktiveQuelle = null
+        aktiverKontext = null
+        aktiverFokusKontext = null
+        // Fix B: das HWND-Versprechen erst JETZT auflösen (nach runner.stop(), vor dem Routen) — zum
+        // Stop-Zeitpunkt fast immer schon da; der 2000ms-Adapter-Timeout deckelt das Restwarten.
+        const eingefügterKontext = await loeseFokusKontext(fokusKontext)
+        verarbeiteTerminal(terminal, quelle, kontext, eingefügterKontext)
+      } finally {
+        imTerminalRouting = false
+      }
     },
     async erneutVersuchen() {
       // W3-B: nur sinnvoll, wenn kein Lauf aktiv ist UND der Runner noch Audio hält (transienter
@@ -308,15 +321,22 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
           aktiverKontext = null
         }
       }
-      const terminal = await deps.runner.erneutVersuchen()
-      // Ein brichAb() während des Retrys hat die Generation erhöht + die Reservierung geräumt und das
-      // Audio verworfen → still aussteigen, ohne den (abgebrochenen) Terminal-Zustand zu routen.
-      if (veraltet()) {
-        log.info('sitzung.start_entwertet', { quelle: vorlage.quelle })
-        return
+      // v0.7.3 (A1): wie in stoppe() das onPhase-Routing für die Dauer der regulären Verarbeitung
+      // sperren (die runner.erneutVersuchen()-transition() erzeugt onPhase-Emissionen). try/finally.
+      imTerminalRouting = true
+      try {
+        const terminal = await deps.runner.erneutVersuchen()
+        // Ein brichAb() während des Retrys hat die Generation erhöht + die Reservierung geräumt und das
+        // Audio verworfen → still aussteigen, ohne den (abgebrochenen) Terminal-Zustand zu routen.
+        if (veraltet()) {
+          log.info('sitzung.start_entwertet', { quelle: vorlage.quelle })
+          return
+        }
+        gibReservierungFrei()
+        verarbeiteTerminal(terminal, vorlage.quelle, vorlage.kontext, vorlage.fokusKontext)
+      } finally {
+        imTerminalRouting = false
       }
-      gibReservierungFrei()
-      verarbeiteTerminal(terminal, vorlage.quelle, vorlage.kontext, vorlage.fokusKontext)
     },
     kannErneutVersuchen() {
       // Kein Retry mitten in einem aktiven Lauf anbieten (der Runner hielte evtl. noch altes Audio).
@@ -430,7 +450,35 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   }
 
   // Runner-Phasen nach außen reichen, damit Tray und Fenster den Status spiegeln können.
-  deps.runner.onPhase = (phase) => sitzung.onStatus?.(phase)
+  deps.runner.onPhase = (phase) => {
+    sitzung.onStatus?.(phase)
+    // v0.7.3 (A1): unerwarteter Terminal-Fehler OHNE laufendes stoppe()/erneutVersuchen(). Das passiert
+    // beim externen Aufnahme-Fehler (recorder:error während der Aufnahme → runner.meldeAufnahmeFehler →
+    // transition('fehler')): die Sitzung hält noch eine Reservierung (aktiveQuelle), aber niemand hat
+    // stop() gerufen, der den Terminal-Zustand routen würde. Ohne dieses Routing bliebe die Reservierung
+    // stehen (App „beschäftigt", nächster Hotkey ignoriert) und der Nutzer sähe keine Fehlermeldung.
+    // Nur reagieren, wenn (a) wir nicht ohnehin gerade regulär routen (imTerminalRouting) und (b) eine
+    // Reservierung offen ist und (c) die Phase ein echter Terminal-Fehler ist.
+    if (imTerminalRouting) return
+    if (aktiveQuelle === null) return
+    if (phase.status !== 'fehler') return
+    const quelle = aktiveQuelle
+    const kontext = aktiverKontext
+    // Reservierung räumen + Generation erhöhen: ein nachfolgendes stoppe() (der Nutzer lässt den Chord
+    // noch los) findet aktiveQuelle === null → No-Op (der :268-Guard greift), kein Phantom-Stop.
+    aktiveQuelle = null
+    aktiverKontext = null
+    aktiverFokusKontext = null
+    laufGeneration++
+    // Beim Routen erneut sperren (verarbeiteTerminal löst hier keine weitere onPhase-Emission aus, aber
+    // defensiv symmetrisch zu stoppe()/erneutVersuchen()). try/finally, damit das Flag sicher fällt.
+    imTerminalRouting = true
+    try {
+      verarbeiteTerminal(phase, quelle, kontext, null)
+    } finally {
+      imTerminalRouting = false
+    }
+  }
 
   return sitzung
 }

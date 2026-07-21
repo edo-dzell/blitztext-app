@@ -35,6 +35,13 @@ export interface Recorder {
   stop(): Promise<RecordingResult>
   /** Aufnahme beenden und verwerfen, ohne ein Ergebnis zu liefern (Abbruch). */
   discard(): void
+  /**
+   * v0.7.3 (A1): registriert einen dauerhaften Rückruf für Aufnahme-Fehler, die AUSSERHALB eines
+   * wartenden stop() auftreten (recorder:error während der Aufnahme, ohne dass gerade gestoppt wird —
+   * z. B. Mikrofon exklusiv belegt, MediaRecorder-Fehler). Optional: der Runner verdrahtet ihn in der
+   * Composition auf `meldeAufnahmeFehler`; Fakes ohne den Kanal lassen ihn weg (kein Verhaltensbruch).
+   */
+  onFehler?(cb: (message: string) => void): void
 }
 
 interface QualityPort {
@@ -84,6 +91,20 @@ export interface WorkflowRunnerDeps {
    * Roh-/Endtexte hinein, nur Status, FehlerArt, redigierte Fehler-Nachricht und Längen (`zeichen=`).
    */
   log?: EreignisLog
+}
+
+/**
+ * v0.7.3 (A1): Laufkapsel eines einzelnen verarbeiteAufnahme()-Durchlaufs. Bündelt die pro-Lauf-
+ * Abbruch-Steuerung, die früher als Runner-weite Closures lag und Läufe verwechselte. `id` erlaubt den
+ * `istAktuell`-Guard (nur der GERADE aktuelle Lauf darf noch Phasen schreiben); `controller` bricht die
+ * in-flight fetch ab; `abgebrochen` markiert einen manuellen Abbruch (Catch still nach idle statt Fehler);
+ * `istTimeout` markiert einen Anbieter-Watchdog-Timeout (für die Meldung + retrybar-Sperre).
+ */
+interface LaufKontext {
+  id: number
+  controller: AbortController
+  abgebrochen: boolean
+  istTimeout: boolean
 }
 
 export interface RunInput {
@@ -153,6 +174,14 @@ export interface WorkflowRunner {
   stop(): Promise<WorkflowPhase>
   /** Abbruch in Aufnahme/Transkription/Umschreiben: bricht laufende Anbieter-Aufrufe ab, still nach idle. */
   abbrechen(): void
+  /**
+   * v0.7.3 (A1): externer Aufnahme-Fehler aus dem Recorder-Kanal (recorder:error außerhalb eines
+   * wartenden stop() — z. B. Mikrofon von einer anderen App exklusiv belegt). No-Op außer in der Phase
+   * 'aufnehmen' (Alt-Lauf-Schutz: ein verspäteter Fehler eines längst abgeschlossenen Laufs darf keinen
+   * frischen Zustand überschreiben). Meldet den Fehler als terminale 'fehler'/'aufnahme'-Phase. Optional
+   * im Interface, damit Fakes ohne den Kanal weiter erfüllen — Composition verdrahtet ihn.
+   */
+  meldeAufnahmeFehler(message: string): void
   /**
    * W3-B (Audio-Retry): true, wenn ein Lauf an einem transienten Fehler (netzwerk/anbieter) bzw. einem
    * Teil-Erfolg scheiterte UND das aufgenommene Audio noch flüchtig im Speicher liegt → ein erneuter
@@ -236,10 +265,18 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   let phase: WorkflowPhase = { status: 'idle' }
   let input: RunInput | null = null
   let letzteMetrik: RunMetrik | null = null
-  // Abbruch-Steuerung pro Lauf: Controller bricht die in-flight fetch ab; `abgebrochen` markiert einen
-  // manuellen Abbruch, damit der Catch still nach idle führt statt einen Fehler zu melden.
-  let controller: AbortController | null = null
-  let abgebrochen = false
+  // v0.7.3 (A1): Laufkapsel. Die frühere Runner-weite Abbruch-Steuerung (`controller`/`abgebrochen`/
+  // `istTimeout` als Closures) verwechselte Läufe: brach man einen Lauf A ab und startete gleich einen
+  // Lauf B (erneutVersuchen / Fix-A-Neustart), sah der noch in-flight hängende catch von A das
+  // frisch von B gesetzte `abgebrochen=false` (oder umgekehrt) → falsche Meldung / falscher letzteAufnahme-
+  // Schreiber. Jede verarbeiteAufnahme() bekommt nun EINEN eigenen LaufKontext; ein `istAktuell`-Guard in
+  // transition() verwirft veraltete Schreiber. `aktuellerLauf` zeigt auf den gerade gültigen Kontext.
+  let aktuellerLauf: LaufKontext | null = null
+  let laufZaehler = 0
+  // Schmales Flag NUR für den stop()-catch (Vordergrund-Pfad, bekommt bewusst KEINEN LaufKontext): es
+  // unterscheidet einen manuellen Abbruch (discard → AbortError, still nach idle) von einem echten
+  // Recorder-Fehler. start() setzt es false, abbrechen()/der externe Fehlerkanal setzen es true.
+  let aufnahmeAbgebrochen = false
   // W3-B (Audio-Retry): das zuletzt aufgenommene Audio wird NUR flüchtig im Speicher gehalten, solange
   // ein erneuter Versuch sinnvoll ist (transienter Fehler / Teil-Erfolg). Bei 'fertig' oder Aufnahme-
   // Fehler (nichts Brauchbares) wird es verworfen. NIE auf Disk, NIE in den Verlauf (Datenschutz).
@@ -279,9 +316,13 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     },
     start(next) {
       input = next
-      abgebrochen = false
+      // v0.7.3 (A1): frischer Vordergrund-Start → das schmale stop()-catch-Flag zurücksetzen. Ein evtl.
+      // noch existierender alter LaufKontext bleibt bestehen, wird aber durch `istAktuell` entwertet,
+      // sobald verarbeiteAufnahme() einen neuen anlegt (dieser start() öffnet nur die Aufnahme-Phase).
+      aufnahmeAbgebrochen = false
       // W3-B: ein frisches Diktat macht ein zuvor gehaltenes Audio gegenstandslos → verwerfen.
       letzteAufnahme = null
+      // Vordergrund-Pfad: NIE mit lauf guarden — ein Start muss die Aufnahme-Phase immer setzen dürfen.
       transition({ status: 'aufnehmen' })
       deps.recorder.start()
     },
@@ -294,7 +335,12 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       ) {
         return
       }
-      abgebrochen = true
+      // v0.7.3 (A1): den aktuellen Lauf als abgebrochen markieren (dessen catch führt still nach idle),
+      // seine in-flight fetch abbrechen. `aufnahmeAbgebrochen` deckt zusätzlich den stop()-catch ab, der
+      // KEINEN LaufKontext kennt (Vordergrund-Pfad) — der aufnehmen-Zweig löst über discard() ein
+      // recorder.stop()-Reject aus, das dort still bleiben muss.
+      aufnahmeAbgebrochen = true
+      if (aktuellerLauf) aktuellerLauf.abgebrochen = true
       if (phase.status === 'aufnehmen') {
         // discard() darf die idle-Transition nicht killen (W1-A, P0): ein zerstörtes Recorder-Fenster
         // ließe send() sonst werfen → Runner bliebe „beschäftigt". Der Adapter schluckt bereits, hier
@@ -305,9 +351,33 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
           /* ignorieren — die stille Rückkehr nach idle hat Vorrang */
         }
       } else {
-        controller?.abort(new DOMException('Abbruch durch Nutzer.', 'AbortError'))
+        aktuellerLauf?.controller.abort(new DOMException('Abbruch durch Nutzer.', 'AbortError'))
+        // W3-B-Invariante (sitzung.ts:354 „nach Abbruch kein Retry auf verworfenem Audio"): HIER das
+        // gehaltene Audio verwerfen. Wird ein laufender Transkriptions-/Umschreib-Lauf abgebrochen, setzt
+        // der nächste Schritt aktuellerLauf=null → der spät auflaufende catch dieses Laufs greift den
+        // istAktuell-Alt-Lauf-Schutz und erreicht seinen `lauf.abgebrochen`-Zweig (letzteAufnahme=null)
+        // NIE mehr. Ohne dieses Verwerfen bliebe letzteAufnahme gesetzt und die Tray-Aktion „Erneut
+        // versuchen" böte VERWORFENES Audio an. Nur im Nicht-'aufnehmen'-Pfad nötig: im 'aufnehmen'-Zweig
+        // gab es noch kein verwertbares recording (letzteAufnahme wurde in start() bereits genullt).
+        letzteAufnahme = null
       }
+      // Der abgebrochene Lauf darf ab jetzt nichts mehr schreiben → aktuellerLauf lösen, DANN idle setzen
+      // (Vordergrund-Pfad ohne lauf-Guard, damit die idle-Transition immer durchgeht).
+      aktuellerLauf = null
       transition({ status: 'idle' })
+    },
+    meldeAufnahmeFehler(message) {
+      // v0.7.3 (A1): externer Recorder-Fehler (recorder:error außerhalb eines wartenden stop()). NUR in
+      // der Phase 'aufnehmen' wirksam (Alt-Lauf-Schutz): ein verspäteter Fehler, nachdem der Lauf längst
+      // transkribiert/abgeschlossen/abgebrochen ist, darf keinen frischen Zustand überschreiben.
+      if (phase.status !== 'aufnehmen') return
+      // Nichts Brauchbares zum Wiederholen (die Aufnahme kam nie sauber an) → gehaltenes Audio verwerfen.
+      letzteAufnahme = null
+      // Ein danach eintreffender stop()-catch (falls doch noch ein recorder.stop() in-flight ist) muss
+      // still bleiben — wie bei einem manuellen Abbruch.
+      aufnahmeAbgebrochen = true
+      // Vordergrund-Pfad (kein LaufKontext): die Fehler-Phase muss immer gesetzt werden dürfen.
+      transition({ status: 'fehler', art: 'aufnahme', message: kuerzeMeldung(message) })
     },
     async stop() {
       // Phantom-Stop-Schutz: stop() ist nur in der Aufnahme-Phase sinnvoll. Wird es ohne laufende
@@ -350,7 +420,10 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         }
         // Recorder-Fehler sauber als 'fehler' melden statt als uncaught exception durchzureichen.
         // Manueller Abbruch (discard → AbortError) ist bereits nach idle gegangen → still bleiben.
-        if (abgebrochen) return phase
+        // v0.7.3 (A1): der stop()-catch ist ein Vordergrund-Pfad OHNE LaufKontext — er liest deshalb das
+        // schmale `aufnahmeAbgebrochen`-Flag (von abbrechen()/dem externen Fehlerkanal gesetzt), nicht
+        // den per-Lauf-abgebrochen-Wert.
+        if (aufnahmeAbgebrochen) return phase
         const message = err instanceof Error ? err.message : String(err)
         return transition({ status: 'fehler', art: 'aufnahme', message })
       } finally {
@@ -380,8 +453,9 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     async erneutVersuchen() {
       // No-Op ohne gehaltenes Audio: nach 'fertig' (verworfen), Aufnahme-Fehler oder im Leerlauf.
       if (letzteAufnahme === null) return phase
-      // Frisches Diktat entfällt — direkt ab Transkription mit dem gehaltenen Audio.
-      abgebrochen = false
+      // Frisches Diktat entfällt — direkt ab Transkription mit dem gehaltenen Audio. v0.7.3 (A1): der
+      // abgebrochen-Reset entfällt hier — verarbeiteAufnahme() legt selbst einen frischen LaufKontext
+      // (abgebrochen=false) an.
       // A4a: dies IST der Wiederholungs-Pfad — Pille/Tray sollen das während Transkription/Umschreiben
       // sichtbar machen. Reine Anzeige: Protokoll/Verlauf/Metrik bleiben unverändert (kein Nicht-Ziel-Bruch).
       return verarbeiteAufnahme(letzteAufnahme, true)
@@ -397,19 +471,27 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     recording: RecordingResult,
     istWiederholung = false
   ): Promise<WorkflowPhase> {
-    abgebrochen = false
-    controller = new AbortController()
-    let istTimeout = false
+    // v0.7.3 (A1): frische Laufkapsel. Ab hier ist `lauf` der GERADE gültige Lauf; ein späterer Abbruch
+    // (aktuellerLauf=null) oder ein Neustart (neuer Kontext) entwertet ihn über `istAktuell`. Der frühere
+    // Runner-weite `abgebrochen`/`controller`/`istTimeout`-Zustand ist damit lauf-lokal (kein Leak zwischen
+    // interleavten Läufen).
+    const lauf: LaufKontext = {
+      id: ++laufZaehler,
+      controller: new AbortController(),
+      abgebrochen: false,
+      istTimeout: false
+    }
+    aktuellerLauf = lauf
     const stoppeWatchdog = starteWatchdog(() => {
-      istTimeout = true
-      controller?.abort(new DOMException('Zeitüberschreitung beim Anbieter.', 'TimeoutError'))
+      lauf.istTimeout = true
+      lauf.controller.abort(new DOMException('Zeitüberschreitung beim Anbieter.', 'TimeoutError'))
     })
 
-    const signal = controller.signal
+    const signal = lauf.controller.signal
     // Nur transiente netzwerk-Fehler wiederholen — nie Abbruch/Watchdog-Timeout (sonst Doppel-Audio,
     // und der abgebrochene Controller ließe den nächsten Versuch ohnehin sofort scheitern).
     const retrybar = (fehler: unknown): boolean => {
-      if (abgebrochen || istTimeout) return false
+      if (lauf.abgebrochen || lauf.istTimeout) return false
       if (fehler instanceof Error && (fehler.name === 'AbortError' || fehler.name === 'TimeoutError')) {
         return false
       }
@@ -430,10 +512,10 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     // Reine Gliederung von verarbeiteAufnahme; Logik/Reihenfolge/Fehlerpfade unverändert. Nutzt die
     // Closure-Werte (signal/retryOpts/input) direkt; wirft weiter an die try/catch-Orchestrierung.
     async function transkribiere(): Promise<string | null> {
-      transition({ status: 'transkribieren', istWiederholung })
+      transition({ status: 'transkribieren', istWiederholung }, lauf)
       // A2: additiver Zwischenmeldungs-Timer — MUSS gestoppt werden, sobald die Phase verlassen wird
       // (Erfolg, Fehler, Abbruch), sonst Leak/Fehlfeuern in eine andere Phase (finally deckt alle Pfade ab).
-      const stoppeZwischenmeldung = starteZwischenmeldung('transkribieren', istWiederholung)
+      const stoppeZwischenmeldung = starteZwischenmeldung('transkribieren', istWiederholung, lauf)
       try {
         // Eigennamen nur bei ausreichend langer Aufnahme mitschicken (≥ 0,9 s): ein zusätzlicher
         // konservativer Guard oberhalb der 0,8s-Artefakt-Staffel aus quality.ts — Whisper kann
@@ -463,11 +545,11 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     // --- Umschreib-Phase: Rohtext → Endtext-Terminal-Phase (fertig / teilErfolg). ---
     // Reine Gliederung; Prompt-Auflösung, Token-Limit-, Treue- und Kennungs-Logik unverändert.
     async function schreibeUm(rohtext: string, def: WorkflowDefinition): Promise<WorkflowPhase> {
-      transition({ status: 'umschreiben', istWiederholung })
+      transition({ status: 'umschreiben', istWiederholung }, lauf)
       // A2: additiver Zwischenmeldungs-Timer — MUSS gestoppt werden, sobald die Phase verlassen wird
       // (Erfolg, Teil-Erfolg, Fehler, Abbruch), sonst Leak/Fehlfeuern in eine andere Phase (finally
       // deckt alle Rückgabepfade dieser Funktion ab).
-      const stoppeZwischenmeldung = starteZwischenmeldung('umschreiben', istWiederholung)
+      const stoppeZwischenmeldung = starteZwischenmeldung('umschreiben', istWiederholung, lauf)
       try {
         const system = deps.resolveSystemPrompt(def, input?.rewriteSettings)
         // 0.3.1-Blocker-Fix: das bereits AUFGELÖSTE chatModell (aus aufloeseWorkflowLauf →
@@ -493,14 +575,14 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         // Der zurückgegebene Text ist unvollständig — weder als voller Erfolg einfügen noch dem
         // Treue-Detektor zur Prüfung vorlegen (der prüft eine vollständige Bearbeitung). Rohtext retten.
         if (rewritten.abgeschnitten) {
-          return teilErfolg(rohtext, recording.durationSeconds, ABGESCHNITTEN_WARNUNG, 'abgeschnitten')
+          return teilErfolg(rohtext, recording.durationSeconds, ABGESCHNITTEN_WARNUNG, 'abgeschnitten', lauf)
         }
         // Etwaig zurückgespiegelte Markierungen entfernen, bevor cleanedTranscript trimmt.
         const endtext = deps.quality.cleanedTranscript(entferneTranskriptMarken(rewritten.text))
         // Treue-Detektor (v0.4.5, ADR-0018): hat das Modell das Diktat beantwortet statt es zu
         // bearbeiten? Dann den (geglückten) Rohtext retten statt falschen Text einzufügen.
         if (deps.treueDetektor?.wirktBeantwortet(rohtext, endtext)) {
-          return teilErfolg(rohtext, recording.durationSeconds, BEANTWORTET_WARNUNG, 'beantwortet')
+          return teilErfolg(rohtext, recording.durationSeconds, BEANTWORTET_WARNUNG, 'beantwortet', lauf)
         }
         // Vollständigkeits-Detektor (v0.7.1 Stufe 3, 5. Vorfallsklasse „Weglassen"): NUR für die
         // Polier-Workflows improve/emoji (siehe VOLLSTAENDIGKEIT_WORKFLOW_IDS-Kommentar), NIE bei
@@ -511,7 +593,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
           (!def.ausgabeSprache || def.ausgabeSprache.trim() === '') &&
           wirktUnvollstaendig(rohtext, endtext)
         ) {
-          return teilErfolg(rohtext, recording.durationSeconds, UNVOLLSTAENDIG_WARNUNG, 'unvollstaendig')
+          return teilErfolg(rohtext, recording.durationSeconds, UNVOLLSTAENDIG_WARNUNG, 'unvollstaendig', lauf)
         }
         // V5: Kennung des Prompt-Stands, der DIESEN Endtext erzeugt hat — NUR hier (Umschreib-Erfolg),
         // reine Transkription (unten) bleibt ohne System-Prompt und damit ohne Kennung.
@@ -521,6 +603,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
           recording.durationSeconds,
           rewritten.usage,
           true,
+          lauf,
           promptKennungFuer(def, system)
         )
       } finally {
@@ -535,26 +618,35 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       const rohtext = await transkribiere()
       if (rohtext === null) {
         // Leere/artefaktige Transkription trotz verwertbarer Länge → Aufnahme-Fehler, kein sinnvoller
-        // Retry (dasselbe Audio liefert dasselbe Ergebnis) → Audio verwerfen.
-        letzteAufnahme = null
-        return transition({ status: 'fehler', art: 'aufnahme', message: NO_RECORDING_ERROR })
+        // Retry (dasselbe Audio liefert dasselbe Ergebnis) → Audio verwerfen. v0.7.3 (A1): nur schreiben,
+        // wenn der Lauf noch aktuell ist (ein Abbruch/Neustart dazwischen entwertet die Zuweisung).
+        if (istAktuell(lauf)) letzteAufnahme = null
+        return transition({ status: 'fehler', art: 'aufnahme', message: NO_RECORDING_ERROR }, lauf)
       }
       letzterRohtext = rohtext // Transkription gelang → bei späterem Umschreib-Fehler Teil-Erfolg
 
       const def = input?.def
       if (!def || !def.rewrites) {
-        return abschluss(rohtext, rohtext, recording.durationSeconds, undefined, false)
+        return abschluss(rohtext, rohtext, recording.durationSeconds, undefined, false, lauf)
       }
 
       return await schreibeUm(rohtext, def)
     } catch (err) {
+      // v0.7.3 (A1): erst den Alt-Lauf-Schutz. Ist dieser Lauf nicht mehr der aktuelle (inzwischen
+      // abgebrochen/neu gestartet), darf sein catch WEDER eine Fehler-Phase setzen NOCH letzteAufnahme
+      // anfassen — sonst überschriebe ein veralteter Lauf den frischen Zustand. Still die aktuelle Phase
+      // zurückgeben. DANACH erst der reguläre Abbruch-Zweig (Lauf ist noch aktuell, wurde aber abgebrochen).
+      if (!istAktuell(lauf)) return phase
       // Manueller Abbruch: still nach idle (bereits durch abbrechen() gesetzt) — kein Fehler/Metrik.
-      // Bei Abbruch auch das gehaltene Audio verwerfen (der Nutzer will keinen Retry auf Verworfenes).
-      if (abgebrochen) {
+      // DEFENSIV-REST (v0.7.3): das Audio-Verwerfen ist inzwischen abbrechen() vorgezogen (W3-B-Invariante),
+      // weil abbrechen() aktuellerLauf=null setzt und dieser Zweig hier den istAktuell-Guard oben (Zeile
+      // ~639) für einen abgebrochenen Lauf gar nicht mehr passiert (dead). Bleibt harmlos-defensiv stehen,
+      // falls je ein Pfad diesen Zweig mit istAktuell==true UND abgebrochen erreicht (idempotentes Nullen).
+      if (lauf.abgebrochen) {
         letzteAufnahme = null
         return phase
       }
-      const istTimeoutFehler = istTimeout || (err instanceof Error && err.name === 'TimeoutError')
+      const istTimeoutFehler = lauf.istTimeout || (err instanceof Error && err.name === 'TimeoutError')
       const art = klassifiziere(err, { istWatchdogTimeout: istTimeoutFehler })
       const message = istTimeoutFehler
         ? 'Zeitüberschreitung beim Anbieter.'
@@ -564,12 +656,12 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       // Teil-Erfolg: Transkription gelang, nur das Umschreiben scheiterte → Rohtext retten. Das Audio
       // bleibt gehalten (W3-B): der Nutzer kann das Umschreiben erneut versuchen.
       if (letzterRohtext !== null) {
-        return teilErfolg(letzterRohtext, recording.durationSeconds, message, 'umschreibfehler')
+        return teilErfolg(letzterRohtext, recording.durationSeconds, message, 'umschreibfehler', lauf)
       }
       // Vollfehler: das Audio bleibt gehalten (W3-B) — ein transienter netzwerk/anbieter-Fehler lässt
       // sich ab Transkription wiederholen. (Aufnahme-Fehler kommen hier nicht an, die sind oben schon
       // terminal und verwerfen das Audio.)
-      return transition({ status: 'fehler', art, message })
+      return transition({ status: 'fehler', art, message }, lauf)
     } finally {
       stoppeWatchdog()
     }
@@ -602,15 +694,20 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     dauerSekunden: number,
     usage: RunMetrik['usage'],
     umgeschrieben: boolean,
+    lauf: LaufKontext,
     promptKennung?: string
   ): WorkflowPhase {
+    // v0.7.3 (A1): Alt-Lauf-Schutz VOR den Seiteneffekten (Metrik/letzteAufnahme). Ein längst abgelöster
+    // Lauf, der spät hier ankommt, darf weder die Metrik des frischen Laufs überschreiben noch dessen
+    // gehaltenes Audio verwerfen — still die aktuelle Phase zurückgeben.
+    if (!istAktuell(lauf)) return phase
     // MAL-1 (W2-B): letzte Stelle vor Metrik/Phase — von hier geht `text` via Sitzung in
     // Zwischenablage/Auto-Paste (einfügen/anzeigen). Steuerzeichen/Escape-Sequenzen raus.
     const sauber = entferneSteuerzeichen(endtext)
     // W3-B: erfolgreicher Lauf → das flüchtig gehaltene Audio verwerfen (kein Retry mehr nötig/Datenschutz).
     letzteAufnahme = null
     setzeMetrik(rohtext, sauber, dauerSekunden, usage, umgeschrieben, promptKennung)
-    return transition({ status: 'fertig', text: sauber })
+    return transition({ status: 'fertig', text: sauber }, lauf)
   }
 
   // Teil-Erfolg (CONTEXT.md): die Transkription gelang, aber das Umschreiben scheiterte
@@ -622,16 +719,33 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     rohtext: string,
     dauerSekunden: number,
     warnung: string,
-    grund: TeilErfolgGrund
+    grund: TeilErfolgGrund,
+    lauf: LaufKontext
   ): WorkflowPhase {
+    // v0.7.3 (A1): Alt-Lauf-Schutz VOR der Metrik-Setzung (wie abschluss). Ein abgelöster Lauf darf die
+    // Metrik nicht überschreiben — still die aktuelle Phase zurückgeben.
+    if (!istAktuell(lauf)) return phase
     // MAL-1 (W2-B): der Rohtext geht hier ebenfalls in die Zwischenablage (inZwischenablage) — derselbe
     // Filter wie im Endtext-Pfad, sonst könnte ein Teil-Erfolg die Injektion durchlassen.
     const sauber = entferneSteuerzeichen(rohtext)
     setzeMetrik(sauber, sauber, dauerSekunden, undefined, false)
-    return transition({ status: 'teilErfolg', rohtext: sauber, warnung, grund })
+    return transition({ status: 'teilErfolg', rohtext: sauber, warnung, grund }, lauf)
   }
 
-  function transition(next: WorkflowPhase): WorkflowPhase {
+  // v0.7.3 (A1): true, solange `lauf` der GERADE gültige Lauf ist. Ein Abbruch (aktuellerLauf=null) oder
+  // ein Neustart (neuer Kontext mit höherer id) entwertet einen älteren Lauf → dessen späte Schreiber
+  // (transition/abschluss/teilErfolg) werden verworfen. Vordergrund-Pfade rufen transition() OHNE lauf →
+  // der Guard greift dort nie (start/abbrechen/stop/meldeAufnahmeFehler müssen immer schreiben dürfen).
+  function istAktuell(lauf: LaufKontext): boolean {
+    return aktuellerLauf !== null && aktuellerLauf.id === lauf.id
+  }
+
+  function transition(next: WorkflowPhase, lauf?: LaufKontext): WorkflowPhase {
+    // v0.7.3 (A1): ist ein Lauf-Kontext übergeben (Aufrufe INNERHALB verarbeiteAufnahme), aber nicht mehr
+    // aktuell (abgebrochen/abgelöst), verwerfen — kein veralteter Schreiber überschreibt den frischen
+    // Zustand. Vordergrund-Aufrufe (start/abbrechen/stop/meldeAufnahmeFehler) übergeben KEINEN lauf und
+    // laufen immer durch.
+    if (lauf && !istAktuell(lauf)) return phase
     // A2: JEDER Statuswechsel invalidiert eine zuvor gestartete Zwischenmeldung — zentral hier erhöht,
     // damit der Guard im Timer-Callback (starteZwischenmeldung) wirksam ist, egal wie viele andere
     // transition()-Aufrufe dazwischen liefen.
@@ -662,12 +776,15 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   // `istWiederholung` wird durchgereicht (A4a-Feld bleibt beim Zwischenmeldungs-transition erhalten).
   function starteZwischenmeldung(
     status: 'transkribieren' | 'umschreiben',
-    istWiederholung: boolean
+    istWiederholung: boolean,
+    lauf: LaufKontext
   ): () => void {
     const meineGeneration = zwischenmeldungGeneration
     return starteZwischenmeldungsTimer(() => {
       if (zwischenmeldungGeneration !== meineGeneration) return // Phase längst gewechselt — No-Op
-      transition({ status, dauertLaenger: true, istWiederholung })
+      // v0.7.3 (A1): den Lauf mitgeben — der transition-Guard verwirft die Zwischenmeldung zusätzlich,
+      // falls der Lauf inzwischen abgelöst wurde (doppelte Sicherung neben dem Generation-Guard).
+      transition({ status, dauertLaenger: true, istWiederholung }, lauf)
     })
   }
 

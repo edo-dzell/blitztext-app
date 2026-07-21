@@ -46,8 +46,9 @@ import { pillenPosition } from '@main/window/pillen-position'
 import { pillenStatus } from '@main/window/pill-status'
 import { istAbbruchOderTimeout } from '@main/session/abbruch-guard'
 import { createSettingsStore, type BlitztextSettings, type ApiKeyStatus } from '@main/settings/store'
-import { sendeAn } from '@main/window/send-to-window'
+import { sendeAn, canSend } from '@main/window/send-to-window'
 import { warteAufFensterBereit } from '@main/window/fenster-bereitschaft'
+import { montiereFensterHeilung, type FensterHeilung } from '@main/window/fenster-heilung'
 // W3-F1: `workflowZuPreset` zog von @shared/workflows nach @main/rewrite/prompt-builder um (braucht
 // `berechneterPrompt`, um den Prompt-Text eines unveränderten Built-ins aufzulösen statt '' zu
 // exportieren — shared darf @main nicht als Wert importieren, siehe Kommentar in workflows.ts).
@@ -101,6 +102,13 @@ let pillWindow: BrowserWindow | null = null
 let pillFehlerTimer: ReturnType<typeof setTimeout> | null = null
 let stopUiohook: () => void = () => {}
 let isQuitting = false
+
+// v0.7.3 (B1): Selbstheilung der versteckten Renderer (Recorder/Pille) — bei will-quit entfernt (Liste,
+// weil zwei Fenster geheilt werden). Leer, bis nach dem Fenster-Bau montiert.
+const fensterHeilungen: FensterHeilung[] = []
+// v0.7.3 (B1): einmalige Warnung, falls die Pille nicht (mehr) sendbar ist (zerstört/nicht bereit) —
+// so wird das Log bei einem dauerhaft toten Pillen-Fenster nicht bei jedem onStatus vollgeschrieben.
+let pilleNichtVerfuegbarGemeldet = false
 
 // C5: Zustand des Update-Hintergrund-Checks (Start-Check ~1min, danach ~6h-Intervall). Der bestehende
 // 24h-Mindestabstand + ETag-Cache in pruefeAufUpdate() bleibt die Spam-Bremse — der Timer hier fragt
@@ -251,6 +259,30 @@ function positioniertePille(window: BrowserWindow): void {
   window.setBounds({ x, y, width: pw, height: ph })
 }
 
+// v0.7.3 (B1): die Status-Pille kann während des Betriebs zerstört werden oder (nach einem Renderer-
+// Crash + Reload) kurz nicht sendbar sein. Alle Pillen-Zugriffe (send/positionieren/showInactive/hide)
+// laufen über diese Hüllen: sie greifen NUR auf ein sendbares Fenster zu (canSend prüft null + Fenster-
+// und webContents-isDestroyed) und melden den Ausfall EINMAL text-frei, statt bei jedem onStatus zu
+// werfen (send auf zerstörtes webContents → uncaughtException → App-Tod) oder das Log vollzuschreiben.
+function pilleSichtbar(label: string): void {
+  if (!canSend(pillWindow)) {
+    if (!pilleNichtVerfuegbarGemeldet) {
+      pilleNichtVerfuegbarGemeldet = true
+      log.warnung('pille.nicht_verfuegbar')
+    }
+    return
+  }
+  pillWindow!.webContents.send('pill:status', label)
+  positioniertePille(pillWindow!)
+  pillWindow!.showInactive()
+}
+
+function pilleHide(): void {
+  // hide() auf ein zerstörtes Fenster wirft ebenfalls → nur bei sendbarem Fenster ausblenden. Kein
+  // separater Log-Eintrag hier (pilleSichtbar meldet den Ausfall bereits einmalig).
+  if (pillWindow && !pillWindow.isDestroyed()) pillWindow.hide()
+}
+
 function createTray(): void {
   tray = new Tray(resolveTrayIcon())
   tray.setToolTip('Blitztext')
@@ -332,6 +364,23 @@ function benachrichtige(
   // Der Notification-Aktions-Button feuert 'action' mit dem Button-Index (hier nur Button 0).
   if (aktion) n.on('action', (_event, index) => index === 0 && aktion.aufAktion())
   n.show()
+}
+
+// v0.7.3 (A3/B1): einmaliger Korruptions-Melder für die Einstellungen. Der Store (A3) legt eine
+// unlesbare settings.json als settings.json.korrupt beiseite und fällt auf Defaults zurück; er loggt/
+// benachrichtigt bewusst NICHT selbst (keine log-/GUI-Dep im Kern), sondern ruft diesen Callback.
+// Derselbe Callback wird an BEIDE Store-Instanzen gereicht (Startpfad + Komposition) — der `korrupt-
+// Gemeldet`-Flag verhindert eine Doppel-Notification, falls beide load()-Pfade dieselbe kaputte Datei
+// treffen. Text-frei: nur der Umstand + die feste, generische Meldung (kein Dateiinhalt).
+let korruptGemeldet = false
+function meldeSettingsKorrupt(): void {
+  if (korruptGemeldet) return
+  korruptGemeldet = true
+  log.warnung('einstellungen.korrupt')
+  benachrichtige(
+    'Blitztext',
+    'Einstellungen waren beschädigt und wurden zurückgesetzt. Alte Datei: settings.json.korrupt'
+  )
 }
 
 // P1: apiKeyStatus[anbieterId] setzen (status) oder entfernen (null) — frisch laden, NUR diesen Eintrag
@@ -566,7 +615,15 @@ if (!gotTheLock) {
     // Reihenfolge (ADR-0010): Settings laden (liefert standardAnbieterId) → Legacy-Key (api-key.bin)
     // auf die anbieter-spezifische Datei migrieren → Vault bauen → dann Komposition.
     const settingsFile = createSettingsFile()
-    const startSettings = await createSettingsStore({ file: settingsFile }).load()
+    // v0.7.3 (A3/B1): auch der Startpfad-Store bekommt den Korruptions-Callback — er ist der ERSTE
+    // load() beim Start (liefert standardAnbieterId für die Key-Migration), also die wahrscheinlichste
+    // Stelle, an der eine kaputte Datei auffällt. Der `korruptGemeldet`-Flag im Callback verhindert eine
+    // Doppel-Notification, falls der spätere Komposition-Store dieselbe (bereits beiseitegelegte) Datei
+    // erneut trifft.
+    const startSettings = await createSettingsStore({
+      file: settingsFile,
+      aufKorruption: meldeSettingsKorrupt
+    }).load()
     // v0.7.2: gespeicherte Debug-Stufe des Ereignislogs übernehmen (env BLITZTEXT_DEBUG=1 bleibt erzwungen).
     log.setzeDebugAktiv?.(startSettings.ausfuehrlichesProtokoll)
     await migriereLegacyApiKey({
@@ -577,9 +634,11 @@ if (!gotTheLock) {
     createTray()
 
     // Farbschema: Systemänderungen an die Fenster broadcasten + Tray-Icon nachziehen (#Design).
+    // v0.7.3 (B1): der Broadcast läuft über sendeAn (canSend-Gate) — ein gerade zerstörtes/neu ladendes
+    // Fenster in der Liste würde bei nacktem webContents.send sonst werfen (uncaughtException → App-Tod).
     nativeTheme.on('updated', () => {
       const dark = nativeTheme.shouldUseDarkColors
-      for (const w of BrowserWindow.getAllWindows()) w.webContents.send('theme:systemChanged', dark)
+      for (const w of BrowserWindow.getAllWindows()) sendeAn(w, 'theme:systemChanged', dark)
       aktualisiereTrayIcon(dark)
     })
 
@@ -617,6 +676,9 @@ if (!gotTheLock) {
       ausgabe,
       apiKeys,
       settingsFile,
+      // v0.7.3 (A3/B1): derselbe Korruptions-Callback wie beim Startpfad-Store (korruptGemeldet-Flag
+      // schützt vor Doppel-Notification, falls beide Stores die kaputte Datei treffen).
+      aufSettingsKorruption: meldeSettingsKorrupt,
       // V2 Strang D: verschlüsselter Verlauf (safeStorage/DPAPI) + text-freie Statistik.
       verlaufCipher: safeStorageCipher,
       verlaufFile: createHistoryFile(),
@@ -639,6 +701,32 @@ if (!gotTheLock) {
       })
     })
     holeStandardAnbieterId = () => comp.standardAnbieterId()
+
+    // v0.7.3 (B1): Selbstheilung der versteckten Renderer montieren — NACH createRecorder (das läuft in
+    // createMainComposition oben und registriert im recorder-adapter seinen eigenen 'render-process-gone'-
+    // Listener, der einen wartenden stop() ablehnt). Registrierungsreihenfolge = Feuerreihenfolge: der
+    // Adapter-Listener feuert VOR unserem Reload, also läuft das stop()-Reject zuerst und der Reload trifft
+    // ein sauber abgeräumtes webContents. Recorder: Notification bei Aufgabe (Aufnahme dauerhaft tot ist
+    // sichtbar relevant); Pille: nur Log (rein visueller Statushinweis, kein Datenverlust).
+    if (recorderWindow) {
+      fensterHeilungen.push(
+        montiereFensterHeilung({
+          fenster: recorderWindow,
+          name: 'recorder',
+          log,
+          beiAufgabe: () =>
+            benachrichtige(
+              'Blitztext',
+              'Das Aufnahme-Fenster ist wiederholt abgestürzt. Bitte Blitztext neu starten.'
+            )
+        })
+      )
+    }
+    if (pillWindow) {
+      fensterHeilungen.push(
+        montiereFensterHeilung({ fenster: pillWindow, name: 'pille', log })
+      )
+    }
 
     // IPC erst nach dem Bau der Komposition registrieren (Handler brauchen comp), dann Fenster zeigen.
     registerIpc(apiKeys, comp)
@@ -678,23 +766,23 @@ if (!gotTheLock) {
       sendeAn(settingsWindow, 'workflow:status', phase)
 
       // Status-Pille (fokusfrei, Recorder-Fenster) nutzt weiterhin die gemappte PillenStatus lokal hier.
+      // v0.7.3 (B1): ALLE Pillen-Zugriffe laufen über die canSend/isDestroyed-gesicherten Hüllen
+      // (pilleSichtbar/pilleHide) — ein während des Betriebs zerstörtes (oder gerade neu geladenes)
+      // Pillen-Fenster darf keinen send-auf-Zerstörtes-Crash mehr auslösen.
       const s = pillenStatus(phase)
-      if (!pillWindow) return
       if (pillFehlerTimer) {
         clearTimeout(pillFehlerTimer)
         pillFehlerTimer = null
       }
       if (s.sichtbar) {
-        pillWindow.webContents.send('pill:status', s.label)
-        positioniertePille(pillWindow)
-        pillWindow.showInactive()
+        pilleSichtbar(s.label)
         // Fehler/Teil-Erfolg bleiben sonst stehen (kein weiteres onStatus bis zum nächsten Lauf) → auto-ausblenden.
         // A3: Anzeigedauer kommt aus pillenStatus() (nach Textlänge gestaffelt, gedeckelt) statt fixer 4000ms.
         if (phase.status === 'fehler' || phase.status === 'teilErfolg') {
-          pillFehlerTimer = setTimeout(() => pillWindow?.hide(), s.dauerMs ?? 4000)
+          pillFehlerTimer = setTimeout(() => pilleHide(), s.dauerMs ?? 4000)
         }
       } else {
-        pillWindow.hide()
+        pilleHide()
       }
     }
 
@@ -761,6 +849,8 @@ if (!gotTheLock) {
   app.on('will-quit', () => {
     log.info('app.ende')
     stopUiohook()
+    // v0.7.3 (B1): Fenster-Heilungs-Listener abmelden (kein Reload mehr während des App-Abbaus).
+    for (const h of fensterHeilungen) h.entferne()
     perf.stoppe() // No-Op bei NOOP_PERF; verhindert einen hängenden Log-Timer bei BLITZTEXT_PERF=1
     // C5: Update-Timer aufräumen (Start-Timeout kann beim Beenden noch ausstehen, Intervall läuft sonst weiter).
     if (updateStartTimer) clearTimeout(updateStartTimer)

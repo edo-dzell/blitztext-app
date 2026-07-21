@@ -395,6 +395,79 @@ describe('createSettingsStore', () => {
     await expect(store.load()).resolves.toEqual(defaultSettings())
   })
 
+  // A3 (v0.7.3): Korruptions-Rettung — beiseiteLegen + aufKorruption-Callback bei unlesbarer Datei.
+  describe('Korruptions-Rettung (A3)', () => {
+    // Fake-Port mit beiseiteLegen-Zähler.
+    function korruptFile(initial: string | null) {
+      let content = initial
+      let beiseiteGelegt = 0
+      return {
+        file: {
+          async read() {
+            return content
+          },
+          async write(next: string) {
+            content = next
+          },
+          async beiseiteLegen() {
+            beiseiteGelegt++
+            content = null // Datei „umbenannt" → beim nächsten read weg
+          }
+        } satisfies SettingsFile,
+        get beiseiteGelegt() {
+          return beiseiteGelegt
+        }
+      }
+    }
+
+    it('kaputtes JSON: legt die Datei beiseite, ruft aufKorruption und liefert Defaults', async () => {
+      const f = korruptFile('{ das ist kaputt')
+      let callbacks = 0
+      const store = createSettingsStore({ file: f.file, aufKorruption: () => callbacks++ })
+
+      await expect(store.load()).resolves.toEqual(defaultSettings())
+      expect(f.beiseiteGelegt).toBe(1)
+      expect(callbacks).toBe(1)
+    })
+
+    it('fehlende Datei (null): KEIN Callback, KEIN Beiseitelegen, Defaults', async () => {
+      const f = korruptFile(null)
+      let callbacks = 0
+      const store = createSettingsStore({ file: f.file, aufKorruption: () => callbacks++ })
+
+      await expect(store.load()).resolves.toEqual(defaultSettings())
+      expect(f.beiseiteGelegt).toBe(0)
+      expect(callbacks).toBe(0)
+    })
+
+    it('gültige Datei: KEIN Callback, KEIN Beiseitelegen', async () => {
+      const f = korruptFile(JSON.stringify({ language: 'en' }))
+      let callbacks = 0
+      const store = createSettingsStore({ file: f.file, aufKorruption: () => callbacks++ })
+
+      const loaded = await store.load()
+      expect(loaded.language).toBe('en')
+      expect(f.beiseiteGelegt).toBe(0)
+      expect(callbacks).toBe(0)
+    })
+
+    it('Fake-Port OHNE beiseiteLegen: wirft bei Korruption nicht, liefert Defaults + Callback', async () => {
+      // fakeFile hat kein beiseiteLegen (optionale Methode) → der Store ruft `?.()` und läuft weiter.
+      let callbacks = 0
+      const store = createSettingsStore({
+        file: fakeFile('kein json'),
+        aufKorruption: () => callbacks++
+      })
+      await expect(store.load()).resolves.toEqual(defaultSettings())
+      expect(callbacks).toBe(1)
+    })
+
+    it('ohne aufKorruption-Callback: kaputtes JSON liefert weiterhin Defaults (No-Op-Default)', async () => {
+      const store = createSettingsStore({ file: fakeFile('kaputt') })
+      await expect(store.load()).resolves.toEqual(defaultSettings())
+    })
+  })
+
   it('ersetzt einen unbekannten Aufnahmemodus durch den Default (hold)', async () => {
     const store = createSettingsStore({
       file: fakeFile(JSON.stringify({ aufnahmemodus: 'dauerfeuer' }))

@@ -34,4 +34,12 @@ describe('sendeAn', () => {
     sendeAn(w, 'history:changed')
     expect(w.gesendet).toEqual([])
   })
+  it('no-op bei zerstörten webContents (kein send-auf-Zerstörtes-Crash)', () => {
+    const w = fenster({ wcDestroyed: true })
+    sendeAn(w, 'theme:systemChanged', true)
+    expect(w.gesendet).toEqual([])
+  })
+  it('no-op bei null (Broadcast über eine Liste mit leerem Slot)', () => {
+    expect(() => sendeAn(null, 'theme:systemChanged', false)).not.toThrow()
+  })
 })

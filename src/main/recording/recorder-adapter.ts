@@ -55,6 +55,27 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
   // stop läuft. Wird beim Aufräumen genullt, damit ein Renderer-Tod-Event keinen alten stop trifft.
   let brichLaufendenStopAb: ((fehler: Error) => void) | null = null
 
+  // v0.7.3 (A1): externer Aufnahme-Fehlerkanal. Der Renderer kann einen 'recorder:error' senden, WÄHREND
+  // gar kein stop() läuft (Aufnahme läuft noch, aber das Mikrofon fällt aus — z. B. exklusiv belegt,
+  // MediaRecorder-Fehler). Der wartende-stop()-once-Listener existiert dann nicht → der Fehler ginge
+  // verloren, die Pille zeigte weiter „Aufnahme". `externerFehlerCb` reicht ihn an den Runner
+  // (meldeAufnahmeFehler). Wird über onFehler() gesetzt; null = nicht verdrahtet (kein Verhaltensbruch).
+  let externerFehlerCb: ((message: string) => void) | null = null
+  // true, solange ein stop() auf sein Ergebnis wartet: dann hat der once-Listener in stop() Vorrang und
+  // der dauerhafte Listener hält sich raus (keine Doppelverarbeitung desselben recorder:error).
+  let stopLaeuft = false
+
+  // Dauerhafter Listener (die Lebensdauer des Adapters, NICHT pro stop() abgeräumt): fängt recorder:error
+  // AUSSERHALB eines wartenden stop() ab. Der wartende stop() nutzt seinen eigenen once('recorder:error')
+  // — der `stopLaeuft`-Guard verhindert, dass BEIDE denselben Fehler verarbeiten.
+  const beiExternemFehler = (_e: IpcMainEvent, message: string): void => {
+    if (stopLaeuft) return // der stop()-once-Listener übernimmt → hier nichts tun (keine Doppelmeldung)
+    // Feld-Beleg (text-frei): externer Aufnahme-Fehler ohne laufenden stop(). Nur die gekürzte Meldung.
+    log.fehler('recorder.fehler_extern', { message: (message ?? '').slice(0, 200) })
+    externerFehlerCb?.(message ?? 'Aufnahme fehlgeschlagen.')
+  }
+  ipcMain.on('recorder:error', beiExternemFehler)
+
   // Renderer-Tod (Crash/Kill) reißt einen wartenden stop() aus dem Hänger: die once-Listener auf
   // ipcMain feuern dann nie → wir lösen den offenen stop() selbst mit Fehler auf. Einmal registriert,
   // greift für die Lebensdauer des (pro Aufnahme neu erzeugten) Fensters.
@@ -74,9 +95,21 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
   return {
     start() {
       // sendeSicher bleibt generisch; das Ergebnis wird hier zum Feld-Beleg (Kanal), nie im Helfer.
-      if (!sendeSicher(fenster, 'recorder:start')) log.warnung('recorder.sende_fehl', { kanal: 'start' })
+      if (!sendeSicher(fenster, 'recorder:start')) {
+        log.warnung('recorder.sende_fehl', { kanal: 'start' })
+        // v0.7.3 (A1): das Aufnahme-Fenster ist nicht verfügbar → der Runner steht in Phase 'aufnehmen'
+        // und bekäme sonst nie ein stop()-Ergebnis (der Nutzer hält evtl. nur kurz und lässt gleich los,
+        // aber ohne laufende Aufnahme). Sofort über den externen Fehlerkanal melden, damit die Pille den
+        // Fehler zeigt statt endlos „Aufnahme".
+        externerFehlerCb?.('Aufnahme-Fenster nicht verfügbar.')
+      }
       // v0.7.2 debug: nur der Umstand „Start-Befehl abgesetzt" — kein Audio/Text, keine Felder.
       else log.debug('recorder.start_gesendet')
+    },
+    onFehler(cb) {
+      // v0.7.3 (A1): Composition verdrahtet hier runner.meldeAufnahmeFehler. Ein einzelner Empfänger reicht
+      // (ein Runner je Recorder); der letzte Aufruf gewinnt.
+      externerFehlerCb = cb
     },
     discard() {
       // discard() darf NIE werfen: der Runner ruft es fire-and-forget aus abbrechen() und geht danach
@@ -90,11 +123,17 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
       // ablehnen — sonst hinterließe der überschriebene brichLaufendenStopAb verwaiste once-Listener,
       // und der erste stop() hinge für immer.
       brichLaufendenStopAb?.(new DOMException('Aufnahme abgelöst durch erneutes Stoppen.', 'AbortError'))
+      // v0.7.3 (A1): ab jetzt hat der stop()-eigene once('recorder:error')-Listener Vorrang; der
+      // dauerhafte externe Listener (beiExternemFehler) hält sich per stopLaeuft-Guard raus. Wichtig:
+      // der dauerhafte Listener wurde ZUERST registriert und feuert daher vor dem once-Listener — der
+      // Guard greift also, bevor aufraeumen() ihn wieder freigibt (keine Doppelverarbeitung).
+      stopLaeuft = true
       return new Promise<RecordingResult>((resolve, reject) => {
         const aufraeumen = (): void => {
           ipcMain.removeListener('recorder:result', onResult)
           ipcMain.removeListener('recorder:error', onError)
           brichLaufendenStopAb = null
+          stopLaeuft = false // stop() beendet → der dauerhafte externe Listener übernimmt wieder
         }
         const onResult = (_e: IpcMainEvent, data: RecorderErgebnis): void => {
           aufraeumen()

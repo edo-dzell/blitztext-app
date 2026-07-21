@@ -1220,4 +1220,197 @@ describe('createWorkflowRunner', () => {
     await runner.stop()
     expect(runner.phase).toEqual({ status: 'fertig', text: 'roh' })
   })
+
+  // --- v0.7.3 (A1): Laufkapsel — Interleaving-Races zweier Läufe im selben Runner ---
+  //
+  // Vor der Kapselung lagen `abgebrochen`/`controller`/`istTimeout` als RUNNER-WEITE Closures. Startete
+  // ein zweiter Lauf B, während der erste Lauf A noch in-flight hing (abgebrochen oder langsam), teilten
+  // sich beide diesen Zustand → A's später catch/abschluss las den von B frisch gesetzten Wert und
+  // schrieb falsch (Fehlermeldung eines abgebrochenen Laufs, oder Überschreiben des frischen Zustands).
+  // Die LaufKontext-Kapsel + istAktuell-Guard verhindert das. Alle Läufe sind hier DETERMINISTISCH über
+  // manuell auflösbare deferreds getaktet (kein setTimeout-Timing).
+
+  /** Ein von außen auflösbares Promise (kontrollierte Deferreds für die Race-Tests). */
+  function deferred<T>() {
+    let resolve!: (wert: T) => void
+    let reject!: (grund: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  it('Race: Abbruch von Lauf A + sofortiger Neustart als Lauf B — A trifft B NICHT (kein falscher Fehler)', async () => {
+    // Zwei Transkriptionen nacheinander; jede hängt an ihrem eigenen deferred, das wir manuell steuern.
+    const tore = [deferred<string>(), deferred<string>()]
+    let n = 0
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: {
+          async transcribe(_audio, opts) {
+            const meins = tore[n++]!
+            // Abbruch-Signal → wie der echte Provider mit AbortError ablehnen.
+            opts?.signal?.addEventListener('abort', () =>
+              meins.reject(new DOMException('Aborted', 'AbortError'))
+            )
+            return meins.promise
+          }
+        }
+      })
+    )
+
+    // Lauf A: start → stop; Transkription hängt (Tor 0 offen).
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const stopA = runner.stop()
+    await tick()
+    expect(runner.phase.status).toBe('transkribieren')
+
+    // A abbrechen: der A-Lauf wird abgebrochen (aktuellerLauf=null, still nach idle). Sein hängendes
+    // Transkriptions-Promise lehnt gleich mit AbortError ab — sein catch muss den Alt-Lauf-Schutz greifen.
+    runner.abbrechen()
+    expect(runner.phase).toEqual({ status: 'idle' })
+    const terminalA = await stopA
+    expect(terminalA).toEqual({ status: 'idle' })
+
+    // Lauf B: SOFORT ein frisches Diktat starten und stoppen (Tor 1). Mit dem ALTEN Code teilte sich B
+    // den `abgebrochen`-Zustand mit A; A's noch abzuwickelnder catch hätte B's frisch gesetzten Zustand
+    // gesehen. Jetzt ist B ein eigener LaufKontext.
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const stopB = runner.stop()
+    await tick()
+    expect(runner.phase.status).toBe('transkribieren') // B läuft sauber, KEIN aufgezwungener idle/fehler
+
+    tore[1]!.resolve('bee sauber')
+    const terminalB = await stopB
+    // B kommt sauber durch — A's abgebrochener Lauf hat B NICHT verfälscht.
+    expect(terminalB).toEqual({ status: 'fertig', text: 'bee sauber' })
+    expect(runner.phase).toEqual({ status: 'fertig', text: 'bee sauber' })
+  })
+
+  it('Race: veralteter Lauf A liefert seinen Erfolg SPÄT — überschreibt weder Phase noch letzteAufnahme von B', async () => {
+    // Lauf A hängt in der Transkription; wir brechen ihn ab und starten B (frisches Diktat). DANACH lösen
+    // wir A's Transkription doch noch mit Erfolg auf — der veraltete A-abschluss darf NICHTS schreiben.
+    const torA = deferred<string>()
+    let n = 0
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: {
+          async transcribe() {
+            if (n++ === 0) {
+              // Lauf A: NICHT auf abort reagieren — wir lösen ihn bewusst später mit ERFOLG auf, um den
+              // „veralteter Erfolg schreibt durch"-Bug zu treffen (nicht nur den Abbruch-Pfad).
+              return torA.promise
+            }
+            return 'bee frisch' // Lauf B: sofort fertig
+          }
+        }
+      })
+    )
+
+    // Lauf A starten + stoppen (hängt im Tor A).
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const stopA = runner.stop()
+    await tick()
+    expect(runner.phase.status).toBe('transkribieren')
+
+    // A abbrechen → aktuellerLauf=null, idle. A's Transkription hängt weiter (Tor A noch offen).
+    runner.abbrechen()
+    expect(runner.phase).toEqual({ status: 'idle' })
+
+    // Lauf B: frisches Diktat, läuft komplett durch → 'fertig', kein gehaltenes Audio mehr.
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const terminalB = await runner.stop()
+    expect(terminalB).toEqual({ status: 'fertig', text: 'bee frisch' })
+    expect(runner.kannErneutVersuchen()).toBe(false) // B war erfolgreich → Audio verworfen
+
+    // JETZT löst A's Transkription doch noch mit Erfolg auf. Mit dem ALTEN Code liefe A's Rest durch bis
+    // abschluss(): das hätte die Phase auf A's Ergebnis gesetzt UND letzteAufnahme angefasst. istAktuell
+    // fängt das ab: der A-Lauf ist längst nicht mehr aktuell → still, kein Schreiben.
+    torA.resolve('aah alt und veraltet')
+    // stopA lief bereits durch (idle nach Abbruch); der interne verarbeiteAufnahme-Rest wickelt sich ab.
+    await stopA.catch(() => undefined)
+    await tick()
+    await tick()
+
+    // Phase + Retry-Basis unverändert von B — A hat NICHTS überschrieben.
+    expect(runner.phase).toEqual({ status: 'fertig', text: 'bee frisch' })
+    expect(runner.letzteMetrik?.endtext).toBe('bee frisch')
+    expect(runner.kannErneutVersuchen()).toBe(false)
+  })
+
+  it('Abbruch während Transkription verwirft das gehaltene Audio → kannErneutVersuchen() === false (W3-B-Invariante)', async () => {
+    // Regression: abbrechen() setzt aktuellerLauf=null; der catch des abgebrochenen Laufs greift danach
+    // den istAktuell-Alt-Lauf-Schutz und erreicht den `lauf.abgebrochen`-Zweig NIE mehr. Ohne den Fix in
+    // abbrechen() (letzteAufnahme=null) bliebe das gehaltene Audio gesetzt und die Tray-Aktion „Erneut
+    // versuchen" böte VERWORFENES Audio an — Widerspruch zur Invariante sitzung.ts:354.
+    const tor = deferred<string>()
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: {
+          async transcribe(_audio, opts) {
+            opts?.signal?.addEventListener('abort', () =>
+              tor.reject(new DOMException('Aborted', 'AbortError'))
+            )
+            return tor.promise
+          }
+        }
+      })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const stopP = runner.stop()
+    await tick()
+    expect(runner.phase.status).toBe('transkribieren') // Audio ist ab hier gehalten (letzteAufnahme=recording)
+
+    // Abbruch mitten in der Transkription: Audio muss verworfen werden → kein Retry auf Verworfenem.
+    runner.abbrechen()
+    expect(runner.phase).toEqual({ status: 'idle' })
+    expect(runner.kannErneutVersuchen()).toBe(false)
+
+    // Auch nachdem der abgebrochene Lauf sein spätes AbortError-Reject abgewickelt hat: weiterhin false,
+    // Phase idle unberührt (der Alt-Lauf-Schutz darf keinen Zustand mehr schreiben).
+    await stopP
+    await tick()
+    await tick()
+    expect(runner.kannErneutVersuchen()).toBe(false)
+    expect(runner.phase).toEqual({ status: 'idle' })
+  })
+
+  it('Race: externer Aufnahme-Fehler in Phase aufnehmen → fehler; ein späterer Neustart bleibt sauber', async () => {
+    // meldeAufnahmeFehler wirkt NUR in Phase 'aufnehmen' (Alt-Lauf-Schutz). Hier: Fehler in der Aufnahme,
+    // dann ein frischer Lauf, der normal durchläuft (der externe Fehler darf ihn nicht vergiften).
+    const runner = createWorkflowRunner(
+      makeDeps({ transcription: { async transcribe() { return 'frisch' } } })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    expect(runner.phase).toEqual({ status: 'aufnehmen' })
+
+    // Mikrofon fällt während der Aufnahme aus → externer Kanal.
+    runner.meldeAufnahmeFehler('Mikrofon exklusiv belegt')
+    expect(runner.phase).toEqual({ status: 'fehler', art: 'aufnahme', message: 'Mikrofon exklusiv belegt' })
+    expect(runner.kannErneutVersuchen()).toBe(false) // nichts Brauchbares gehalten
+
+    // Frischer Lauf danach: sauber.
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const terminal = await runner.stop()
+    expect(terminal).toEqual({ status: 'fertig', text: 'frisch' })
+  })
+
+  it('meldeAufnahmeFehler außerhalb der Aufnahme-Phase ist ein No-Op (Alt-Lauf-Schutz)', async () => {
+    // Ein verspäteter externer Fehler, nachdem der Lauf längst 'fertig' ist, darf den Zustand nicht kippen.
+    const runner = createWorkflowRunner(makeDeps({ transcription: { async transcribe() { return 'ok' } } }))
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const terminal = await runner.stop()
+    expect(terminal).toEqual({ status: 'fertig', text: 'ok' })
+
+    runner.meldeAufnahmeFehler('zu spät')
+    expect(runner.phase).toEqual({ status: 'fertig', text: 'ok' }) // unverändert
+  })
+
+  // Kleine Test-Helferzeile: ein Mikro-Tick, damit hängende Promises einen Zyklus laufen.
+  function tick(): Promise<void> {
+    return new Promise((r) => setTimeout(r, 0))
+  }
 })

@@ -53,4 +53,53 @@ describe('createSettingsFile (fs-Wrapper)', () => {
     await file.write('zweit')
     expect(await file.read()).toBe('zweit')
   })
+
+  // A3 (v0.7.3): atomarer Roundtrip + Korruptions-Rettung.
+  it('atomarer Roundtrip: keine .tmp-Datei bleibt nach dem write zurück', async () => {
+    const file = createSettingsFile(pfad)
+    await file.write('{"a":1}')
+    expect(await file.read()).toBe('{"a":1}')
+    // Die temporäre Datei wurde umbenannt, existiert also nicht mehr.
+    const tmp = createSettingsFile(`${pfad}.tmp`)
+    expect(await tmp.read()).toBeNull()
+  })
+
+  it('Absturz-Simulation: schlägt das Ersetzen fehl, bleibt die alte Datei unversehrt (Ziel-Verzeichnis nur-lesbar)', async () => {
+    // Als root sind Verzeichnis-Rechte wirkungslos → Test überspringen (deterministisch nur non-root).
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return
+
+    const unterordner = join(dir, 'ro')
+    const direkt = join(unterordner, 'settings.json')
+    const file = createSettingsFile(direkt)
+    await file.write('alt-gut')
+
+    // Verzeichnis nur-lesbar machen → rename(tmp → Ziel) scheitert (EACCES/EPERM), tmp wird nicht
+    // übernommen. writeFile der tmp scheitert ebenfalls; in jedem Fall bleibt die alte Datei intakt.
+    const { chmod } = await import('node:fs/promises')
+    await chmod(unterordner, 0o500)
+    try {
+      await expect(file.write('neu-halb')).rejects.toBeTruthy()
+    } finally {
+      await chmod(unterordner, 0o700) // für den afterEach-rm wieder beschreibbar
+    }
+    // Die alte Datei ist unverändert lesbar (nie halb überschrieben).
+    expect(await file.read()).toBe('alt-gut')
+  })
+
+  it('beiseiteLegen: verschiebt eine korrupte Datei nach settings.json.korrupt', async () => {
+    const direkt = join(dir, 'settings.json')
+    await writeFile(direkt, '{ halb', 'utf-8')
+    const file = createSettingsFile(direkt)
+
+    await file.beiseiteLegen!()
+
+    // Original weg, .korrupt trägt den Inhalt.
+    expect(await file.read()).toBeNull()
+    expect(await readFile(`${direkt}.korrupt`, 'utf-8')).toBe('{ halb')
+  })
+
+  it('beiseiteLegen: wirft nie, auch wenn keine Datei existiert', async () => {
+    const file = createSettingsFile(join(dir, 'gibt-es-nicht.json'))
+    await expect(file.beiseiteLegen!()).resolves.toBeUndefined()
+  })
 })

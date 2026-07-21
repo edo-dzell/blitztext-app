@@ -207,9 +207,17 @@ describe('uiohook-source Ereignislog', () => {
 function fakePasteSpawn(strategieExit: number): typeof spawn {
   return ((_cmd: string, args: string[]) => {
     const kind = new EventEmitter() as unknown as ReturnType<typeof spawn>
-    // stdin für --set-clip (schreibUeberHelfer)
+    // stdin für --set-clip (schreibUeberHelfer): write nimmt optional einen Callback (A2), on('error')
+    // wird registriert. Echtes stdin ist ein Writable-Stream mit .on — hier als No-Op-Double.
+    const stdin = {
+      write: (_text: string, cb?: (fehler?: Error | null) => void) => {
+        cb?.(null)
+      },
+      end: () => {},
+      on: () => {}
+    }
     // @ts-expect-error - Test-Double
-    kind.stdin = { write: () => {}, end: () => {} }
+    kind.stdin = stdin
     // @ts-expect-error - Test-Double
     kind.stdout = new EventEmitter()
     // @ts-expect-error - Test-Double

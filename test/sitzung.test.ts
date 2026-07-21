@@ -893,3 +893,103 @@ describe('createSitzung', () => {
     expect(calls.anzeigen).toEqual([])
   })
 })
+
+// --- v0.7.3 (A1): externer Aufnahme-Fehler routet über onPhase, ohne dass stoppe() gerufen wurde ---
+
+/**
+ * Sitzung mit einem Recorder, dessen onFehler-Callback wie in der Composition auf
+ * runner.meldeAufnahmeFehler verdrahtet ist. `feuereAufnahmeFehler()` löst den externen Fehler aus
+ * (Mikrofon fällt während der Aufnahme aus) — der Runner geht dann auf 'fehler', und die Sitzung muss
+ * das über ihren onPhase-Handler routen (Meldung + Reservierung räumen).
+ */
+function makeSitzungMitFehlerkanal() {
+  const recorder = {
+    started: 0,
+    stopped: 0,
+    discarded: 0,
+    fehlerCb: null as ((m: string) => void) | null,
+    start(): void {
+      recorder.started++
+    },
+    async stop() {
+      recorder.stopped++
+      return { audio, durationSeconds: 1.5 }
+    },
+    discard(): void {
+      recorder.discarded++
+    },
+    onFehler(cb: (m: string) => void): void {
+      recorder.fehlerCb = cb
+    }
+  }
+  const runner = createWorkflowRunner({
+    recorder,
+    transcription: { async transcribe() { return 'roh' } },
+    rewrite: { async rewrite() { return { text: 'um' } } },
+    resolveSystemPrompt,
+    quality
+  })
+  // Verdrahtung wie in der Composition (A1).
+  recorder.onFehler((m) => runner.meldeAufnahmeFehler(m))
+
+  const einstellungen = createSettingsStore({
+    file: {
+      async read() {
+        return null
+      },
+      async write() {}
+    }
+  })
+  const calls = {
+    melde: [] as FehlerMeldung[],
+    einfügen: [] as string[],
+    inZwischenablage: [] as string[]
+  }
+  const ausgabe: Ausgabe = {
+    einfügen: (t) => calls.einfügen.push(t),
+    anzeigen: () => {},
+    zeigeEinstellungen: () => {},
+    melde: (f) => calls.melde.push(f),
+    inZwischenablage: (t) => calls.inZwischenablage.push(t),
+    erfasseFenster: async () => null
+  }
+  const apiKeys = { async has() { return true } }
+  const sitzung = createSitzung({ runner, einstellungen, apiKeys, ausgabe })
+  return { sitzung, calls, recorder, feuereAufnahmeFehler: (m: string) => recorder.fehlerCb?.(m) }
+}
+
+describe('createSitzung — externer Aufnahme-Fehler (A1)', () => {
+  it('meldet den Fehler UND räumt die Reservierung (App danach nicht mehr beschäftigt)', async () => {
+    const { sitzung, calls, feuereAufnahmeFehler } = makeSitzungMitFehlerkanal()
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    expect(sitzung.beschaeftigt()).toBe(true) // Aufnahme läuft, Reservierung offen
+
+    // Mikrofon fällt während der Aufnahme aus → der externe Kanal geht zum Runner → onPhase-Routing.
+    feuereAufnahmeFehler('Mikrofon exklusiv belegt')
+    await tick()
+
+    // Der Nutzer sieht eine Fehlermeldung …
+    expect(calls.melde.length).toBe(1)
+    // … und die Reservierung ist geräumt: die App ist wieder frei für den nächsten Hotkey.
+    expect(sitzung.beschaeftigt()).toBe(false)
+    expect(calls.einfügen).toEqual([]) // nichts eingefügt (es gab keinen Endtext)
+  })
+
+  it('ein danach eintreffendes stoppe() (Chord-Loslassen) ist ein No-Op (kein Phantom-Stop/Doppelmeldung)', async () => {
+    const { sitzung, calls, recorder, feuereAufnahmeFehler } = makeSitzungMitFehlerkanal()
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    feuereAufnahmeFehler('Mikrofon exklusiv belegt')
+    await tick()
+    expect(calls.melde.length).toBe(1)
+    const stopsVorher = recorder.stopped
+
+    // Der Nutzer lässt den Chord jetzt erst los → stoppe(). aktiveQuelle ist bereits null (vom Routing
+    // geräumt) → Desync-Guard (:268) greift: kein weiterer recorder.stop(), keine zweite Meldung.
+    await sitzung.stoppe()
+
+    expect(recorder.stopped).toBe(stopsVorher) // kein Phantom-recorder.stop()
+    expect(calls.melde.length).toBe(1) // keine Doppelmeldung
+  })
+})

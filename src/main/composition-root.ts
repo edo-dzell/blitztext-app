@@ -85,6 +85,13 @@ export interface CompositionDeps extends NativePorts {
    * NOOP_EREIGNISLOG genutzt (headless-Tests bleiben ohne Datei-Senke, Verhalten unverändert).
    */
   log?: EreignisLog
+  /**
+   * v0.7.3 (A3/B1): Korruptions-Callback für den Einstellungs-Store. Feuert, wenn die settings.json
+   * existiert, aber nicht lesbar/parsebar ist (der Store legt sie dann als settings.json.korrupt
+   * beiseite und fällt auf Defaults zurück). index.ts reicht denselben Callback auch an den
+   * Startpfad-Store durch (Log + Notification). Optional/No-Op-Default → headless-Tests unverändert.
+   */
+  aufSettingsKorruption?: () => void
 }
 
 export interface MainComposition {
@@ -206,7 +213,11 @@ export function routeDispatch(
 export async function createMainComposition(deps: CompositionDeps): Promise<MainComposition> {
   // v0.7.2: TEXT-FREIES Ereignislog. Ohne Dep ein No-Op → an runner/sitzung/protokoll durchgereicht.
   const log = deps.log ?? NOOP_EREIGNISLOG
-  const einstellungen = createSettingsStore({ file: deps.settingsFile })
+  // v0.7.3 (A3/B1): Korruptions-Callback durchreichen (Store legt die kaputte Datei beiseite + meldet).
+  const einstellungen = createSettingsStore({
+    file: deps.settingsFile,
+    aufKorruption: deps.aufSettingsKorruption
+  })
   let settings = await einstellungen.load()
 
   // Anbieter-Auflösung (ADR-0010): Standard-Anbieter (für Assistent/Validierung) + der pro Lauf aktive
@@ -239,6 +250,12 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     treueDetektor: createTreueDetektor(),
     log
   })
+
+  // v0.7.3 (A1): externer Aufnahme-Fehlerkanal. Fällt das Mikrofon WÄHREND der Aufnahme aus (Recorder
+  // sendet recorder:error, ohne dass gerade ein stop() wartet), meldet der Recorder es hier an den
+  // Runner → Phase 'aufnehmen' wird zu einem echten 'fehler' statt endlos „Aufnahme" zu zeigen.
+  // Optional (?.): Recorder-Fakes ohne den Kanal lassen die Verdrahtung ein No-Op.
+  deps.recorder.onFehler?.((message) => runner.meldeAufnahmeFehler(message))
 
   // Verlauf (verschlüsselt, opt-in) + Statistik (text-frei) + Protokoll-Adapter (Strang D).
   const verlauf = createVerlaufStore({
