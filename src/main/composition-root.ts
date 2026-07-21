@@ -38,6 +38,7 @@ import {
   type ErreichbarkeitsPort,
   type HealthErgebnis
 } from '@main/health'
+import { NOOP_EREIGNISLOG, redigiereFehler, type EreignisLog } from '@main/diagnostics/ereignis-log'
 
 /** Die OS-/GUI-nahen Ports, die nur Windows real erfüllen kann (HITL). */
 export interface NativePorts {
@@ -78,6 +79,12 @@ export interface CompositionDeps extends NativePorts {
    * meldet der Erreichbarkeits-Check 'warnung' (nicht prüfbar) — kein Absturz.
    */
   erreichbarkeit?: ErreichbarkeitsPort
+  /**
+   * Ereignislog (v0.7.2): TEXT-FREIES, lokales Diagnose-Log. index.ts erzeugt es am Modulkopf und reicht
+   * es hier herein; die Komposition verteilt es an runner/sitzung/protokoll. Fehlt es, wird
+   * NOOP_EREIGNISLOG genutzt (headless-Tests bleiben ohne Datei-Senke, Verhalten unverändert).
+   */
+  log?: EreignisLog
 }
 
 export interface MainComposition {
@@ -183,15 +190,22 @@ export function loeseAnbieterFuerErreichbarkeit(
 /** Reine Glue: ordnet eine Dispatch-Aktion der passenden Sitzung-Methode zu (Hotkey-Quelle). */
 export function routeDispatch(
   aktion: DispatchAktion | null,
-  sitzung: Pick<Sitzung, 'starteWorkflow' | 'stoppe' | 'brichAb'>
+  sitzung: Pick<Sitzung, 'starteWorkflow' | 'stoppe' | 'brichAb'>,
+  log: EreignisLog = NOOP_EREIGNISLOG
 ): void {
   if (!aktion) return
+  // v0.7.2 debug: NUR wenn eine echte Dispatch-Aktion vorliegt (start/stop/cancel) — der Hot-Path
+  // (jeder Tastendruck durch dispatcher.handle) liefert sonst `null` und wird hier NICHT geloggt.
+  // Feldwerte sind reine Enums/Ids (aktion + Workflow-Id), NIE Text.
+  log.debug('hotkey.aktion', { aktion: aktion.aktion, workflow: aktion.workflow })
   if (aktion.aktion === 'start') void sitzung.starteWorkflow(aktion.workflow, 'hotkey')
   else if (aktion.aktion === 'stop') void sitzung.stoppe()
   else sitzung.brichAb()
 }
 
 export async function createMainComposition(deps: CompositionDeps): Promise<MainComposition> {
+  // v0.7.2: TEXT-FREIES Ereignislog. Ohne Dep ein No-Op → an runner/sitzung/protokoll durchgereicht.
+  const log = deps.log ?? NOOP_EREIGNISLOG
   const einstellungen = createSettingsStore({ file: deps.settingsFile })
   let settings = await einstellungen.load()
 
@@ -222,7 +236,8 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     resolveSystemPrompt,
     quality: { shouldRejectRecording, cleanedTranscript, rohtextAus },
     // v0.4.5 (ADR-0018): deterministischer Treue-Detektor, kein zusätzlicher Modell-Aufruf.
-    treueDetektor: createTreueDetektor()
+    treueDetektor: createTreueDetektor(),
+    log
   })
 
   // Verlauf (verschlüsselt, opt-in) + Statistik (text-frei) + Protokoll-Adapter (Strang D).
@@ -237,7 +252,8 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     verlauf,
     stats,
     jetzt: deps.jetzt ?? Date.now,
-    neueId: deps.neueId ?? (() => globalThis.crypto.randomUUID())
+    neueId: deps.neueId ?? (() => globalThis.crypto.randomUUID()),
+    log
   })
 
   const sitzung = createSitzung({
@@ -250,7 +266,8 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     aktiviereAnbieter: (a) => {
       aktiverAnbieter = a
     },
-    onHistoryChanged: deps.onHistoryChanged
+    onHistoryChanged: deps.onHistoryChanged,
+    log
   })
 
   // Hotkeys aus den Einstellungen → Dispatcher. Bei Settings-Änderung über `aktualisiere` neu aufgebaut.
@@ -278,12 +295,15 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
       if (gewuenscht) await deps.autostart.autostartAn(deps.exePfad)
       else await deps.autostart.autostartAus()
     } catch (err) {
+      // v0.7.2: zusätzlich TEXT-FREI ins Log (nur redigierter Fehler: name+message).
+      log.fehler('autostart.koppeln_fehl', redigiereFehler(err))
       console.error('Autostart konnte nicht gekoppelt werden:', err instanceof Error ? err.message : err)
     }
   }
 
   function uebernimm(next: BlitztextSettings): void {
     const autostartGeaendert = next.autostart !== settings.autostart
+    const debugGeaendert = next.ausfuehrlichesProtokoll !== settings.ausfuehrlichesProtokoll
     settings = next
     standardAnbieter = findeStandard(next)
     aktiverAnbieter = standardAnbieter
@@ -294,6 +314,11 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     // Nur bei echter Änderung an-/abkoppeln (idempotenter Registry-Schreibvorgang, aber unnötige
     // reg.exe-Aufrufe bei jedem Speichern vermeiden). Bewusst nicht awaiten — feuer-und-vergiss.
     if (autostartGeaendert) void koppleAutostart(next.autostart)
+    // v0.7.2: Debug-Stufe des Ereignislogs zur Laufzeit umschalten (GUI-Schalter). Nur die Umschaltung
+    // selbst loggen (text-frei), das Setzen ist idempotent und läuft bei jedem Speichern. `log` ist hier
+    // ggf. NOOP_EREIGNISLOG (ohne setzeDebugAktiv) → optionaler Aufruf.
+    if (debugGeaendert) log.info('log.debug', { aktiv: next.ausfuehrlichesProtokoll })
+    log.setzeDebugAktiv?.(next.ausfuehrlichesProtokoll)
   }
 
   return {
@@ -314,10 +339,10 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     verlauf,
     stats,
     verarbeiteTaste(event) {
-      routeDispatch(dispatcher.handle(event), sitzung)
+      routeDispatch(dispatcher.handle(event), sitzung, log)
     },
     setzeTastenZurueck() {
-      routeDispatch(dispatcher.setzeZurueck(), sitzung)
+      routeDispatch(dispatcher.setzeZurueck(), sitzung, log)
     },
     async assistiere(beschreibung, bestehend) {
       // Assistent läuft über den Standard-Anbieter (kein Workflow-Kontext).

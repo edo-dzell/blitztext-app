@@ -643,25 +643,27 @@ describe('createSitzung', () => {
     expect(sitzung.beschaeftigt()).toBe(false)
   })
 
-  // A1 (v0.6.0): erfasseFenster() ist jetzt async — DRITTER Await-Punkt in starteWorkflow (nach
-  // load/apiKeys.has). Die W2-A-Generationsprüfung muss auch NACH diesem Await erneut greifen, sonst
-  // gewinnt ein brichAb() während des erfasseFenster-awaits nicht mehr (verlorener Abbruch, Variante (2)
-  // aus dem Kommentar oben) und runner.start() liefe trotzdem an.
-  it('W2-A/4: brichAb während des erfasseFenster-Awaits verhindert den Start und hinterlässt keine Reservierung', async () => {
+  // v0.7.2 (Erstlauf-Fix B): erfasseFenster() ist KEIN Await-Punkt vor runner.start() mehr — die
+  // (beim Erstlauf zähe) HWND-Erfassung läuft parallel als Versprechen. runner.start() beginnt daher
+  // SOFORT, unabhängig davon, ob erfasseFenster noch hängt. Ein brichAb() danach räumt normal; das noch
+  // laufende erfasseFenster-Versprechen darf danach nichts mehr bewirken (es wird schlicht nie gelesen)
+  // → kein neues Leak. (Der frühere „brichAb während des erfasseFenster-Awaits verhindert den Start"-
+  // Fall ist mit Fix B gegenstandslos: es gibt keinen solchen Await mehr.)
+  it('W2-A/4: erfasseFenster gated NICHT mehr den Start (Fix B); ein danach hängendes Versprechen leakt nicht', async () => {
     const { sitzung, recorder, calls, oeffneTore, oeffneFensterTor, wartendeFensterTore } =
       makeSitzungMitTorSteuerung({ gateErfasseFenster: true })
 
     const p = sitzung.starteWorkflow('transcribe', 'hotkey')
-    // load + apiKeys.has durchlaufen lassen → der Lauf hängt jetzt GENAU im erfasseFenster-Await.
+    // load + apiKeys.has durchlaufen lassen. erfasseFenster hängt weiter — runner.start() läuft TROTZDEM.
     await oeffneTore()
-    expect(wartendeFensterTore()).toBe(1)
-    // Der Nutzer bricht ab, WÄHREND erfasseFenster() noch aussteht.
-    sitzung.brichAb()
-    // Erst danach löst erfasseFenster auf; starteWorkflow läuft weiter — darf aber NICHT mehr starten.
-    await oeffneFensterTor()
     await p
+    expect(recorder.started).toBe(1) // Fix B: Start nicht mehr auf erfasseFenster blockiert
+    expect(wartendeFensterTore()).toBe(1) // das Versprechen steht noch aus
 
-    expect(recorder.started).toBe(0)
+    // Der Nutzer bricht ab, WÄHREND erfasseFenster() noch aussteht. brichAb räumt normal.
+    sitzung.brichAb()
+    // Danach löst das Versprechen auf; es wird nie gelesen → keine Wirkung, kein Leak.
+    await oeffneFensterTor()
     expect(sitzung.beschaeftigt()).toBe(false)
     expect(calls.einfügen).toEqual([])
     expect(calls.anzeigen).toEqual([])
@@ -672,7 +674,7 @@ describe('createSitzung', () => {
     await oeffneTore()
     await oeffneFensterTor()
     await p2
-    expect(recorder.started).toBe(1)
+    expect(recorder.started).toBe(2)
     expect(sitzung.beschaeftigt()).toBe(true)
   })
 

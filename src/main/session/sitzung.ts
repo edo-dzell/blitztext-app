@@ -8,6 +8,7 @@ import { aufloeseWorkflowLauf, type AnbieterKonfig } from '@shared/anbieter'
 import type { WorkflowRunner, WorkflowPhase } from '@main/workflow/runner'
 import type { SettingsStore } from '@main/settings/store'
 import { fehlerMeldung, teilErfolgMeldung, type FehlerMeldung } from '@main/session/fehler-meldung'
+import { NOOP_EREIGNISLOG, redigiereFehler, type EreignisLog } from '@main/diagnostics/ereignis-log'
 
 export type Auslösequelle = 'hotkey' | 'manuell'
 
@@ -15,6 +16,18 @@ export type Auslösequelle = 'hotkey' | 'manuell'
 export interface EinfügeKontext {
   fokusRueckkehr: boolean
   erfasstesHwnd: number | null
+}
+
+/**
+ * v0.7.2 (Erstlauf-Fix B): interner Kontext, solange das HWND noch nicht gebraucht wird. Statt des
+ * bereits AUFGELÖSTEN `erfasstesHwnd` trägt er das noch laufende Erfassungs-Versprechen — so blockiert
+ * `runner.start()` nicht mehr auf der (beim Erstlauf zähen) HWND-Erfassung. Aufgelöst wird es dort, wo
+ * der Wert konsumiert wird (`stoppe`/`verarbeiteTerminal`); Konsumenten erhalten weiter den `EinfügeKontext`.
+ */
+interface FokusKontextVersprechen {
+  fokusRueckkehr: boolean
+  // Fehler → null (nie werfen); der bestehende 2000ms-Adapter-Timeout begrenzt die Auflösung.
+  hwndVersprechen: Promise<number | null>
 }
 
 /** Downstream-Naht: was die Sitzung mit dem Endtext tut. Adapter (win-paste/Fenster) sind HITL. */
@@ -81,6 +94,12 @@ export interface SitzungDeps {
   aktiviereAnbieter?: (anbieter: AnbieterKonfig) => void
   /** Feuert NACH erfolgtem Verlauf-Schreiben (P5b) → Composition sendet `history:changed` ans Dashboard. */
   onHistoryChanged?: () => void
+  /**
+   * Ereignislog (v0.7.2): macht stille Hotkey-Abbrüche (unbekannter Workflow, fehlender Key, entwerteter
+   * Start) und Protokoll-Schreibfehler TEXT-FREI sichtbar. Optional — fehlt er, wird NOOP genutzt und
+   * nichts geloggt (Verhalten unverändert). Es gehen NIE Texte hinein, nur Ids/Quelle/Status/redig. Fehler.
+   */
+  log?: EreignisLog
 }
 
 export interface Sitzung {
@@ -105,11 +124,18 @@ export interface Sitzung {
 }
 
 export function createSitzung(deps: SitzungDeps): Sitzung {
+  // v0.7.2: TEXT-FREIES Ereignislog. Ohne Dep ein No-Op → Bestandsverhalten unverändert.
+  const log = deps.log ?? NOOP_EREIGNISLOG
   let aktiveQuelle: Auslösequelle | null = null
   // Kontext des laufenden Workflows für das Protokoll beim Abschluss (Label + genutzte Modelle).
   let aktiverKontext: { label: string; asrModell: string; chatModell: string } | null = null
   // Weg B (W3-A): das beim Auslösen erfasste Fenster + fokusRueckkehr-Schalter, an einfügen durchgereicht.
-  let aktiverFokusKontext: EinfügeKontext | null = null
+  // v0.7.2 (Erstlauf-Fix B): die HWND-Erfassung (win-paste.exe --hwnd) lief bislang als dritter Await
+  // VOR runner.start() im kritischen Pfad — der allererste Spawn (Defender-Erstscan, bis 2000ms-Timeout)
+  // verzögerte Pille + Aufnahmebeginn. Jetzt hält der Kontext nur noch das VERSPRECHEN der Erfassung
+  // (sofort nach der Reservierung angestoßen, nicht awaitet); aufgelöst wird es erst, wo der HWND-Wert
+  // gebraucht wird (stoppe/verarbeiteTerminal). Der 2000ms-Adapter-Timeout begrenzt das Warten dort.
+  let aktiverFokusKontext: FokusKontextVersprechen | null = null
   // W3-B (Audio-Retry): Kontext des ZULETZT verarbeiteten Laufs, damit ein erneutVersuchen() den
   // Terminal-Zustand identisch routen kann (gleiche Quelle/Label/Modelle/Fokus), ohne aktive Reservierung.
   let letzterLauf: {
@@ -130,6 +156,8 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   const sitzung: Sitzung = {
     async starteWorkflow(workflow, quelle) {
       if (aktiveQuelle !== null) return // ein Lauf zur Zeit; während aktiv neue Auslösungen ignorieren
+      // v0.7.2 debug: ein Lauf beginnt (nach dem „ein Lauf zur Zeit"-Guard). Nur Workflow-Id + Quelle-Enum.
+      log.debug('sitzung.start', { workflow, quelle })
       // Reservierung SOFORT, synchron, vor dem ersten await → schließt das Doppel-Start-Fenster (1).
       aktiveQuelle = quelle
       const meineGeneration = ++laufGeneration
@@ -146,10 +174,15 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       const settings = await deps.einstellungen.load()
       // (2) Abbruch während des load-Awaits: sauber aussteigen, ohne runner.start(). brichAb() hat die
       // Reservierung bereits geräumt und die Generation erhöht → nichts weiter zu tun.
-      if (veraltet()) return
+      if (veraltet()) {
+        log.info('sitzung.start_entwertet', { quelle })
+        return
+      }
       // Workflow-Definition auflösen; unbekannte Id (z. B. verwaister Hotkey) → still abbrechen.
       const def = findWorkflow(workflow, settings.workflows)
       if (!def) {
+        // v0.7.2: verwaister Hotkey / unbekannte Workflow-Id — sonst still. `workflow` ist eine Id, kein Text.
+        log.warnung('sitzung.workflow_unbekannt', { workflow, quelle })
         gibReservierungFrei()
         if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
         return
@@ -165,8 +198,13 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       if (!lauf.anbieter.keinKeyNoetig) {
         const hatKey = await deps.apiKeys.has(lauf.anbieter.id)
         // (2) Abbruch während des has-Awaits: aussteigen, ohne runner.start().
-        if (veraltet()) return
+        if (veraltet()) {
+          log.info('sitzung.start_entwertet', { quelle })
+          return
+        }
         if (!hatKey) {
+          // v0.7.2: ohne Key gar nicht erst aufnehmen — sonst (Hotkey) ein stiller Abbruch. Nur Ids.
+          log.warnung('sitzung.start_ohne_key', { anbieter: lauf.anbieter.id, quelle })
           gibReservierungFrei()
           if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
           return // Hotkey: still abbrechen
@@ -189,13 +227,30 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       }
       // Weg B (W3-A): NUR bei Hotkey (das Ergebnis wird eingefügt) das aktuelle Vordergrundfenster
       // erfassen — das ist das Paste-Ziel. Bei manueller Quelle wird angezeigt, nicht getippt → egal.
-      // A1 (v0.6.0): erfasseFenster() ist jetzt async (spawn statt spawnSync) → dritter Await-Punkt.
-      const erfasstesHwnd = quelle === 'hotkey' ? await deps.ausgabe.erfasseFenster() : null
-      // (2) Abbruch während des erfasseFenster-Awaits: wie beim load-/has-Await sauber aussteigen, ohne
-      // runner.start() — sonst liefe ein bereits abgebrochener Lauf trotzdem los (verlorener Abbruch).
-      if (veraltet()) return
+      // v0.7.2 (Erstlauf-Fix B): die Erfassung ist ein Helfer-Spawn (win-paste.exe --hwnd) und beim
+      // ALLERERSTEN Lauf zäh (Defender-Erstscan, bis 2000ms-Timeout). Sie darf runner.start() (und damit
+      // Pille + Aufnahmebeginn) NICHT mehr blockieren: das Versprechen SOFORT anstoßen (nicht awaiten),
+      // Fehler → null (nie werfen). Es sind damit wieder ZWEI Await-Punkte vor runner.start (load/has).
+      // Die Debug-Messung `sitzung.fenster_erfasst` hängt an der Auflösung des Versprechens (weiter loggen;
+      // Feldwerte reine Zahl/Boolean: Dauer in ms + ob ein Fenster erfasst wurde).
+      let hwndVersprechen: Promise<number | null> | null = null
+      if (quelle === 'hotkey') {
+        const beginn = Date.now()
+        hwndVersprechen = deps.ausgabe
+          .erfasseFenster()
+          .catch(() => null)
+          .then((erfasstesHwnd) => {
+            log.debug('sitzung.fenster_erfasst', {
+              dauerMs: Date.now() - beginn,
+              gefunden: erfasstesHwnd !== null
+            })
+            return erfasstesHwnd
+          })
+      }
       aktiverFokusKontext =
-        quelle === 'hotkey' ? { fokusRueckkehr: settings.fokusRueckkehr, erfasstesHwnd } : null
+        quelle === 'hotkey' && hwndVersprechen
+          ? { fokusRueckkehr: settings.fokusRueckkehr, hwndVersprechen }
+          : null
 
       deps.runner.start({
         def,
@@ -211,6 +266,15 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       // ein langes Umschreiben noch läuft), feuert das Loslassen jenes Chords trotzdem ein stop.
       // Dann hier no-op — sonst Phantom-recorder.stop() ('Keine aktive Aufnahme') + Doppel-Einfügen.
       if (aktiveQuelle === null) return
+      // (2)/Erstlauf-Fix A: Generation SYNCHRON erhöhen, VOR dem runner.stop()-Await — entwertet einen
+      // Start, der noch zwischen seinen Awaits hängt (z. B. beim zähen Erstlauf im settings.load-/apiKeys-
+      // Gate). Ohne das lief der in-flight-Start NACH dem Loslassen weiter, startete die Aufnahme in ein
+      // idle-Leere gestopptes System (Runner-Phantom-Stop war ein No-Op) → Geister-Aufnahme, Mikro offen.
+      // Damit entspricht stoppe() endlich dem Design-Kommentar (2) („brichAb()/stoppe() erhöhen sie").
+      // Der Start steigt an seinem nächsten veraltet()-Check aus; sein gibReservierungFrei() ist dann ein
+      // No-Op (veraltet() → true, stoppe hat schon geräumt). Der normale Stop-Fall (Runner in 'aufnehmen',
+      // starteWorkflow längst fertig, kein in-flight-Start) ist unberührt: es gibt keinen wartenden Start.
+      laufGeneration++
       const quelle = aktiveQuelle
       const kontext = aktiverKontext
       const fokusKontext = aktiverFokusKontext
@@ -218,7 +282,10 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       aktiveQuelle = null
       aktiverKontext = null
       aktiverFokusKontext = null
-      verarbeiteTerminal(terminal, quelle, kontext, fokusKontext)
+      // Fix B: das HWND-Versprechen erst JETZT auflösen (nach runner.stop(), vor dem Routen) — zum
+      // Stop-Zeitpunkt fast immer schon da; der 2000ms-Adapter-Timeout deckelt das Restwarten.
+      const eingefügterKontext = await loeseFokusKontext(fokusKontext)
+      verarbeiteTerminal(terminal, quelle, kontext, eingefügterKontext)
     },
     async erneutVersuchen() {
       // W3-B: nur sinnvoll, wenn kein Lauf aktiv ist UND der Runner noch Audio hält (transienter
@@ -244,7 +311,10 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       const terminal = await deps.runner.erneutVersuchen()
       // Ein brichAb() während des Retrys hat die Generation erhöht + die Reservierung geräumt und das
       // Audio verworfen → still aussteigen, ohne den (abgebrochenen) Terminal-Zustand zu routen.
-      if (veraltet()) return
+      if (veraltet()) {
+        log.info('sitzung.start_entwertet', { quelle: vorlage.quelle })
+        return
+      }
       gibReservierungFrei()
       verarbeiteTerminal(terminal, vorlage.quelle, vorlage.kontext, vorlage.fokusKontext)
     },
@@ -269,6 +339,18 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
     }
   }
 
+  // v0.7.2 (Erstlauf-Fix B): löst das noch offene HWND-Versprechen in einen konkreten EinfügeKontext auf.
+  // Konsumenten (einfügen/paste-adapter, verarbeiteTerminal, letzterLauf) bekommen weiter den AUFGELÖSTEN
+  // Wert — deren Signaturen bleiben unverändert. Wird nur an den beiden Verbrauchsstellen (stoppe /
+  // erneutVersuchen-Vorlage) gerufen; zum Stop-Zeitpunkt ist das Versprechen fast immer schon da.
+  async function loeseFokusKontext(
+    kontext: FokusKontextVersprechen | null
+  ): Promise<EinfügeKontext | null> {
+    if (!kontext) return null
+    const erfasstesHwnd = await kontext.hwndVersprechen
+    return { fokusRueckkehr: kontext.fokusRueckkehr, erfasstesHwnd }
+  }
+
   // Routet einen Terminal-Zustand des Runners auf die Ausgabe. Von stoppe() (frischer Lauf) UND
   // erneutVersuchen() (W3-B, gehaltenes Audio) geteilt — identisches Verhalten. Guard (defensiv):
   // NUR bei einer echten Terminal-Phase weiterlaufen — 'aufnehmen'/'transkribieren'/'umschreiben'/
@@ -282,6 +364,9 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
     fokusKontext: EinfügeKontext | null
   ): void {
     if (terminal.status !== 'fertig' && terminal.status !== 'teilErfolg' && terminal.status !== 'fehler') {
+      // v0.7.2: der Phantom-Stop-Schutz gab eine nicht-terminale Phase zurück (Dispatcher/Sitzung-Desync)
+      // — text-frei sichtbar machen. `status` ist ein Zustandsname, kein Text.
+      log.warnung('sitzung.terminal_unerwartet', { status: terminal.status })
       return
     }
     letzterLauf = { quelle, kontext, fokusKontext }
@@ -338,6 +423,8 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       })
       if (geschrieben) deps.onHistoryChanged?.()
     } catch (err) {
+      // v0.7.2: zusätzlich zum console.error TEXT-FREI ins Log (nur redigierter Fehler: name+message).
+      log.fehler('protokoll.schreiben_fehl', redigiereFehler(err))
       console.error('Protokollieren fehlgeschlagen (ignoriert):', err)
     }
   }

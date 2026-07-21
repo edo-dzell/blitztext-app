@@ -14,4 +14,17 @@ window.blitztextPill.onStatus((label) => {
   if (el) el.textContent = label
 })
 
+// v0.7.2 „Ereignislog": unerwartete Fehler im Pillen-Renderer als Feld-Beleg für die Fehlerjagd
+// („Pille fehlt/hängt") sichtbar machen. Nur die redigierte, gekürzte message — nie Diktat-/Textinhalt.
+// Das Logging darf NIE selbst werfen (still gefangen), sonst würde ein Log-Fehler den Handler stören.
+window.addEventListener('error', (e) => {
+  try {
+    window.blitztext?.log?.schreibe('fehler', 'pill.fehler', {
+      message: String(e.message).slice(0, 200)
+    })
+  } catch {
+    // Log-Bridge fehlt oder wirft → still verschlucken.
+  }
+})
+
 export {}

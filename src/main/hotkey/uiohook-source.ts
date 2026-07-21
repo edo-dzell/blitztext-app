@@ -9,6 +9,7 @@ import { uIOhook, type UiohookKeyboardEvent } from 'uiohook-napi'
 import { keycodeZuName } from '@main/hotkey/uiohook-keymap'
 import type { KeyEvent } from '@main/hotkey/matcher'
 import { NOOP_PERF, type PerfInstrumentierung } from '@main/diagnostics/perf-instrumentierung'
+import { NOOP_EREIGNISLOG, redigiereFehler, type EreignisLog } from '@main/diagnostics/ereignis-log'
 
 /** Minimaler Hook-Vertrag (Teil von uIOhook) → injizierbar für Tests ohne nativen Hook. */
 export interface UiohookQuelle {
@@ -33,12 +34,19 @@ export interface UiohookQuelleDeps {
    * `BLITZTEXT_PERF=1` verdrahtet die Composition eine echte `createPerfInstrumentierung()`.
    */
   perf?: PerfInstrumentierung
+  /**
+   * v0.7.2 Ereignislog (optional, Default NOOP): nur der einmalige Hook-Start/-Fehlschlag wird
+   * geloggt. NIEMALS im keydown/keyup-Hot-Path — dort würde jede Zeile pro Tastenanschlag Latenz
+   * kosten (der Grund, warum uiohook hier bewusst stumm bleibt).
+   */
+  log?: EreignisLog
 }
 
 /** Startet den Hook und gibt einen Stopp-Thunk zurück (für app.will-quit). */
 export function starteUiohookQuelle(deps: UiohookQuelleDeps): () => void {
   const hook = deps.hook ?? uIOhook
   const perf = deps.perf ?? NOOP_PERF
+  const log = deps.log ?? NOOP_EREIGNISLOG
   const handler = (type: 'down' | 'up') => (e: UiohookKeyboardEvent): void => {
     const marker = perf.erfasseStart()
     const key = keycodeZuName(e.keycode)
@@ -59,9 +67,11 @@ export function starteUiohookQuelle(deps: UiohookQuelleDeps): () => void {
   // (uiohook-napi-Crash ist macOS-spezifisch, Windows unkritisch — RESEARCH §5).
   try {
     hook.start()
+    log.info('hotkey.hook_start')
     deps.onStatus?.(true)
   } catch (err) {
     console.error('uiohook konnte nicht gestartet werden:', err)
+    log.fehler('hotkey.hook_fehl', redigiereFehler(err))
     deps.onStatus?.(false)
     return () => {}
   }

@@ -8,6 +8,10 @@ import type { UpdateErgebnis } from '@main/update/update-hinweis'
 import type { DiagnoseErgebnis, HealthErgebnis } from '@main/health'
 import type { WorkflowPhase } from '@main/workflow/runner'
 import type { WorkflowDefinition } from '@shared/workflows'
+import type { LogFelder } from '@main/diagnostics/ereignis-log'
+
+/** Stufen, die der Renderer loggen darf (kein `debug` — der Main filtert zusätzlich, siehe log-ipc). */
+export type RendererLogStufe = 'info' | 'warnung' | 'fehler'
 
 /** Ergebnis von workflow:export (Datei-Preset, siehe main/index.ts). */
 export type WorkflowExportErgebnis =
@@ -118,6 +122,18 @@ const api = {
     starteManuell: (workflowId: string): Promise<void> =>
       ipcRenderer.invoke('sitzung:starteManuell', workflowId),
     stoppeManuell: (): Promise<void> => ipcRenderer.invoke('sitzung:stoppeManuell')
+  },
+  /** v0.7.2 „Ereignislog": text-freies Diagnose-Log auf diesem Gerät. Der Renderer darf nur schreiben
+   *  (fire-and-forget `send`, der Main validiert/redigiert via parseRendererLog und präfixt `renderer.`)
+   *  sowie Pfad/Ordner/Löschen anfragen. `schreibe` wirft NIE — der Renderer soll nie am Logging
+   *  scheitern; die Felder enthalten ausschließlich Primitive (nie Diktat-/Audio-Inhalt). */
+  log: {
+    schreibe: (stufe: RendererLogStufe, ereignis: string, felder?: LogFelder): void => {
+      ipcRenderer.send('log:schreibe', { stufe, ereignis, felder })
+    },
+    pfad: (): Promise<string> => ipcRenderer.invoke('log:pfad'),
+    oeffneOrdner: (): Promise<void> => ipcRenderer.invoke('log:oeffneOrdner'),
+    loeschen: (): Promise<void> => ipcRenderer.invoke('log:loeschen')
   }
 }
 

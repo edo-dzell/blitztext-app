@@ -14,6 +14,7 @@
 
 import { ipcMain, type BrowserWindow, type IpcMainEvent } from 'electron'
 import type { Recorder, RecordingResult } from '@main/workflow/runner'
+import { NOOP_EREIGNISLOG, type EreignisLog } from '@main/diagnostics/ereignis-log'
 
 interface RecorderErgebnis {
   buffer: ArrayBuffer
@@ -46,7 +47,10 @@ function sendeSicher(fenster: BrowserWindow, channel: string): boolean {
   }
 }
 
-export function createRecorder(fenster: BrowserWindow): Recorder {
+export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLog }): Recorder {
+  // v0.7.2 Ereignislog: optionale, text-freie Diagnose — nur Kanal-Namen/Fehler-Meta, nie Audio/Text.
+  const log = deps?.log ?? NOOP_EREIGNISLOG
+
   // Bricht einen wartenden stop()-Promise ab (z. B. bei discard oder Renderer-Tod); null, wenn kein
   // stop läuft. Wird beim Aufräumen genullt, damit ein Renderer-Tod-Event keinen alten stop trifft.
   let brichLaufendenStopAb: ((fehler: Error) => void) | null = null
@@ -55,6 +59,8 @@ export function createRecorder(fenster: BrowserWindow): Recorder {
   // ipcMain feuern dann nie → wir lösen den offenen stop() selbst mit Fehler auf. Einmal registriert,
   // greift für die Lebensdauer des (pro Aufnahme neu erzeugten) Fensters.
   const beiRendererTod = (): void => {
+    // Feld-Beleg für die Fehlerjagd: unterscheidet stillen Renderer-Tod von einem Timeout.
+    log.fehler('recorder.renderer_tot')
     brichLaufendenStopAb?.(new Error('Aufnahme-Fenster wurde beendet.'))
   }
   // webContents kann bei einem bereits zerstörten Fenster fehlen — dann gibt es nichts zu binden.
@@ -67,12 +73,15 @@ export function createRecorder(fenster: BrowserWindow): Recorder {
 
   return {
     start() {
-      sendeSicher(fenster, 'recorder:start')
+      // sendeSicher bleibt generisch; das Ergebnis wird hier zum Feld-Beleg (Kanal), nie im Helfer.
+      if (!sendeSicher(fenster, 'recorder:start')) log.warnung('recorder.sende_fehl', { kanal: 'start' })
+      // v0.7.2 debug: nur der Umstand „Start-Befehl abgesetzt" — kein Audio/Text, keine Felder.
+      else log.debug('recorder.start_gesendet')
     },
     discard() {
       // discard() darf NIE werfen: der Runner ruft es fire-and-forget aus abbrechen() und geht danach
       // nach idle — ein Throw hier würde diesen Übergang killen (P0).
-      sendeSicher(fenster, 'recorder:discard')
+      if (!sendeSicher(fenster, 'recorder:discard')) log.warnung('recorder.sende_fehl', { kanal: 'discard' })
       // Einen evtl. wartenden stop() rejecten, damit der Await nicht hängt (#03/S-8).
       brichLaufendenStopAb?.(new DOMException('Aufnahme verworfen.', 'AbortError'))
     },
@@ -97,6 +106,9 @@ export function createRecorder(fenster: BrowserWindow): Recorder {
         }
         const onError = (_e: IpcMainEvent, message: string): void => {
           aufraeumen()
+          // Nur die (redigiert gekürzte) Meldung — kein Audio, kein Diktattext. Der Formatierer
+          // schneidet zusätzlich auf 200 Zeichen und filtert Steuerzeichen.
+          log.fehler('recorder.fehler', { message: (message ?? '').slice(0, 200) })
           reject(new Error(message))
         }
         brichLaufendenStopAb = (fehler: Error): void => {
@@ -109,7 +121,11 @@ export function createRecorder(fenster: BrowserWindow): Recorder {
         // aufraeumen() entfernt die eben registrierten Listener wieder und meldet den Fehler.
         if (!sendeSicher(fenster, 'recorder:stop')) {
           aufraeumen()
+          log.warnung('recorder.sende_fehl', { kanal: 'stop' })
           reject(new Error('Aufnahme-Fenster nicht verfügbar.'))
+        } else {
+          // v0.7.2 debug: nur der Umstand „Stop-Befehl abgesetzt" — kein Audio/Text, keine Felder.
+          log.debug('recorder.stop_gesendet')
         }
       })
     }

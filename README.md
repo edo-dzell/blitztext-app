@@ -88,7 +88,8 @@ Idee zur Alltags-App aus:
 | **Sicheres Einfügen** | ✅ Prüft vor dem Einfügen, ob noch dasselbe Fenster im Fokus ist — bei Fokuswechsel wird **nicht** blind getippt, sondern der Text landet in der Zwischenablage mit Hinweis. Steuerzeichen werden gefiltert; Diktate bleiben aus dem Windows-Zwischenablageverlauf | — |
 | **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte) | — |
 | **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis im Tray (kein Auto-Update, keine Telemetrie), ehrlicher Hinweis beim Speichern während einer laufenden Aufnahme | — |
-| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* oder stillschweigend Aussagen weglässt statt es originalgetreu umzuschreiben, und weist ehrlich darauf hin statt den Verlust zu verschleiern), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 949 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* oder stillschweigend Aussagen weglässt statt es originalgetreu umzuschreiben, und weist ehrlich darauf hin statt den Verlust zu verschleiern), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 1050 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Diagnose-Log** | ✅ Lokales, **text-freies** Ereignislog für die Fehlersuche (nie Diktate, Texte oder API-Keys — nur Ereignisse, Dauern, Längen); verlässt nie das Gerät, ~1-MB-Deckel, Debug-Stufe per Schalter, Ordner-öffnen/Löschen in den Einstellungen | — |
 | **Wörterbuch** | ✅ Eigene Begriffe (Namen, Fachwörter) per Chips-Editor hinterlegen, damit die Transkription sie korrekt schreibt — inkl. Budget-Anzeige; ein Begriff lässt sich direkt aus dem Verlauf heraus übernehmen | — |
 | **Verlauf: Änderungen zeigen** | ✅ Auf Wunsch ein Wortvergleich zwischen Rohdiktat und umgeschriebenem Text je Verlaufseintrag | — |
 | **Einrichtung** | ✅ Einrichtungs-Assistent führt beim allerersten Start durch Anbieterwahl und API-Key | Manuelle Konfiguration |
@@ -163,6 +164,15 @@ stimmen beide überein, ist die Datei unverändert.
 **Datenschutz:** Blitztext sammelt keine Nutzerdaten und sendet keine Telemetrie. Diktat-Audio
 geht ausschließlich an die vom Nutzer selbst konfigurierten Anbieter (eigener API-Key) oder an
 einen lokalen Endpunkt; Einstellungen, Verlauf und API-Keys bleiben lokal auf dem Rechner.
+
+**Diagnose-Log (ab v0.7.2):** Für die Fehlersuche schreibt Blitztext ein lokales Ereignislog nach
+`%APPDATA%\blitztext-app\logs`. Es ist bewusst **text-frei**: Es enthält nie Diktate, Roh- oder
+Endtexte, eingefügte Texte, Prompts oder API-Keys — nur Ereignisnamen, Dauern, Zeichen-Längen,
+Fehlerklassen und gekürzte Fehlermeldungen. Das Log verlässt nie das Gerät (kein Upload), wechselt
+bei ~1 MB auf genau eine Vorgänger-Datei und lässt sich in den Einstellungen unter
+**System & Diagnose** einsehen („Log-Ordner öffnen") und jederzeit löschen. Dort sitzt auch der
+Schalter **„Ausführliches Protokoll (Debug)"** für zusätzliche Detail-Zeilen; alternativ erzwingt
+die Umgebungsvariable `BLITZTEXT_DEBUG=1` die Debug-Stufe.
 
 ## 🚀 Schnellstart
 
@@ -282,6 +292,17 @@ Prüfe zuerst die Windows-Mikrofonberechtigung für Desktop-Apps (Einstellungen 
 Sicherheit → Mikrofon). Die App bringt außerdem eine Selbstdiagnose („Ampel“) in den Einstellungen
 mit, die Mikrofon, API-Key, Anbieter-Erreichbarkeit und Hotkey-Erkennung einzeln prüft und bei
 fehlendem oder nicht ermittelbarem Mikrofon einen konkreten Hinweis anzeigt.
+
+</details>
+
+<details>
+<summary><b>Etwas funktioniert nicht — wo finde ich Logs für einen Fehlerbericht?</b></summary>
+
+Seit v0.7.2 führt Blitztext ein lokales Ereignislog unter `%APPDATA%\blitztext-app\logs`
+(in den Einstellungen unter **System & Diagnose** per Knopf „Log-Ordner öffnen" erreichbar).
+Es ist text-frei — Diktate, eingefügte Texte und API-Keys landen nie darin — und eignet sich
+daher gefahrlos als Anhang für einen GitHub-Issue. Für besonders detailreiche Zeilen vor dem
+Reproduzieren des Problems den Schalter „Ausführliches Protokoll (Debug)" aktivieren und speichern.
 
 </details>
 

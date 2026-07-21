@@ -50,6 +50,7 @@ describe('createSettingsStore', () => {
       autostart: true,
       mikrofonDeviceId: 'geraet-abc',
       updateHinweisAktiv: true,
+      ausfuehrlichesProtokoll: true,
       verlaufSortierung: 'aeltesteZuerst' as const,
       onboardingAbgeschlossen: true,
       workflows: [
@@ -142,6 +143,34 @@ describe('createSettingsStore', () => {
     expect(d.autostart).toBe(false)
     expect(d.mikrofonDeviceId).toBe('')
     expect(d.updateHinweisAktiv).toBe(false)
+  })
+
+  // v0.7.2: ausfuehrlichesProtokoll (Debug-Stufe des Ereignislogs) — Migration wie die W3-Booleans:
+  // alte Datei ohne Feld ⇒ false, expliziter boolean round-trippt, typfremder Wert ⇒ false.
+  it('alte Datei ohne ausfuehrlichesProtokoll ⇒ Default false', async () => {
+    const store = createSettingsStore({ file: fakeFile(JSON.stringify({ language: 'de' })) })
+    const loaded = await store.load()
+    expect(loaded.ausfuehrlichesProtokoll).toBe(false)
+  })
+
+  it('ausfuehrlichesProtokoll round-trippt (true)', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(JSON.stringify({ ausfuehrlichesProtokoll: true }))
+    })
+    const loaded = await store.load()
+    expect(loaded.ausfuehrlichesProtokoll).toBe(true)
+  })
+
+  it('typfremder ausfuehrlichesProtokoll-Wert fällt auf false zurück', async () => {
+    const store = createSettingsStore({
+      file: fakeFile(JSON.stringify({ ausfuehrlichesProtokoll: 'ja' }))
+    })
+    const loaded = await store.load()
+    expect(loaded.ausfuehrlichesProtokoll).toBe(false) // nur === true zählt
+  })
+
+  it('defaultSettings enthält ausfuehrlichesProtokoll mit Default false', () => {
+    expect(defaultSettings().ausfuehrlichesProtokoll).toBe(false)
   })
 
   // C2: verlaufSortierung — Migration feldweise wie theme (includes-Check + Fallback auf Default).

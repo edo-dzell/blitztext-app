@@ -19,6 +19,7 @@ import BegriffeFeld from './BegriffeFeld'
 import AutostartKarte from './AutostartKarte'
 import UpdateKarte from './UpdateKarte'
 import DiagnoseKarte from './DiagnoseKarte'
+import LogsKarte from './LogsKarte'
 
 // Einstellungen (P8): Zwei-Ebenen-Ansicht. Band = Anbieter (vorausgewählt) / Transkription & Umschreiben
 // / Datenschutz / Darstellung. Speicher-Modell A: EIN globaler Entwurf, EIN fest sichtbarer (dirty-
@@ -239,6 +240,10 @@ export default function EinstellungenView({ settings, speichern }: Props) {
             aendere={(v) => setEntwurf({ ...entwurf, updateHinweisAktiv: v })}
           />
           <DiagnoseKarte />
+          <LogsKarte
+            an={entwurf.ausfuehrlichesProtokoll}
+            aendere={(v) => setEntwurf({ ...entwurf, ausfuehrlichesProtokoll: v })}
+          />
         </div>
       )}
     </ZweiEbenenShell>

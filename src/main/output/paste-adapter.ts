@@ -29,6 +29,7 @@ import {
 import { winPastePfad } from '@main/output/win-paste-path'
 import type { Ausgabe, EinfügeKontext } from '@main/session/sitzung'
 import { fokusDriftMeldung, type FehlerMeldung } from '@main/session/fehler-meldung'
+import { NOOP_EREIGNISLOG, redigiereFehler, type EreignisLog, type LogFelder } from '@main/diagnostics/ereignis-log'
 
 // macOS nutzt 1,5 s Delay vor dem Restore (restorePasteboardIfCurrent); RESEARCH §4.
 const RESTORE_DELAY_MS = 1500
@@ -56,6 +57,11 @@ export interface PasteAusgabeDeps {
   spawnSyncFn?: typeof spawnSync
   /** Verzögerung; injizierbar für Tests. */
   delayMs?: number
+  /**
+   * v0.7.2 Ereignislog (optional, Default NOOP): protokolliert pro Strategie-Versuch nur Name/Erfolg/
+   * Exit-Code — NIEMALS den einzufügenden Text oder Zwischenablage-Inhalt.
+   */
+  log?: EreignisLog
 }
 
 function defaultHelferPfad(): string {
@@ -66,15 +72,29 @@ function defaultHelferPfad(): string {
   })
 }
 
-/** Prozess starten und auf Exit-Code 0 als Erfolg prüfen; Spawn-Fehler (ENOENT) → false. */
-function prozessErfolg(spawnFn: typeof spawn, command: string, args: string[]): Promise<boolean> {
+/**
+ * Ergebnis eines Strategie-Prozesses: `erfolg` (Exit-Code 0) plus der rohe `code` fürs Ereignislog.
+ * `code` ist null bei Spawn-Fehler (ENOENT) oder wenn der Prozess ohne numerischen Code endete
+ * (Signal-Kill) — dafür wird im Log kein `code`-Feld gesetzt.
+ */
+interface ProzessAusgang {
+  erfolg: boolean
+  code: number | null
+}
+
+/**
+ * Prozess starten und auf Exit-Code 0 als Erfolg prüfen; Spawn-Fehler (ENOENT) → erfolg=false/code=null.
+ * v0.7.2: gibt zusätzlich den Exit-Code zurück (dateilokal, fürs `paste.strategie`-Log). Das nach außen
+ * sichtbare Erfolg/Misserfolg-Verhalten bleibt unverändert — die Strategien mappen wieder auf `boolean`.
+ */
+function prozessErfolg(spawnFn: typeof spawn, command: string, args: string[]): Promise<ProzessAusgang> {
   return new Promise((resolve) => {
     try {
       const kind = spawnFn(command, args, { windowsHide: true })
-      kind.once('error', () => resolve(false))
-      kind.once('exit', (code) => resolve(code === 0))
+      kind.once('error', () => resolve({ erfolg: false, code: null }))
+      kind.once('exit', (code) => resolve({ erfolg: code === 0, code: code ?? null }))
     } catch {
-      resolve(false)
+      resolve({ erfolg: false, code: null })
     }
   })
 }
@@ -161,6 +181,19 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
 
   const spawnSyncFn = deps.spawnSyncFn ?? spawnSync
   const helferPfad = deps.helferPfad ?? defaultHelferPfad()
+  const log = deps.log ?? NOOP_EREIGNISLOG
+
+  // Führt eine Strategie aus und loggt ihren Ausgang (Name/Erfolg/Exit-Code) — Erfolg als info,
+  // Fehlschlag als warnung. Rückgabe bleibt `boolean` (Vertrag der EinfügeStrategie unverändert).
+  // NIE der Text, nur Meta: `code` wird nur gesetzt, wenn ein numerischer Exit-Code vorliegt.
+  const versucheMitLog = async (name: 'helfer' | 'powershell', command: string, args: string[]): Promise<boolean> => {
+    const ausgang = await prozessErfolg(spawnFn, command, args)
+    const felder: LogFelder = { name, erfolg: ausgang.erfolg }
+    if (typeof ausgang.code === 'number') felder.code = ausgang.code
+    if (ausgang.erfolg) log.info('paste.strategie', felder)
+    else log.warnung('paste.strategie', felder)
+    return ausgang.erfolg
+  }
 
   // MAL-2: Text bevorzugt über den Helfer (`--set-clip`) in die Zwischenablage schreiben — der setzt
   // ExcludeClipboardContentFromMonitorProcessing + CanIncludeInClipboardHistory=0, damit Diktate NICHT
@@ -206,12 +239,22 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
     // (spawnSync) war das implizit garantiert, seit A1 (spawn+Promise) nicht mehr. Fehler crashen
     // weiterhin nicht: catch → Electron-clipboard-Fallback, die Promise löst danach normal auf.
     schreib: async (text) => {
+      // v0.7.2 debug: das Setzen der Zwischenablage ist ein Helfer-Spawn (Dauer-Verdächtiger). Nur die
+      // Dauer in ms wird geloggt (nach dem Setzen), NIE der Zwischenablage-Inhalt.
+      const beginn = Date.now()
       try {
         const erfolg = await schreibUeberHelfer(text)
-        if (!erfolg) clipboard.writeText(text)
+        if (!erfolg) {
+          // MAL-2-Härtung des Helfers (ExcludeClipboardContentFromMonitorProcessing) griff nicht →
+          // Electron-Fallback. Nur der Umstand wird geloggt, NIE der Text.
+          log.warnung('paste.helfer_clip_fallback')
+          clipboard.writeText(text)
+        }
       } catch {
+        log.warnung('paste.helfer_clip_fallback')
         clipboard.writeText(text)
       }
+      log.debug('paste.clip_gesetzt', { dauerMs: Date.now() - beginn })
     }
   }
 
@@ -225,8 +268,8 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
       // Mit erfasstem Ziel den nativen Drift-Gate nutzen (`--paste <hwnd>` fügt nur bei passendem
       // Vordergrund ein); sonst der bisherige unbedingte Paste (`--paste`/keine Args).
       versuch: () =>
-        prozessErfolg(
-          spawnFn,
+        versucheMitLog(
+          'helfer',
           helferPfad,
           aktuellesPasteZielHwnd !== null ? ['--paste', String(aktuellesPasteZielHwnd)] : ['--paste']
         )
@@ -235,7 +278,7 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
       name: 'powershell',
       // Abhängigkeitsfreier Fallback (ADR-0003): SendKeys('^v') ins Vordergrundfenster.
       versuch: () =>
-        prozessErfolg(spawnFn, 'powershell', [
+        versucheMitLog('powershell', 'powershell', [
           '-NoProfile',
           '-Command',
           "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')"
@@ -258,6 +301,8 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
 
   return {
     einfügen(text, kontext?: EinfügeKontext) {
+      // v0.7.2 debug: ein Einfüge-Vorgang beginnt. Nur die LÄNGE (`zeichen`) des Endtexts, NIE der Text.
+      log.debug('paste.beginn', { zeichen: text.length })
       // Das native Drift-Gate nur bei aktivem Feature + erfasstem Ziel setzen; sonst unbedingter Paste.
       aktuellesPasteZielHwnd =
         kontext && kontext.fokusRueckkehr ? kontext.erfasstesHwnd : null
@@ -270,7 +315,10 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
           setTimeout(() => ergebnis.wiederherstellen(), delayMs)
         }
         // Bei Drift/Total-Fehlschlag bleibt der Text bewusst in der Zwischenablage (Hinweis kam schon).
-      })().catch((err) => console.error('Einfügen fehlgeschlagen (ignoriert):', err))
+      })().catch((err) => {
+        log.fehler('paste.einfuegen_fehl', redigiereFehler(err))
+        console.error('Einfügen fehlgeschlagen (ignoriert):', err)
+      })
     },
     anzeigen: (text) => deps.fenster.anzeigen(text),
     zeigeEinstellungen: () => deps.fenster.zeigeEinstellungen(),
@@ -281,11 +329,21 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
     // Drift-Prüfung/Paste-Strategie, die auf den Abschluss angewiesen wäre. Fehler crashen nicht
     // (schreib() selbst fängt intern ab); trotzdem sichtbar loggen statt still zu verschlucken.
     inZwischenablage: (text) => {
-      void zwischenablage.schreib(text).catch((err) => console.error('inZwischenablage fehlgeschlagen (ignoriert):', err))
+      void zwischenablage.schreib(text).catch((err) => {
+        log.fehler('paste.zwischenablage_fehl', redigiereFehler(err))
+        console.error('inZwischenablage fehlgeschlagen (ignoriert):', err)
+      })
     },
     // Weg B (W3-A): Vordergrundfenster beim Auslösen erfassen (natives `--hwnd`). null = nicht erfassbar.
     // A1 (v0.6.0): async (spawn statt spawnSync) — sitzung.ts awaitet das bereits (starteWorkflow ist
     // async), blockiert den Event-Loop beim Auslösen also nicht mehr.
-    erfasseFenster: () => hwndVonHelferAsync(spawnFn, helferPfad, ['--hwnd'])
+    // v0.7.2 debug: die HWND-Erfassung ist ein Helfer-Spawn (Dauer-Verdächtiger). Nur Zahl/Boolean:
+    // Dauer in ms + ob ein Fenster erfasst wurde — NIE ein Text.
+    async erfasseFenster() {
+      const beginn = Date.now()
+      const hwnd = await hwndVonHelferAsync(spawnFn, helferPfad, ['--hwnd'])
+      log.debug('paste.hwnd', { dauerMs: Date.now() - beginn, gefunden: hwnd !== null })
+      return hwnd
+    }
   }
 }

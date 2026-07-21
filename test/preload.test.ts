@@ -187,3 +187,80 @@ describe('preload workflow.export/import (Preset-Datei)', () => {
     expect(ipcRenderer.invoke).toHaveBeenCalledWith('workflow:import')
   })
 })
+
+describe('preload api.log (v0.7.2 Ereignislog-Bridge, Slice B)', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    // Der electron-Mock ist modulweit; send/invoke sind vi.fn() und akkumulieren über Tests hinweg.
+    // Für die send-vs-invoke-Trennung hier zählen wir die Aufrufe PRO Test → Historie leeren.
+    vi.clearAllMocks()
+    ;(globalThis as unknown as { process: { contextIsolated: boolean } }).process = {
+      ...process,
+      contextIsolated: false
+    }
+  })
+
+  it('schreibe verwendet send (fire-and-forget) auf log:schreibe mit {stufe, ereignis, felder}', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      log: {
+        schreibe: (
+          stufe: string,
+          ereignis: string,
+          felder?: Record<string, string | number | boolean>
+        ) => void
+      }
+    }
+
+    const ergebnis = api.log.schreibe('fehler', 'renderer.pill.fehler', { message: 'boom' })
+
+    // fire-and-forget: kein Promise, kein Rückgabewert
+    expect(ergebnis).toBeUndefined()
+    expect(ipcRenderer.send).toHaveBeenCalledWith('log:schreibe', {
+      stufe: 'fehler',
+      ereignis: 'renderer.pill.fehler',
+      felder: { message: 'boom' }
+    })
+    // send, NICHT invoke
+    expect(ipcRenderer.invoke).not.toHaveBeenCalled()
+  })
+
+  it('schreibe ohne Felder sendet felder=undefined', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      log: { schreibe: (stufe: string, ereignis: string) => void }
+    }
+
+    api.log.schreibe('info', 'renderer.foo')
+
+    expect(ipcRenderer.send).toHaveBeenCalledWith('log:schreibe', {
+      stufe: 'info',
+      ereignis: 'renderer.foo',
+      felder: undefined
+    })
+  })
+
+  it('pfad/oeffneOrdner/loeschen laufen über invoke auf die passenden Kanäle', async () => {
+    const { ipcRenderer } = await import('electron')
+    await import('../src/preload/index')
+    const api = (globalThis as unknown as { blitztext: unknown }).blitztext as {
+      log: {
+        pfad: () => Promise<string>
+        oeffneOrdner: () => Promise<void>
+        loeschen: () => Promise<void>
+      }
+    }
+
+    await api.log.pfad()
+    await api.log.oeffneOrdner()
+    await api.log.loeschen()
+
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('log:pfad')
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('log:oeffneOrdner')
+    expect(ipcRenderer.invoke).toHaveBeenCalledWith('log:loeschen')
+    // Diese Wege sind Anfragen (invoke), nicht send.
+    expect(ipcRenderer.send).not.toHaveBeenCalled()
+  })
+})

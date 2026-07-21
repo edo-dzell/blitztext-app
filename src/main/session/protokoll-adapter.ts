@@ -6,13 +6,20 @@
 import type { Protokoll, Abschlussdaten } from '@main/session/sitzung'
 import type { VerlaufStore } from '@main/history/history-store'
 import type { StatsStore } from '@main/stats/stats-store'
+import { NOOP_EREIGNISLOG, redigiereFehler, type EreignisLog } from '@main/diagnostics/ereignis-log'
 
 export function createProtokoll(deps: {
   verlauf: VerlaufStore
   stats: StatsStore
   jetzt: () => number
   neueId: () => string
+  /**
+   * Ereignislog (v0.7.2): macht einen Statistik-Schreibfehler TEXT-FREI sichtbar (nur redigierter
+   * Fehler). Optional — fehlt er, NOOP; Verhalten unverändert.
+   */
+  log?: EreignisLog
 }): Protokoll {
+  const log = deps.log ?? NOOP_EREIGNISLOG
   return {
     // Liefert true, wenn der Verlauf tatsächlich geschrieben wurde (für das history:changed-Event, P5b).
     // Stats bleibt fire-and-forget (text-frei, kein Event nötig).
@@ -33,7 +40,11 @@ export function createProtokoll(deps: {
             : undefined
         },
         jetztMs
-      ).catch((err) => console.error('Statistik schreiben fehlgeschlagen (ignoriert):', err))
+      ).catch((err) => {
+        // v0.7.2: zusätzlich TEXT-FREI ins Log (nur redigierter Fehler: name+message).
+        log.fehler('statistik.schreiben_fehl', redigiereFehler(err))
+        console.error('Statistik schreiben fehlgeschlagen (ignoriert):', err)
+      })
       // Verlauf (Text) — der Store entscheidet selbst per aktiv()-Gate, ob er schreibt. Awaiten +
       // zurückgeben, damit der Aufrufer das history:changed-Event erst nach erfolgtem Schreiben feuert.
       return deps.verlauf.aufzeichnen({

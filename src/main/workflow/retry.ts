@@ -12,6 +12,13 @@ export interface RetryOptions {
   retrybar: (fehler: unknown) => boolean
   /** Injizierbar für Tests; Default echte Verzögerung. */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * Beobachtungs-Hook (v0.7.2, Ereignislog): feuert VOR dem Backoff-Sleep, GENAU DANN, wenn ein
+   * Versuch scheiterte UND ein weiterer folgt (also nie beim Erfolg, nie beim finalen Wurf). Reine
+   * Beobachtung — der Kontrollfluss bleibt unverändert. Wirft der Hook selbst, wird das geschluckt,
+   * damit das Logging den Retry-Pfad niemals stört.
+   */
+  beiWiederholung?: (versuch: number, fehler: unknown) => void
 }
 
 export async function mitRetry<T>(fn: () => Promise<T>, opts: RetryOptions): Promise<T> {
@@ -21,6 +28,15 @@ export async function mitRetry<T>(fn: () => Promise<T>, opts: RetryOptions): Pro
       return await fn()
     } catch (fehler) {
       if (versuch >= opts.versuche || !opts.retrybar(fehler)) throw fehler
+      // Nur bei einem Fehlversuch, dem ein weiterer Versuch folgt (nicht beim Erfolg/finalen Wurf).
+      // Darf-nie-werfen-Guard: ein Logging-Fehler darf den Retry nicht abbrechen.
+      if (opts.beiWiederholung) {
+        try {
+          opts.beiWiederholung(versuch, fehler)
+        } catch {
+          /* still: Beobachtung darf den Retry-Pfad nie stören */
+        }
+      }
       await sleep(opts.backoffMs * 2 ** (versuch - 1))
     }
   }

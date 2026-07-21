@@ -59,6 +59,8 @@ export interface BlitztextSettings {
   mikrofonDeviceId: string
   /** Opt-in Update-Hinweis (W3-δ). Default AUS — KEIN Netzabruf ohne ausdrückliche Zustimmung. */
   updateHinweisAktiv: boolean
+  /** Debug-Stufe des Ereignislogs (v0.7.2). Default AUS. BLITZTEXT_DEBUG=1 erzwingt sie unabhängig davon. */
+  ausfuehrlichesProtokoll: boolean
   /** Sortierrichtung im Verlauf (C2). Default 'neuesteZuerst'. Migration wie `theme` (includes-Check). */
   verlaufSortierung: 'neuesteZuerst' | 'aeltesteZuerst'
   /**
@@ -115,6 +117,7 @@ export function defaultSettings(): BlitztextSettings {
     autostart: false,
     mikrofonDeviceId: '',
     updateHinweisAktiv: false,
+    ausfuehrlichesProtokoll: false,
     verlaufSortierung: 'neuesteZuerst',
     onboardingAbgeschlossen: false
   }
@@ -344,6 +347,7 @@ function parseSettings(raw: unknown): BlitztextSettings {
     autostart: o.autostart === true, // Default AUS
     mikrofonDeviceId: typeof o.mikrofonDeviceId === 'string' ? o.mikrofonDeviceId : d.mikrofonDeviceId,
     updateHinweisAktiv: o.updateHinweisAktiv === true, // Opt-in, Default AUS
+    ausfuehrlichesProtokoll: o.ausfuehrlichesProtokoll === true, // Debug-Log, Default AUS
     verlaufSortierung: (['neuesteZuerst', 'aeltesteZuerst'] as const).includes(
       o.verlaufSortierung as never
     )

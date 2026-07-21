@@ -3,6 +3,7 @@ import { createMainComposition, type CompositionDeps } from '@main/composition-r
 import type { Autostart, AutostartStatus } from '@main/autostart'
 import type { Holer, UpdateCacheSpeicher } from '@main/update/update-hinweis'
 import type { ErreichbarkeitsPort } from '@main/health'
+import type { EreignisLog } from '@main/diagnostics/ereignis-log'
 import { defaultSettings, type BlitztextSettings } from '@main/settings/store'
 
 // Verdrahtungstests der Staffel 3.2 (W3-κ): Autostart-Kopplung an Settings-Save, Hotkey-Hook-Status,
@@ -129,6 +130,48 @@ describe('W3-γ: Autostart-Kopplung an Settings-Save', () => {
   it('ohne Autostart-Port ⇒ Status inaktiv, kein Absturz', async () => {
     const comp = await createMainComposition(basisDeps())
     expect(await comp.autostartStatus()).toEqual({ zustand: 'inaktiv' })
+  })
+})
+
+describe('v0.7.2: Debug-Log-Kopplung an Settings-Save', () => {
+  // Fake-EreignisLog mit protokolliertem setzeDebugAktiv (die reale Komposition ruft es in `uebernimm`).
+  function fakeLog(): { log: EreignisLog; schalter: boolean[] } {
+    const schalter: boolean[] = []
+    return {
+      schalter,
+      log: {
+        debug: () => {},
+        info: () => {},
+        warnung: () => {},
+        fehler: () => {},
+        setzeDebugAktiv: (aktiv) => {
+          schalter.push(aktiv)
+        }
+      }
+    }
+  }
+
+  it('aktualisiere schaltet die Debug-Stufe des Logs auf den neuen Wert', async () => {
+    const { log, schalter } = fakeLog()
+    const comp = await createMainComposition(basisDeps({ log }))
+
+    comp.aktualisiere(await settingsMit({ ausfuehrlichesProtokoll: true }))
+    expect(schalter.at(-1)).toBe(true)
+
+    comp.aktualisiere(await settingsMit({ ausfuehrlichesProtokoll: false }))
+    expect(schalter.at(-1)).toBe(false)
+  })
+
+  it('ohne setzeDebugAktiv-Methode (NOOP-artiges Log) wirft die Übernahme nicht', async () => {
+    const log: EreignisLog = {
+      debug: () => {},
+      info: () => {},
+      warnung: () => {},
+      fehler: () => {}
+    }
+    const comp = await createMainComposition(basisDeps({ log }))
+    // kein Throw = bestanden (optionaler Aufruf log.setzeDebugAktiv?.(…) in uebernimm)
+    expect(() => comp.aktualisiere({ ...defaultSettings(), ausfuehrlichesProtokoll: true })).not.toThrow()
   })
 })
 

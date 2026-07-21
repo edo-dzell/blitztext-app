@@ -13,7 +13,7 @@ import {
   dialog
 } from 'electron'
 import { join } from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { writeFile, readFile } from 'node:fs/promises'
 import { validateApiKey } from './secrets'
 import {
@@ -34,6 +34,9 @@ import {
 import { createStatsFile } from '@main/stats/stats-file'
 import { starteUiohookQuelle } from '@main/hotkey/uiohook-source'
 import { createPerfInstrumentierung, NOOP_PERF } from '@main/diagnostics/perf-instrumentierung'
+import { createEreignisLog, redigiereFehler } from '@main/diagnostics/ereignis-log'
+import { createLogDateiSenke, logOrdnerPfad } from '@main/diagnostics/log-datei'
+import { parseRendererLog } from '@main/diagnostics/log-ipc'
 import { createDefaultAutostart } from '@main/autostart'
 import { createUpdateHoler } from '@main/update/update-holer'
 import { createUpdateCacheFile } from '@main/update/update-cache-file'
@@ -44,6 +47,7 @@ import { pillenStatus } from '@main/window/pill-status'
 import { istAbbruchOderTimeout } from '@main/session/abbruch-guard'
 import { createSettingsStore, type BlitztextSettings, type ApiKeyStatus } from '@main/settings/store'
 import { sendeAn } from '@main/window/send-to-window'
+import { warteAufFensterBereit } from '@main/window/fenster-bereitschaft'
 // W3-F1: `workflowZuPreset` zog von @shared/workflows nach @main/rewrite/prompt-builder um (braucht
 // `berechneterPrompt`, um den Prompt-Text eines unveränderten Built-ins aufzulösen statt '' zu
 // exportieren — shared darf @main nicht als Wert importieren, siehe Kommentar in workflows.ts).
@@ -58,10 +62,22 @@ process.on('unhandledRejection', (grund) => {
   throw grund
 })
 
+// v0.7.2 „Ereignislog": das eine, app-weite Log. Immer aktiv (Nutzer-Entscheid, kein Opt-in),
+// synchrone Datei-Senke (Crash-Zeile sofort auf Disk), debug-Zeilen nur bei BLITZTEXT_DEBUG=1
+// (analog BLITZTEXT_PERF). Wird als optionale Dep mit NOOP-Default in die Adapter/Composition
+// durchgereicht. NIE Diktate/Texte/Keys — nur Ereignisnamen, redigierte Fehler, Längen, Ids, Flags.
+const logSenke = createLogDateiSenke()
+const log = createEreignisLog({
+  senke: logSenke,
+  debugAktiv: process.env['BLITZTEXT_DEBUG'] === '1'
+})
+
 // Tray-Dauertool (D4/A5): ein unerwarteter Bug soll NICHT lautlos verschwinden, aber auch keine
 // Datenverlust-Schleife auslösen → surface (Log + Hinweis), dann kontrolliert beenden. KEIN Auto-Neustart
 // (geparkt). Es werden NUR Name/Message geloggt — nie API-Keys/Objekt-Innereien (Secret-Redaction).
 function meldeFatalUndBeende(grund: unknown): void {
+  // Erste Anweisung: den Fatal-Fehler text-frei auf Disk bringen, BEVOR Notification/app.exit laufen.
+  log.fehler('app.fatal', redigiereFehler(grund))
   const text = grund instanceof Error ? `${grund.name}: ${grund.message}` : String(grund)
   console.error('Schwerer Fehler — Blitztext wird beendet:', text)
   try {
@@ -167,7 +183,10 @@ function createRecorderWindow(): BrowserWindow {
     show: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      // Verstecktes, aufnahme-kritisches Fenster: Throttling verhindern, damit der MediaRecorder auch
+      // ohne sichtbaren Vordergrund zuverlässig läuft (wie die Pille, ~createPillWindow).
+      backgroundThrottling: false
     }
   })
 
@@ -372,6 +391,8 @@ function registerIpc(apiKeys: ApiKeyVault, comp: MainComposition): void {
     const aktuell = await comp.einstellungen.load()
     const zusammengefuehrt = { ...next, apiKeyStatus: aktuell.apiKeyStatus }
     await comp.einstellungen.save(zusammengefuehrt)
+    // v0.7.2 debug: nur der Umstand „Einstellungen gespeichert" — keine Werte, keine Felder.
+    log.debug('einstellungen.gespeichert')
     // A4b: Rückgabewert durchreichen (true=sofort übernommen, false=verschoben bis Lauf-Ende) — der
     // Renderer (App.tsx speichern()) zeigt bei false einen abweichenden Hinweis.
     return comp.aktualisiere(zusammengefuehrt)
@@ -417,6 +438,26 @@ function registerIpc(apiKeys: ApiKeyVault, comp: MainComposition): void {
       }
     }
     return comp.pruefeErreichbarkeitFuer(anbieterId)
+  })
+
+  // v0.7.2 „Ereignislog": Diagnose-Log-Kanäle für die LogsKarte.
+  // pfad/oeffneOrdner/loeschen sind invoke (Antwort/Fehler zurück), schreibe ist fire-and-forget (send).
+  ipcMain.handle('log:pfad', () => join(logOrdnerPfad(), 'blitztext.log'))
+  ipcMain.handle('log:oeffneOrdner', () => shell.openPath(logOrdnerPfad()))
+  ipcMain.handle('log:loeschen', () => {
+    // rm mit force (kein Fehler, wenn die Datei nicht existiert) auf beide Log-Dateien im logs-Ordner.
+    const ordner = logOrdnerPfad()
+    rmSync(join(ordner, 'blitztext.log'), { force: true })
+    rmSync(join(ordner, 'blitztext.alt.log'), { force: true })
+    // Der Größenzähler der Senke führte sonst die (nun gelöschte) alte Größe weiter → die nächste Zeile
+    // löste eine überflüssige Rotation der frisch neu erzeugten Mini-Datei aus.
+    logSenke.setzeZurueck?.()
+  })
+  // Renderer-Log: fire-and-forget (send/on). Eingabe UNTRUSTED → parseRendererLog validiert und
+  // präfixt mit `renderer.` (Spoofing-Schutz); bei Ungültigem passiert nichts.
+  ipcMain.on('log:schreibe', (_event, roh: unknown) => {
+    const n = parseRendererLog(roh)
+    if (n) log[n.stufe](n.ereignis, n.felder)
   })
 
   // W2-S8 (Onboarding-Wizard, Probe-Schritt): manuelles Auslösen/Stoppen eines Workflows über IPC statt
@@ -515,12 +556,19 @@ if (!gotTheLock) {
   app.on('second-instance', showSettings)
 
   app.whenReady().then(async () => {
+    log.info('app.start', {
+      version: app.getVersion(),
+      electron: process.versions.electron ?? '',
+      plattform: process.platform
+    })
     app.setAppUserModelId('de.blitztext.app') // Windows: Voraussetzung für zuverlässige Notifications
 
     // Reihenfolge (ADR-0010): Settings laden (liefert standardAnbieterId) → Legacy-Key (api-key.bin)
     // auf die anbieter-spezifische Datei migrieren → Vault bauen → dann Komposition.
     const settingsFile = createSettingsFile()
     const startSettings = await createSettingsStore({ file: settingsFile }).load()
+    // v0.7.2: gespeicherte Debug-Stufe des Ereignislogs übernehmen (env BLITZTEXT_DEBUG=1 bleibt erzwungen).
+    log.setzeDebugAktiv?.(startSettings.ausfuehrlichesProtokoll)
     await migriereLegacyApiKey({
       legacy: createApiKeyFile(),
       ziel: createApiKeyVaultFile(startSettings.standardAnbieterId)
@@ -539,6 +587,7 @@ if (!gotTheLock) {
     recorderWindow = createRecorderWindow()
     pillWindow = createPillWindow()
     const ausgabe = createPasteAusgabe({
+      log,
       fenster: {
         // Manuelle Auslösequelle: v1-minimal als Notification (vollständige Workflow-Anzeige + manueller
         // Tray-Start brauchen Aufnahme-UI → zurückgestellt; Kernpfad ist der Hotkey).
@@ -563,7 +612,8 @@ if (!gotTheLock) {
     let holeStandardAnbieterId: () => string = () => ''
 
     const comp = await createMainComposition({
-      recorder: createRecorder(recorderWindow),
+      log,
+      recorder: createRecorder(recorderWindow, { log }),
       ausgabe,
       apiKeys,
       settingsFile,
@@ -648,13 +698,25 @@ if (!gotTheLock) {
       }
     }
 
+    // Erstlauf-Härtung (H1): die versteckten Renderer (Recorder/Pille) werden fire-and-forget geladen
+    // (loadFile/URL) — der Hook darf erst starten, wenn sie ihre IPC-Listener registriert haben, sonst
+    // verpufft der allererste recorder:start / pill:status nach Kaltstart. Timeout = Fallback (der Hook
+    // startet IMMER, blockiert nie).
+    const bereitschaft = await warteAufFensterBereit([recorderWindow, pillWindow], 3000)
+    if (!bereitschaft.bereit) {
+      log.warnung('app.fenster_bereit_timeout', { dauerMs: bereitschaft.dauerMs })
+    } else {
+      log.debug('app.fenster_bereit', { dauerMs: bereitschaft.dauerMs })
+    }
+
     // Globaler Hotkey über uiohook → verarbeiteTaste → Sitzung (ersetzt den globalShortcut-Platzhalter).
     // onStatus speist den Start-Erfolg in den Health-Check „Hotkey-Erkennung" (W3-ε).
     // perf: NOOP_PERF im Normalbetrieb (siehe oben) — nur bei BLITZTEXT_PERF=1 eine echte Messung.
     stopUiohook = starteUiohookQuelle({
       verarbeiteTaste: comp.verarbeiteTaste,
       onStatus: (aktiv) => comp.setzeHotkeyHookAktiv(aktiv),
-      perf
+      perf,
+      log
     })
 
     // W3-γ: Registry-Autostart-Eintrag an das gespeicherte `autostart`-Feld angleichen (heilt einen
@@ -664,15 +726,28 @@ if (!gotTheLock) {
     // Sperre/Standby verschlucken Keyups (Win+L → Secure Desktop, RESEARCH §3): Tasten-Tracking
     // zurücksetzen, sonst bleibt z. B. die Win-Taste „gedrückt" und LinksStrg allein startet die
     // Aufnahme. Ein gerade aktiver Hotkey-Lauf wird dabei abgebrochen.
-    powerMonitor.on('lock-screen', () => comp.setzeTastenZurueck())
-    powerMonitor.on('unlock-screen', () => comp.setzeTastenZurueck())
-    powerMonitor.on('suspend', () => comp.setzeTastenZurueck())
-    powerMonitor.on('resume', () => comp.setzeTastenZurueck())
+    powerMonitor.on('lock-screen', () => {
+      log.info('system.sperre')
+      comp.setzeTastenZurueck()
+    })
+    powerMonitor.on('unlock-screen', () => {
+      log.info('system.entsperrt')
+      comp.setzeTastenZurueck()
+    })
+    powerMonitor.on('suspend', () => {
+      log.info('system.standby')
+      comp.setzeTastenZurueck()
+    })
+    powerMonitor.on('resume', () => {
+      log.info('system.aufwachen')
+      comp.setzeTastenZurueck()
+    })
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) showSettings()
     })
   }).catch((err) => {
+    log.fehler('app.start_fehl', redigiereFehler(err))
     console.error('App-Start fehlgeschlagen:', err)
   })
 
@@ -684,6 +759,7 @@ if (!gotTheLock) {
   })
 
   app.on('will-quit', () => {
+    log.info('app.ende')
     stopUiohook()
     perf.stoppe() // No-Op bei NOOP_PERF; verhindert einen hängenden Log-Timer bei BLITZTEXT_PERF=1
     // C5: Update-Timer aufräumen (Start-Timeout kann beim Beenden noch ausstehen, Intervall läuft sonst weiter).

@@ -17,6 +17,12 @@ import type { TreueDetektor } from '@main/rewrite/treue-detektor'
 import { wirktUnvollstaendig } from '@shared/vollstaendigkeit'
 import { klassifiziere, type FehlerArt } from '@main/workflow/fehler-klassifikation'
 import { mitRetry } from '@main/workflow/retry'
+import {
+  NOOP_EREIGNISLOG,
+  redigiereFehler,
+  type EreignisLog,
+  type LogFelder
+} from '@main/diagnostics/ereignis-log'
 
 export interface RecordingResult {
   audio: Blob
@@ -72,6 +78,12 @@ export interface WorkflowRunnerDeps {
   starteZwischenmeldungsTimer?: (onTimeout: () => void) => () => void
   /** Backoff-Verzögerung zwischen netzwerk-Retries; injizierbar für Tests (Default echte Verzögerung). */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * Ereignislog (v0.7.2): TEXT-FREIE Beobachtung der Phasenwechsel und Anbieter-Retries. Optional —
+   * fehlt er, wird NOOP_EREIGNISLOG genutzt und nichts geloggt (Verhalten unverändert). Es gehen NIE
+   * Roh-/Endtexte hinein, nur Status, FehlerArt, redigierte Fehler-Nachricht und Längen (`zeichen=`).
+   */
+  log?: EreignisLog
 }
 
 export interface RunInput {
@@ -210,7 +222,17 @@ export function entferneSteuerzeichen(text: string): string {
     .replace(C1_UND_ZEILENTRENNER, '')
 }
 
+// v0.7.2: kürzt eine Fehler-MELDUNG fürs Log auf höchstens 200 Zeichen (der Formatierer kürzt zwar
+// ohnehin, aber die Absicht „nur eine kurze Meldung, nie ein langer Text" wird hier am Call-Site sichtbar).
+// Ein Fehlermeldungstext ist erlaubt — NIE ein Roh-/Endtext (der wird an dieser Stelle nie durchgereicht).
+const MAX_MELDUNG_LAENGE = 200
+function kuerzeMeldung(message: string): string {
+  return message.length <= MAX_MELDUNG_LAENGE ? message : message.slice(0, MAX_MELDUNG_LAENGE) + '…'
+}
+
 export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
+  // v0.7.2: TEXT-FREIES Ereignislog. Ohne Dep ein No-Op → Bestandsverhalten unverändert.
+  const log = deps.log ?? NOOP_EREIGNISLOG
   let phase: WorkflowPhase = { status: 'idle' }
   let input: RunInput | null = null
   let letzteMetrik: RunMetrik | null = null
@@ -343,6 +365,12 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       // W3-B: Audio ab hier flüchtig halten (verwertbare Aufnahme). Ein späterer transienter Fehler /
       // Teil-Erfolg lässt einen Retry ab Transkription zu; ein 'fertig' verwirft es wieder (abschluss()).
       letzteAufnahme = recording
+      // v0.7.2 debug: verwertbare Aufnahme steht (nach Watchdog + Qualitäts-Guard). Nur Zahlen: gerundete
+      // Aufnahmedauer + Audio-Bytegröße — NIE Audio/Text.
+      log.debug('workflow.aufnahme', {
+        dauerSekunden: Math.round(recording.durationSeconds),
+        bytes: recording.audio.size
+      })
       // stop() ist immer ein FRISCHER Lauf — istWiederholung bleibt hier default false.
       return verarbeiteAufnahme(recording)
     },
@@ -387,7 +415,16 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       }
       return klassifiziere(fehler, { istWatchdogTimeout: false }) === 'netzwerk'
     }
-    const retryOpts = { versuche: 2, backoffMs: 300, retrybar, sleep: deps.sleep }
+    const retryOpts = {
+      versuche: 2,
+      backoffMs: 300,
+      retrybar,
+      sleep: deps.sleep,
+      // v0.7.2: TEXT-FREIE Beobachtung jedes Fehlversuchs, der wiederholt wird — nur Versuchsnummer
+      // und redigierter Fehler (name+message), NIE Roh-/Endtext.
+      beiWiederholung: (versuch: number, fehler: unknown) =>
+        log.warnung('anbieter.retry', { versuch, ...redigiereFehler(fehler) })
+    }
 
     // --- Transkriptions-Phase: Audio → Rohtext (oder null bei leerer/artefaktiger Transkription). ---
     // Reine Gliederung von verarbeiteAufnahme; Logik/Reihenfolge/Fehlerpfade unverändert. Nutzt die
@@ -404,6 +441,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         // schon hier (defense-in-depth, idempotent — cloud-provider.ts wendet ihn ohnehin nochmal an).
         const vocabularyHints =
           recording.durationSeconds >= 0.9 ? begriffeFuerAsrPrompt(input?.customTerms ?? []) : []
+        const beginn = Date.now()
         const raw = await mitRetry(
           () =>
             deps.transcription.transcribe(recording.audio, {
@@ -413,6 +451,9 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
             }),
           retryOpts
         )
+        // v0.7.2 debug: Transkription fertig. Nur Zahlen: Dauer in ms + LÄNGE des Rohtranskripts
+        // (`zeichen`), NIE der Transkript-Text selbst.
+        log.debug('workflow.transkribiert', { dauerMs: Date.now() - beginn, zeichen: raw.length })
         return deps.quality.rohtextAus(raw, recording.durationSeconds)
       } finally {
         stoppeZwischenmeldung()
@@ -436,6 +477,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         const model = input?.chatModell ?? ''
         // Rohtext gekapselt senden (Daten-Rahmen, prompt-builder): zieht die Grenze „zu bearbeitende
         // Daten" vs. „Anweisung", damit ein direkt ansprechendes Diktat nicht als Befehl befolgt wird.
+        const beginn = Date.now()
         const rewritten = await mitRetry(
           () =>
             deps.rewrite.rewrite(
@@ -444,6 +486,9 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
             ),
           retryOpts
         )
+        // v0.7.2 debug: Umschreiben fertig. Nur Zahlen: Dauer in ms + LÄNGE des Modell-Endtexts
+        // (`zeichen`), NIE der Endtext selbst.
+        log.debug('workflow.umgeschrieben', { dauerMs: Date.now() - beginn, zeichen: rewritten.text.length })
         // Token-Limit (W1-D): der Anbieter hat die Antwort bei finish_reason='length' abgeschnitten.
         // Der zurückgegebene Text ist unvollständig — weder als voller Erfolg einfügen noch dem
         // Treue-Detektor zur Prüfung vorlegen (der prüft eine vollständige Bearbeitung). Rohtext retten.
@@ -591,6 +636,20 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     // damit der Guard im Timer-Callback (starteZwischenmeldung) wirksam ist, egal wie viele andere
     // transition()-Aufrufe dazwischen liefen.
     zwischenmeldungGeneration++
+    // v0.7.2: `transition()` ist das Nadelöhr ALLER Phasenwechsel → hier text-frei loggen. Es gehen NIE
+    // Roh-/Endtexte hinein: nur der Status, bei 'fertig'/'teilErfolg' die LÄNGE (`zeichen=`), bei 'fehler'
+    // die FehlerArt + redigierte, gekürzte Meldung. `message` ist ein Fehlermeldungstext (kein Transkript).
+    const felder: LogFelder = { status: next.status }
+    if (next.status === 'fertig') {
+      felder.zeichen = next.text.length
+    } else if (next.status === 'teilErfolg') {
+      felder.grund = next.grund
+      felder.zeichen = next.rohtext.length
+    } else if (next.status === 'fehler') {
+      felder.art = next.art
+      felder.message = kuerzeMeldung(next.message)
+    }
+    log.info('workflow.phase', felder)
     phase = next
     runner.onPhase?.(next)
     return next
