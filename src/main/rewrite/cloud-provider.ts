@@ -27,6 +27,16 @@ export interface RewriteProvider {
 
 const OPENAI_BASE_URL = 'https://api.openai.com/v1'
 
+// Fetch-Timeout (A3, analog transcription/cloud-provider.ts W1-F): der Runner-Watchdog (90 s,
+// runner.ts) ist der Backstop für JEDEN hängenden Anbieter-Aufruf und klassifiziert bewusst als
+// 'anbieter' (nicht wiederholbar — siehe fehler-klassifikation.ts). Ohne eigenen Timeout lief ein
+// hängendes Umschreiben bislang ungebremst bis zum Watchdog und verlor dabei die Retry-Fähigkeit
+// eines simplen Transportproblems. Ein eigener, KÜRZERER Provider-Timeout liegt darunter, damit ein
+// stockender Verbindungsaufbau/Transfer VOR dem Watchdog als Transport-/Verbindungsfehler auffällt
+// (`.transport = true` → Fehler-Art 'netzwerk', wiederholbar via mitRetry) statt erst nach 90 s als
+// nicht wiederholbarer Anbieter-Fehler zu enden.
+export const DEFAULT_FETCH_TIMEOUT_MS = 60_000
+
 export function createCloudRewriteProvider(deps: {
   getApiKey: () => Promise<string | null>
   /** OpenAI-kompatible Base-URL OHNE Trailing-Slash; ohne Angabe = OpenAI (v1-Verhalten). */
@@ -34,6 +44,16 @@ export function createCloudRewriteProvider(deps: {
   /** L1: erlaubt einen Lauf OHNE Key (key-loser lokaler Anbieter) → kein Authorization-Header. */
   erlaubeOhneKey?: () => boolean
   fetchFn?: typeof fetch
+  /** Eigener Fetch-Timeout in ms; Default DEFAULT_FETCH_TIMEOUT_MS. Injizierbar für Tests UND als
+   *  Andockpunkt für eine spätere Welle (Timeouts über die Einstellungen konfigurierbar). */
+  fetchTimeoutMs?: number
+  /**
+   * v0.8.0 (netzwerkProfil): Live-Getter für den Fetch-Timeout — nimmt Vorrang vor der statischen
+   * `fetchTimeoutMs` (Tests), falls gesetzt. Composition-root reicht ihn als Closure über die lebende
+   * Settings-Kopie durch (Muster wie `getBaseUrl` oben), damit eine Profiländerung ab dem NÄCHSTEN
+   * Aufruf greift, ohne den Provider neu zu bauen.
+   */
+  getFetchTimeoutMs?: () => number
 }): RewriteProvider {
   const fetchFn = deps.fetchFn ?? fetch
   const getBaseUrl = deps.getBaseUrl ?? (() => OPENAI_BASE_URL)
@@ -50,6 +70,23 @@ export function createCloudRewriteProvider(deps: {
       // (lokales ASR/Chat). Der Fehler trägt .status=400 → Fehler-Art 'konfiguration' (kein Retry).
       pruefeAnbieterUrlSicherheit(getBaseUrl())
 
+      // Eigener Fetch-Timeout (A3, unter dem 90s-Runner-Watchdog): kombiniert mit einem etwaig
+      // durchgereichten Abbruch-Signal (Nutzer-Abbruch oder Watchdog des Aufrufers), sodass BEIDE
+      // Gründe weiter abbrechen können. `internTimeout.signal` feuert NUR bei unserem eigenen Timer.
+      // v0.8.0: PRO AUFRUF aufgelöst (nicht mehr einmalig beim Provider-Bau) — damit ein via
+      // `getFetchTimeoutMs` live gereichtes netzwerkProfil ab dem NÄCHSTEN Aufruf greift.
+      const fetchTimeoutMs = deps.getFetchTimeoutMs
+        ? deps.getFetchTimeoutMs()
+        : (deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS)
+      const internTimeout = new AbortController()
+      const timeoutTimer = setTimeout(
+        () => internTimeout.abort(new DOMException('Zeitüberschreitung.', 'TimeoutError')),
+        fetchTimeoutMs
+      )
+      const combinedSignal = opts.signal
+        ? AbortSignal.any([opts.signal, internTimeout.signal])
+        : internTimeout.signal
+
       let response: Response
       try {
         response = await fetchFn(`${getBaseUrl()}/chat/completions`, {
@@ -65,10 +102,25 @@ export function createCloudRewriteProvider(deps: {
               { role: 'user', content: input.user }
             ]
           }),
-          signal: opts.signal
+          signal: combinedSignal
         })
       } catch (cause) {
-        // Abbruch/Timeout unverändert weiterreichen, damit der Aufrufer (Reducer) sie klassifizieren kann.
+        // Unser EIGENER Timeout ist erkennbar an internTimeout.signal.aborted — von einem durchgereichten
+        // Nutzer-Abbruch/Watchdog-Timeout des Aufrufers unterscheiden (der unverändert weiterfliegt).
+        if (internTimeout.signal.aborted && !(opts.signal?.aborted ?? false)) {
+          // NICHT als 'TimeoutError' weiterreichen: der Runner (runner.ts) behandelt JEDEN
+          // TimeoutError als Watchdog-Timeout → Fehler-Art 'anbieter' (nicht wiederholbar). Unser
+          // Timeout liegt bewusst UNTER dem Watchdog und soll als Transport-/Verbindungsfehler
+          // gelten → Fehler-Art 'netzwerk', damit der bestehende Retry (mitRetry) greift.
+          const fehler = new Error(
+            'Netzwerkfehler: Zeitüberschreitung bei der Übertragung zum Anbieter.',
+            { cause }
+          ) as AnbieterFehler
+          fehler.transport = true
+          throw fehler
+        }
+        // Abbruch/Timeout des AUFRUFERS (Nutzer-Abbruch oder dessen Watchdog) unverändert weiterreichen,
+        // damit der Aufrufer (Reducer) sie klassifizieren kann.
         if (cause instanceof Error && (cause.name === 'AbortError' || cause.name === 'TimeoutError')) {
           throw cause
         }
@@ -79,6 +131,8 @@ export function createCloudRewriteProvider(deps: {
         ) as AnbieterFehler
         fehler.transport = true // Transport-/Verbindungsfehler → Fehler-Art netzwerk
         throw fehler
+      } finally {
+        clearTimeout(timeoutTimer)
       }
 
       const raw = await response.text()

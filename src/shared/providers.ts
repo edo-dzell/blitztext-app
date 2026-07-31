@@ -186,3 +186,20 @@ export function modelleFuerVorlage(vorlage: string): { asr: ModellInfo[]; chat: 
 export function asrUnterstuetztTextFormat(model: string): boolean {
   return model.startsWith('whisper')
 }
+
+/** In welchem Multipart-Feld erwartet der ASR-Endpunkt die Eigene-Begriffe-Liste? */
+export type AsrBegriffeFeld = 'prompt' | 'context_bias'
+
+/**
+ * B1: Mistrals Voxtral-Transkriptions-Endpunkt kennt KEIN `prompt`-Feld (das ist Whisper-/
+ * OpenAI-spezifisch) — unbekannte Multipart-Felder werden von APIs typischerweise still ignoriert,
+ * das Wörterbuch des Nutzers verpuffte also bisher bei jeder Mistral-Transkription ohne Fehler.
+ * Mistrals Gegenstück heißt laut Doku `context_bias` (Array von Begriffen, siehe
+ * https://docs.mistral.ai/studio-api/audio/speech_to_text/offline_transcription, Stand 2026-07-31:
+ * "up to 100 words or phrases"). Analog zu asrUnterstuetztTextFormat() oben: reine, modellabhängige
+ * Verzweigung. Default bleibt 'prompt' (Whisper/OpenAI-kompatibel/Groq/lokal/custom) — KEIN
+ * Verhaltenswechsel für die bestehenden Anbieter.
+ */
+export function asrBegriffeFeld(model: string): AsrBegriffeFeld {
+  return model.startsWith('voxtral') ? 'context_bias' : 'prompt'
+}

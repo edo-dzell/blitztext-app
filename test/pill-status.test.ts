@@ -2,8 +2,28 @@ import { describe, it, expect } from 'vitest'
 import { pillenStatus } from '@main/window/pill-status'
 
 describe('pillenStatus', () => {
+  // v0.8.0 (Befund 9): DIESER Test schrieb bislang fest, dass die Phase 'aufnehmen' SOFORT „🎙 Aufnahme …"
+  // zeigt — das WAR genau der irreführende Zustand aus Befund 9: der Runner setzt die Phase 'aufnehmen',
+  // BEVOR mediaRecorder.start() im Renderer überhaupt gelaufen ist, die Pille log also fälschlich schon
+  // „Aufnahme" bei langsamem Gerätestart (Defender-Erstscan, Bluetooth-Mikro) — der Nutzer sprach in genau
+  // diesem Fenster los, und der Anfang fehlte im Transkript. Bewusst umgeschrieben (kein Abschwächen!):
+  // OHNE die neue, additive Bestätigung (`bestaetigt`, siehe runner.ts) zeigt die Pille jetzt „Starte …";
+  // ERST nach der Bestätigung (mediaRecorder.start() im Renderer erfolgreich) zeigt sie wie bisher
+  // „🎙 Aufnahme …". Die zweite Zeile unten (mit bestaetigt:true) ist der einzige Weg, das alte Label zu
+  // bekommen — es ist NICHT verschwunden, nur an eine Bedingung geknüpft.
+  it('zeigt „Starte …" ohne Bestätigung, „Aufnahme …" NACH Bestätigung (Befund 9)', () => {
+    expect(pillenStatus({ status: 'aufnehmen' })).toEqual({ sichtbar: true, label: '⏳ Starte …' })
+    expect(pillenStatus({ status: 'aufnehmen', bestaetigt: false })).toEqual({
+      sichtbar: true,
+      label: '⏳ Starte …'
+    })
+    expect(pillenStatus({ status: 'aufnehmen', bestaetigt: true })).toEqual({
+      sichtbar: true,
+      label: '🎙 Aufnahme …'
+    })
+  })
+
   it('zeigt die aktiven Phasen mit Label', () => {
-    expect(pillenStatus({ status: 'aufnehmen' })).toEqual({ sichtbar: true, label: '🎙 Aufnahme …' })
     expect(pillenStatus({ status: 'transkribieren' }).sichtbar).toBe(true)
     expect(pillenStatus({ status: 'umschreiben' }).sichtbar).toBe(true)
   })
@@ -88,6 +108,32 @@ describe('pillenStatus', () => {
       const s = pillenStatus({ status: 'fehler', art: 'anbieter', message: 'y'.repeat(100) })
       expect(s.dauerMs).toBeGreaterThan(4000)
       expect(s.dauerMs).toBeLessThan(8000)
+    })
+
+    // --- v0.8.0 (pillenAnzeigedauerProfil): optionaler zweiter Parameter, Default = die AUTO_HIDE_*-Werte ---
+
+    describe('mit abweichenden Anzeigedauer-Werten (pillenAnzeigedauerProfil)', () => {
+      const kurz = { basisMs: 2000, obergrenzeMs: 4000, msProZeichen: 30 }
+
+      it('kurzer Fehlertext trifft die ABWEICHENDE Basis (2000), nicht den Default (4000)', () => {
+        const s = pillenStatus({ status: 'fehler', art: 'anbieter', message: 'kurz' }, kurz)
+        expect(s.dauerMs).toBe(2000)
+        // Kontrollprobe: ohne den Parameter bleibt der Default (4000) unverändert.
+        expect(pillenStatus({ status: 'fehler', art: 'anbieter', message: 'kurz' }).dauerMs).toBe(4000)
+      })
+
+      it('sehr langer Fehlertext trifft die ABWEICHENDE Obergrenze (4000), nicht den Default (8000)', () => {
+        const s = pillenStatus({ status: 'fehler', art: 'anbieter', message: 'x'.repeat(200) }, kurz)
+        expect(s.dauerMs).toBe(4000)
+      })
+
+      it('gilt genauso für teilErfolg (nicht nur fehler)', () => {
+        const s = pillenStatus(
+          { status: 'teilErfolg', rohtext: 'x', warnung: 'w', grund: 'umschreibfehler' },
+          kurz
+        )
+        expect(s.dauerMs).toBe(2000)
+      })
     })
   })
 })

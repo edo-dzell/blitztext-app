@@ -142,8 +142,19 @@ export type BlitztextApi = typeof api
 // Bridge für den versteckten Aufnahme-Renderer (recorder.html, #03/#11): Befehle aus dem Main-Prozess
 // empfangen, Ergebnis/Fehler zurücksenden. Auf dem Einstellungs-Fenster ungenutzt (harmlos).
 const recorder = {
-  onStart: (cb: () => void): void => {
-    ipcRenderer.on('recorder:start', () => cb())
+  // Befund 7a (v0.8.0): `deviceId` kommt jetzt als Nutzlast direkt aus dem Main-Prozess mit (die Sitzung
+  // hat die Einstellungen an dieser Stelle bereits geladen) — kein `settings:get`-Roundtrip mehr im
+  // Startpfad der Aufnahme. `undefined`, wenn KEINE Nutzlast mitkam (Altweg: der Renderer fragt dann
+  // selbst per IPC nach, siehe recorder.ts `ermittleGewuenschteDeviceId`).
+  // Befund 2 (v0.8.x, adversariale Review): `lauf` ist der vom Main-Prozess erzeugte Lauf-Bezug für
+  // DIESEN Aufnahme-Versuch (siehe recorder-adapter.ts `StartNutzlast`) — der Renderer reicht ihn nur
+  // durch (sendGestartet spiegelt ihn zurück), interpretiert ihn selbst nicht. `undefined`, wenn die
+  // Nutzlast ganz fehlt (Altweg) ODER keinen Lauf-Bezug enthält (alter Main-Aufrufer).
+  onStart: (cb: (deviceId?: string, lauf?: number) => void): void => {
+    ipcRenderer.on(
+      'recorder:start',
+      (_event, payload?: { deviceId?: string; lauf?: number }) => cb(payload?.deviceId, payload?.lauf)
+    )
   },
   onStop: (cb: () => void): void => {
     ipcRenderer.on('recorder:stop', () => cb())
@@ -151,11 +162,35 @@ const recorder = {
   onDiscard: (cb: () => void): void => {
     ipcRenderer.on('recorder:discard', () => cb())
   },
-  sendResult: (buffer: ArrayBuffer, durationSeconds: number, mimeType: string): void => {
-    ipcRenderer.send('recorder:result', { buffer, durationSeconds, mimeType })
+  // Befund A (v0.8.0): App-Start-Vorwärmung, fire-and-forget vom Main-Prozess ausgelöst (siehe
+  // index.ts). `deviceId` = die vom Nutzer gewählte mikrofonDeviceId, direkt als Nutzlast mitgegeben
+  // (kein IPC-Pull nötig, analog zur onStart-Nutzlast, Befund 7a). `undefined`, wenn keine gesetzt ist
+  // (OS-Standardgerät).
+  onWarmup: (cb: (deviceId?: string) => void): void => {
+    ipcRenderer.on('recorder:warmup', (_event, deviceId?: string) => cb(deviceId))
+  },
+  // v0.7.4: `pegel` = {max, median} der Aufnahme (RMS über kurze Fenster) oder null ohne Messung.
+  // Speist die Stille-Erkennung gegen Whisper-Halluzinationen im Main-Prozess. Zwei Zahlen, kein
+  // Audio-Inhalt.
+  sendResult: (
+    buffer: ArrayBuffer,
+    durationSeconds: number,
+    mimeType: string,
+    pegel: { max: number; median: number } | null
+  ): void => {
+    ipcRenderer.send('recorder:result', { buffer, durationSeconds, mimeType, pegel })
   },
   sendError: (message: string): void => {
     ipcRenderer.send('recorder:error', message)
+  },
+  // v0.8.0 (Befund 9): Bestätigung, dass mediaRecorder.start() im Renderer erfolgreich lief — die Pille
+  // zeigt bis dahin „Starte …" statt fälschlich „Aufnahme …" (pill-status.ts). Analog zu sendError:
+  // fire-and-forget send, kein neuer Antwort-Roundtrip nötig.
+  // Befund 2 (v0.8.x): `lauf` (optional) spiegelt den in `onStart` empfangenen Lauf-Bezug unverändert
+  // zurück — der Main-Prozess erkennt daran eine verspätete Bestätigung eines längst abgelösten Laufs
+  // (siehe runner.ts `meldeAufnahmeBestaetigt`). `undefined`, wenn `onStart` keinen Bezug mitbekam.
+  sendGestartet: (lauf?: number): void => {
+    ipcRenderer.send('recorder:gestartet', lauf)
   }
 }
 

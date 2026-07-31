@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { warteAufFensterBereit } from '@main/window/fenster-bereitschaft'
+import { warteAufFensterBereit, protokolliereLadefehler } from '@main/window/fenster-bereitschaft'
 
 // Fake-Fenster: webContents als EventEmitter (did-finish-load/did-fail-load), steuerbares isLoading
 // und isDestroyed. Muster analog test/recorder-adapter.test.ts.
@@ -112,5 +112,93 @@ describe('warteAufFensterBereit', () => {
       return v
     })
     expect(res.dauerMs).toBe(25)
+  })
+})
+
+// v0.7.4 — Regression: Ein 'did-fail-load' zählte zwar als „fertig" (richtig, damit der Hook nicht ewig
+// wartet), war danach aber vom Erfolgsfall NICHT mehr unterscheidbar und wurde nirgends protokolliert.
+// Ein gescheitertes pill.html blieb damit vollständig unsichtbar: Fenster lebt, send() verpufft,
+// showInactive() zeigt eine leere Fläche, kein einziges Log-Ereignis.
+describe('warteAufFensterBereit — Ladefehler', () => {
+  it('did-fail-load gilt weiterhin als fertig, wird aber als Ladefehler gemeldet', async () => {
+    const f = fakeFenster({ loading: true })
+    const p = warteAufFensterBereit([f as never], 3000)
+    f.webContents.emit('did-fail-load')
+    const res = await p
+    expect(res.bereit).toBe(true) // blockiert den Hook-Start weiterhin nicht
+    expect(res.ladefehler).toEqual([0])
+  })
+
+  it('meldet den INDEX des gescheiterten Fensters (Aufrufer mappt auf recorder/pille)', async () => {
+    const ok = fakeFenster({ loading: true })
+    const kaputt = fakeFenster({ loading: true })
+    const p = warteAufFensterBereit([ok as never, kaputt as never], 3000)
+    ok.webContents.emit('did-finish-load')
+    kaputt.webContents.emit('did-fail-load')
+    const res = await p
+    expect(res.ladefehler).toEqual([1])
+  })
+
+  it('sauberer Start → ladefehler leer', async () => {
+    const f = fakeFenster({ loading: true })
+    const p = warteAufFensterBereit([f as never], 3000)
+    f.webContents.emit('did-finish-load')
+    expect((await p).ladefehler).toEqual([])
+  })
+
+  it('entfernt beide Listener auch nach did-fail-load (kein Leak)', async () => {
+    const f = fakeFenster({ loading: true })
+    const p = warteAufFensterBereit([f as never], 3000)
+    f.webContents.emit('did-fail-load')
+    await p
+    expect(f.webContents.listenerCount('did-finish-load')).toBe(0)
+    expect(f.webContents.listenerCount('did-fail-load')).toBe(0)
+  })
+})
+
+describe('protokolliereLadefehler', () => {
+  function fakeLog() {
+    const eintraege: Array<{ ereignis: string; felder?: Record<string, unknown> }> = []
+    return {
+      eintraege,
+      warnung: (ereignis: string, felder?: Record<string, unknown>) =>
+        eintraege.push({ ereignis, felder })
+    }
+  }
+
+  it('protokolliert einen SPÄTEREN Ladefehler (nach dem Start, z. B. nach einem Reload)', () => {
+    const f = fakeFenster({ loading: false })
+    const log = fakeLog()
+    protokolliereLadefehler(f as never, 'pille', log)
+    f.webContents.emit('did-fail-load')
+    expect(log.eintraege).toEqual([{ ereignis: 'fenster.ladefehler', felder: { fenster: 'pille' } }])
+  })
+
+  it('protokolliert jeden weiteren Ladefehler ebenfalls (kein Einmal-Flag)', () => {
+    const f = fakeFenster({ loading: false })
+    const log = fakeLog()
+    protokolliereLadefehler(f as never, 'recorder', log)
+    f.webContents.emit('did-fail-load')
+    f.webContents.emit('did-fail-load')
+    expect(log.eintraege).toHaveLength(2)
+  })
+
+  it('entferne() meldet ab und ist idempotent', () => {
+    const f = fakeFenster({ loading: false })
+    const log = fakeLog()
+    const w = protokolliereLadefehler(f as never, 'pille', log)
+    w.entferne()
+    w.entferne()
+    f.webContents.emit('did-fail-load')
+    expect(log.eintraege).toEqual([])
+  })
+
+  it('zerstörtes/fehlendes Fenster → No-Op, wirft nicht', () => {
+    const log = fakeLog()
+    expect(() => protokolliereLadefehler(null, 'pille', log).entferne()).not.toThrow()
+    const tot = fakeFenster({ zerstoert: true })
+    expect(() => protokolliereLadefehler(tot as never, 'pille', log).entferne()).not.toThrow()
+    tot.webContents.emit('did-fail-load')
+    expect(log.eintraege).toEqual([])
   })
 })

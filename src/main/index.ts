@@ -33,21 +33,30 @@ import {
 } from '@main/secrets/ciphertext-file'
 import { createStatsFile } from '@main/stats/stats-file'
 import { starteUiohookQuelle } from '@main/hotkey/uiohook-source'
-import { createPerfInstrumentierung, NOOP_PERF } from '@main/diagnostics/perf-instrumentierung'
+import {
+  createPerfInstrumentierung,
+  NOOP_PERF,
+  type PerfInstrumentierung
+} from '@main/diagnostics/perf-instrumentierung'
 import { createEreignisLog, redigiereFehler } from '@main/diagnostics/ereignis-log'
 import { createLogDateiSenke, logOrdnerPfad } from '@main/diagnostics/log-datei'
 import { parseRendererLog } from '@main/diagnostics/log-ipc'
 import { createDefaultAutostart } from '@main/autostart'
+import { ermittleAutostartExePfad, istPortablerStart } from '@main/autostart/exe-pfad'
 import { createUpdateHoler } from '@main/update/update-holer'
 import { createUpdateCacheFile } from '@main/update/update-cache-file'
 import { createErreichbarkeitsAdapter } from '@main/health/erreichbarkeit-adapter'
 import { spiegleStatus, baueTrayMenuTemplate } from '@main/window/tray-status'
-import { pillenPosition } from '@main/window/pillen-position'
 import { pillenStatus } from '@main/window/pill-status'
+import {
+  pillenAnzeigedauerWerteFuer,
+  UPDATE_INTERVALL_STUNDEN_STUFEN
+} from '@shared/laufzeit-profile'
+import { erstellePillenSteuerung, type PillenSteuerung } from '@main/window/pillen-steuerung'
 import { istAbbruchOderTimeout } from '@main/session/abbruch-guard'
 import { createSettingsStore, type BlitztextSettings, type ApiKeyStatus } from '@main/settings/store'
-import { sendeAn, canSend } from '@main/window/send-to-window'
-import { warteAufFensterBereit } from '@main/window/fenster-bereitschaft'
+import { sendeAn } from '@main/window/send-to-window'
+import { warteAufFensterBereit, protokolliereLadefehler } from '@main/window/fenster-bereitschaft'
 import { montiereFensterHeilung, type FensterHeilung } from '@main/window/fenster-heilung'
 // W3-F1: `workflowZuPreset` zog von @shared/workflows nach @main/rewrite/prompt-builder um (braucht
 // `berechneterPrompt`, um den Prompt-Text eines unveränderten Built-ins aufzulösen statt '' zu
@@ -72,6 +81,7 @@ const log = createEreignisLog({
   senke: logSenke,
   debugAktiv: process.env['BLITZTEXT_DEBUG'] === '1'
 })
+
 
 // Tray-Dauertool (D4/A5): ein unerwarteter Bug soll NICHT lautlos verschwinden, aber auch keine
 // Datenverlust-Schleife auslösen → surface (Log + Hinweis), dann kontrolliert beenden. KEIN Auto-Neustart
@@ -106,9 +116,11 @@ let isQuitting = false
 // v0.7.3 (B1): Selbstheilung der versteckten Renderer (Recorder/Pille) — bei will-quit entfernt (Liste,
 // weil zwei Fenster geheilt werden). Leer, bis nach dem Fenster-Bau montiert.
 const fensterHeilungen: FensterHeilung[] = []
-// v0.7.3 (B1): einmalige Warnung, falls die Pille nicht (mehr) sendbar ist (zerstört/nicht bereit) —
-// so wird das Log bei einem dauerhaft toten Pillen-Fenster nicht bei jedem onStatus vollgeschrieben.
-let pilleNichtVerfuegbarGemeldet = false
+// v0.7.4: dauerhafte 'did-fail-load'-Wächter beider versteckter Fenster — ebenfalls bei will-quit ab.
+const ladefehlerWaechter: Array<{ entferne(): void }> = []
+// v0.7.4: Anzeige-Steuerung der Pille (testbares Modul, ersetzt die früheren Closures pilleSichtbar/
+// pilleHide/positioniertePille). Erst nach dem Fenster-Bau gesetzt; bis dahin No-Op.
+let pillenSteuerung: PillenSteuerung | null = null
 
 // C5: Zustand des Update-Hintergrund-Checks (Start-Check ~1min, danach ~6h-Intervall). Der bestehende
 // 24h-Mindestabstand + ETag-Cache in pruefeAufUpdate() bleibt die Spam-Bremse — der Timer hier fragt
@@ -118,11 +130,19 @@ let updateVerfuegbar: { url: string; version: string } | null = null
 let updateStartTimer: ReturnType<typeof setTimeout> | null = null
 let updateIntervallTimer: ReturnType<typeof setInterval> | null = null
 
-// R5 (Perf-Diagnose, opt-in, .scratch/PERF-MESSANLEITUNG-R5.md): NUR bei gesetztem env-Flag eine
-// echte Ringpuffer-Instrumentierung anlegen — sonst NOOP_PERF (kein Ringpuffer, kein Timer, keine
-// Allokation außer dem einen no-op-Objekt-Literal). Der Hot-Path in uiohook-source.ts bleibt im
-// Aus-Zustand bei zwei no-op-Funktionsaufrufen pro Event (vernachlässigbar ggü. dem Hook selbst).
-const perf =
+// R5 (Perf-Diagnose, opt-in, .scratch/PERF-MESSANLEITUNG-R5.md): NUR bei gesetztem env-Flag ODER
+// aktivierter `perfAktiv`-Einstellung (v0.8.0) eine echte Ringpuffer-Instrumentierung anlegen — sonst
+// NOOP_PERF (kein Ringpuffer, kein Timer, keine Allokation außer dem einen no-op-Objekt-Literal). Der
+// Hot-Path in uiohook-source.ts bleibt im Aus-Zustand bei zwei no-op-Funktionsaufrufen pro Event
+// (vernachlässigbar ggü. dem Hook selbst).
+// v0.8.0: NICHT mehr beim Modul-Laden entschieden (VOR dem Settings-Laden) — der `perfAktiv`-Anteil
+// braucht die geladenen Settings. Die endgültige Zuweisung passiert weiter unten in `app.whenReady()`,
+// direkt nachdem `startSettings` geladen ist; bis dahin (bzw. falls der Start scheitert) bleibt `perf`
+// NOOP_PERF, damit `will-quit` → `perf.stoppe()` immer ein gültiges Objekt vorfindet. WICHTIG: der uiohook-
+// Hook wird EINMALIG mit diesem `perf`-Objekt verdrahtet (`starteUiohookQuelle({ perf, ... })`) und NICHT
+// neu aufgebaut, wenn der Nutzer die Einstellung später ändert — der Schalter wirkt deshalb bewusst erst
+// nach einem Neustart (akzeptiert, siehe Bericht/GUI-Hinweistext).
+let perf: PerfInstrumentierung =
   process.env['BLITZTEXT_PERF'] === '1' ? createPerfInstrumentierung() : NOOP_PERF
 
 // Dunkle Taskleiste → helles Icon, helle Taskleiste → dunkles Icon (Windows kennt keine Template-
@@ -139,6 +159,19 @@ function aktualisiereTrayIcon(dark = nativeTheme.shouldUseDarkColors): void {
   if (tray) tray.setImage(resolveTrayIcon(dark))
 }
 
+// App-Icon für Fenster + Taskleiste. Ohne diese Option fällt Windows auf das Icon der .exe zurück —
+// und das ist leer, weil `signAndEditExecutable: false` den rcedit-Schritt überspringt, der Icon und
+// Versions-Metadaten einstempelt (siehe electron-builder.yml; genau diese Einstellung hält den
+// Linux-Build wine-frei). Ergebnis war das Electron-Standardicon, obwohl das Tray-Icon korrekt war.
+// Fehlt die Datei, wird bewusst KEINE Option gesetzt: ein leeres NativeImage würde das Icon erst
+// recht löschen, während `undefined` Electron beim bisherigen Verhalten belässt.
+function resolveAppIcon(): Electron.NativeImage | undefined {
+  const file = app.isPackaged
+    ? join(process.resourcesPath, 'icon.ico')
+    : join(app.getAppPath(), 'resources', 'icon.ico')
+  return existsSync(file) ? nativeImage.createFromPath(file) : undefined
+}
+
 function createSettingsWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1080,
@@ -147,6 +180,7 @@ function createSettingsWindow(): BrowserWindow {
     minHeight: 600,
     show: false,
     title: 'Blitztext',
+    icon: resolveAppIcon(),
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -250,37 +284,29 @@ function createPillWindow(): BrowserWindow {
   return window
 }
 
-// Unten mittig über der Taskleiste, auf dem Display unter dem Cursor (dort wurde der Hotkey ausgelöst).
-function positioniertePille(window: BrowserWindow): void {
-  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
-  const [pw = 0, ph = 0] = window.getSize()
-  // A8: Wunschposition (unten zentriert) + harter Clamp in die sichtbaren Bounds gegen off-screen.
-  const { x, y } = pillenPosition(display.workArea, { width: pw, height: ph })
-  window.setBounds({ x, y, width: pw, height: ph })
+// v0.7.4: Anzeige/Verstecken/Positionieren der Pille liegen jetzt in `pillen-steuerung.ts` (testbar,
+// duck-typed, protokolliert den TATSÄCHLICHEN Sichtbarkeitszustand). Hier bleibt nur die Electron-Naht:
+// welche Arbeitsfläche gilt. Unten mittig über der Taskleiste, auf dem Display unter dem Cursor —
+// dort steht in aller Regel auch das Fenster, in das eingefügt wird.
+//
+// Befund B (Feld-Log 2026-07-31): DIESE Funktion liefert weiterhin nur eine EINMALIGE, frische Messung
+// unter dem aktuellen Zeiger — sie weiß nichts von „Läufen". Die Konstanz über einen ganzen Lauf hinweg
+// (nicht bei jeder Phase neu unter dem inzwischen woanders stehenden Zeiger nachschauen) übernimmt
+// pillen-steuerung.ts (laufBeginnt()/laufEndet()): sie ruft diese Funktion nur EINMAL pro Lauf auf
+// (beim Phasenbeginn, s. comp.sitzung.onStatus unten) und hält das Ergebnis für alle weiteren Phasen
+// desselben Laufs fest. Ohne laufenden Lauf (Aufwärmen vor dem allerersten Lauf) bleibt es bei der
+// frischen Abfrage hier.
+function arbeitsflaecheFuerPille(): { x: number; y: number; width: number; height: number } {
+  return screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea
 }
 
-// v0.7.3 (B1): die Status-Pille kann während des Betriebs zerstört werden oder (nach einem Renderer-
-// Crash + Reload) kurz nicht sendbar sein. Alle Pillen-Zugriffe (send/positionieren/showInactive/hide)
-// laufen über diese Hüllen: sie greifen NUR auf ein sendbares Fenster zu (canSend prüft null + Fenster-
-// und webContents-isDestroyed) und melden den Ausfall EINMAL text-frei, statt bei jedem onStatus zu
-// werfen (send auf zerstörtes webContents → uncaughtException → App-Tod) oder das Log vollzuschreiben.
+// Bequeme Hüllen — bis die Steuerung montiert ist (Fenster-Bau), sind sie folgenlose No-Ops.
 function pilleSichtbar(label: string): void {
-  if (!canSend(pillWindow)) {
-    if (!pilleNichtVerfuegbarGemeldet) {
-      pilleNichtVerfuegbarGemeldet = true
-      log.warnung('pille.nicht_verfuegbar')
-    }
-    return
-  }
-  pillWindow!.webContents.send('pill:status', label)
-  positioniertePille(pillWindow!)
-  pillWindow!.showInactive()
+  pillenSteuerung?.zeige(label)
 }
 
 function pilleHide(): void {
-  // hide() auf ein zerstörtes Fenster wirft ebenfalls → nur bei sendbarem Fenster ausblenden. Kein
-  // separater Log-Eintrag hier (pilleSichtbar meldet den Ausfall bereits einmalig).
-  if (pillWindow && !pillWindow.isDestroyed()) pillWindow.hide()
+  pillenSteuerung?.verstecke()
 }
 
 function createTray(): void {
@@ -383,24 +409,62 @@ function meldeSettingsKorrupt(): void {
   )
 }
 
-// P1: apiKeyStatus[anbieterId] setzen (status) oder entfernen (null) — frisch laden, NUR diesen Eintrag
-// mergen, schreiben, Live-Reconfigure. So überschreibt kein Renderer-Entwurf den Status (Lost-Update).
+// A1: derselbe Korruptions-Melder wie oben, für den Verlauf (history-store.ts). Der Store legt eine
+// nicht entschlüsselbare/parsebare history.bin als history.bin.korrupt beiseite, STATT sie beim
+// nächsten Diktat stillschweigend zu überschreiben, und ruft danach diesen Callback. Text-frei: nur
+// der Umstand + eine generische, ehrliche Meldung (kein Dateiinhalt, kein voller Pfad).
+function meldeVerlaufKorrupt(): void {
+  log.warnung('verlauf.korrupt')
+  benachrichtige(
+    'Blitztext',
+    'Der gespeicherte Verlauf war nicht mehr lesbar (z. B. nach einem Profil-/Systemwechsel) und ' +
+      'wurde gesichert, statt überschrieben zu werden. Alte Datei: history.bin.korrupt. Die Daten ' +
+      'sind nicht gelöscht, aber derzeit nicht mehr lesbar.'
+  )
+}
+
+// A1: Korruptions-Melder für den API-Key-Tresor (api-key-vault.ts), EINER je Anbieter (mehrere Keys
+// möglich) — daher ein Set statt eines einzelnen Flags, damit jeder betroffene Anbieter genau einmal
+// gemeldet wird. NUR die anbieterId geht ins Log/die Meldung, NIE Key-Material (Leak-Regel).
+const secretsKorruptGemeldet = new Set<string>()
+function meldeSecretsKorrupt(anbieterId: string): void {
+  if (secretsKorruptGemeldet.has(anbieterId)) return
+  secretsKorruptGemeldet.add(anbieterId)
+  log.warnung('secrets.korrupt', { anbieterId })
+  benachrichtige(
+    'Blitztext',
+    `Der gespeicherte API-Key für „${anbieterId}" war nicht mehr lesbar und wurde gesichert (Suffix ` +
+      '.korrupt). Bitte den Key in den Einstellungen erneut eingeben.'
+  )
+}
+
+// P1: apiKeyStatus[anbieterId] setzen (status) oder entfernen (null) — NUR diesen Eintrag mergen,
+// schreiben, Live-Reconfigure. So überschreibt kein Renderer-Entwurf den Status (Lost-Update).
+// A2: load()→merge→save() lief hier bisher als ZWEI unabhängige Store-Zugriffe ohne gegenseitigen
+// Ausschluss — zwei überlappende Aufrufe (z. B. zwei apikey:save für verschiedene Anbieter, oder dieser
+// Handler parallel zu settings:save) konnten sich gegenseitig überschreiben (der zweite Aufruf hatte vor
+// dem Schreiben einen veralteten Stand geladen). `mutate()` (store.ts) serialisiert load()→fn()→save()
+// jetzt als EINE Transaktion.
 async function mergeApiKeyStatus(
   comp: MainComposition,
   anbieterId: string,
   status: ApiKeyStatus | null
 ): Promise<void> {
-  const aktuell = await comp.einstellungen.load()
-  const apiKeyStatus = { ...aktuell.apiKeyStatus }
-  if (status === null) {
-    if (!(anbieterId in apiKeyStatus)) return
-    delete apiKeyStatus[anbieterId]
-  } else {
-    apiKeyStatus[anbieterId] = status
-  }
-  const next = { ...aktuell, apiKeyStatus }
-  await comp.einstellungen.save(next)
-  comp.aktualisiere(next)
+  // `next` bleibt null, wenn `fn` den No-Op-Zweig nimmt (Key soll entfernt werden, ist aber gar nicht
+  // gesetzt) — identisches Verhalten zum früheren frühen `return` VOR save()/aktualisiere() unten.
+  let next: BlitztextSettings | null = null
+  await comp.einstellungen.mutate((aktuell) => {
+    if (status === null) {
+      if (!(anbieterId in aktuell.apiKeyStatus)) return aktuell // No-Op: nichts zu entfernen
+      const apiKeyStatus = { ...aktuell.apiKeyStatus }
+      delete apiKeyStatus[anbieterId]
+      next = { ...aktuell, apiKeyStatus }
+      return next
+    }
+    next = { ...aktuell, apiKeyStatus: { ...aktuell.apiKeyStatus, [anbieterId]: status } }
+    return next
+  })
+  if (next) comp.aktualisiere(next)
 }
 
 function registerIpc(apiKeys: ApiKeyVault, comp: MainComposition): void {
@@ -437,9 +501,14 @@ function registerIpc(apiKeys: ApiKeyVault, comp: MainComposition): void {
   ipcMain.handle('settings:get', () => comp.einstellungen.load())
   ipcMain.handle('settings:save', async (_event, next: BlitztextSettings) => {
     // P1: apiKeyStatus NICHT aus dem Renderer übernehmen — Main bewahrt den persistierten Stand.
-    const aktuell = await comp.einstellungen.load()
-    const zusammengefuehrt = { ...next, apiKeyStatus: aktuell.apiKeyStatus }
-    await comp.einstellungen.save(zusammengefuehrt)
+    // A2: load()→merge→save() jetzt als EINE serialisierte Transaktion über `mutate()` (store.ts) statt
+    // zwei unabhängiger Store-Zugriffe — verhindert ein Lost-Update, falls dieser Aufruf mit einem
+    // gleichzeitigen apikey:save (mergeApiKeyStatus) überlappt.
+    let zusammengefuehrt!: BlitztextSettings
+    await comp.einstellungen.mutate((aktuell) => {
+      zusammengefuehrt = { ...next, apiKeyStatus: aktuell.apiKeyStatus }
+      return zusammengefuehrt
+    })
     // v0.7.2 debug: nur der Umstand „Einstellungen gespeichert" — keine Werte, keine Felder.
     log.debug('einstellungen.gespeichert')
     // A4b: Rückgabewert durchreichen (true=sofort übernommen, false=verschoben bis Lauf-Ende) — der
@@ -626,11 +695,23 @@ if (!gotTheLock) {
     }).load()
     // v0.7.2: gespeicherte Debug-Stufe des Ereignislogs übernehmen (env BLITZTEXT_DEBUG=1 bleibt erzwungen).
     log.setzeDebugAktiv?.(startSettings.ausfuehrlichesProtokoll)
+    // v0.8.0 (perfAktiv): die env-Variable bleibt ein Override (Muster wie BLITZTEXT_DEBUG oben) — die
+    // Einstellung ODER das Flag genügt, um die echte Instrumentierung anzulegen. Bewusst NACH dem
+    // Settings-Laden statt beim Modul-Top (siehe Kommentar an der `let perf`-Deklaration): wirkt erst
+    // nach einem Neustart, weil der uiohook-Hook weiter unten mit GENAU diesem `perf`-Objekt verdrahtet
+    // wird und bei einer späteren Einstellungsänderung nicht neu aufgebaut wird.
+    if (startSettings.perfAktiv || process.env['BLITZTEXT_PERF'] === '1') {
+      perf = createPerfInstrumentierung()
+    }
     await migriereLegacyApiKey({
       legacy: createApiKeyFile(),
       ziel: createApiKeyVaultFile(startSettings.standardAnbieterId)
     })
-    const apiKeys = createApiKeyVault({ cipher: safeStorageCipher, dateiFuer: createApiKeyVaultFile })
+    const apiKeys = createApiKeyVault({
+      cipher: safeStorageCipher,
+      dateiFuer: createApiKeyVaultFile,
+      aufKorruption: meldeSecretsKorrupt
+    })
     createTray()
 
     // Farbschema: Systemänderungen an die Fenster broadcasten + Tray-Icon nachziehen (#Design).
@@ -645,6 +726,12 @@ if (!gotTheLock) {
     // M3/#11 — die Sitzung montieren und die nativen Adapter anschließen.
     recorderWindow = createRecorderWindow()
     pillWindow = createPillWindow()
+    // v0.7.4: Anzeige-Steuerung an das frisch erzeugte Fenster hängen (siehe pillen-steuerung.ts).
+    pillenSteuerung = erstellePillenSteuerung({
+      fenster: pillWindow,
+      ermittleArbeitsflaeche: arbeitsflaecheFuerPille,
+      log
+    })
     const ausgabe = createPasteAusgabe({
       log,
       fenster: {
@@ -682,13 +769,19 @@ if (!gotTheLock) {
       // V2 Strang D: verschlüsselter Verlauf (safeStorage/DPAPI) + text-freie Statistik.
       verlaufCipher: safeStorageCipher,
       verlaufFile: createHistoryFile(),
+      // A1: Störfall-Melder für den Verlauf (siehe meldeVerlaufKorrupt oben).
+      aufVerlaufKorruption: meldeVerlaufKorrupt,
       statsFile: createStatsFile(),
       // P5b: nach erfolgtem Verlauf-Schreiben das Dashboard zum Neuladen anstoßen (race-frei, da das
       // Event erst nach dem aufgelösten Schreibvorgang feuert). sendeAn prüft null/isDestroyed.
       onHistoryChanged: () => sendeAn(settingsWindow, 'history:changed'),
-      // W3-γ: Autostart über den HKCU-Run-Key (portable .exe). `process.execPath` = die laufende .exe.
+      // W3-γ: Autostart über den HKCU-Run-Key (portable .exe).
+      // v0.7.4: NICHT `process.execPath` — bei einem portable-Build zeigt der auf die ins %TEMP%
+      // entpackte Kopie (bei jedem Start eine andere), nicht auf die vom Nutzer gestartete .exe. Der
+      // Run-Key bekam dadurch einen toten Pfad: Autostart hat nie funktioniert. `PORTABLE_EXECUTABLE_FILE`
+      // (von electron-builder gesetzt) trägt den echten Pfad; siehe autostart/exe-pfad.ts.
       autostart: createDefaultAutostart(),
-      exePfad: process.execPath,
+      exePfad: ermittleAutostartExePfad(process.env, process.execPath),
       // W3-δ: echte Ports für den Opt-in-Update-Hinweis (Netz nur bei aktivierter Einstellung).
       updateHoler: createUpdateHoler(),
       updateCache: createUpdateCacheFile(join(app.getPath('userData'), 'update-cache.json')),
@@ -734,16 +827,38 @@ if (!gotTheLock) {
     showSettings()
 
     // C5: Update-Hintergrund-Check — Start-Check nach ~1min (App-Start nicht verzögern), danach
-    // alle ~6h. comp.pruefeUpdate() liest das Opt-in LIVE aus den Settings und bremst über den
-    // bestehenden 24h-Mindestabstand/ETag-Cache selbst (kein Netz-Spam). .unref(), damit die Timer
-    // einen App-Exit nicht künstlich offenhalten; Cleanup zusätzlich explizit bei will-quit.
+    // regelmäßig. comp.pruefeUpdate() liest das Opt-in LIVE aus den Settings und bremst über den
+    // Mindestabstand (v0.8.0 einstellbar) + ETag-Cache selbst (kein Netz-Spam). .unref(), damit die
+    // Timer einen App-Exit nicht künstlich offenhalten; Cleanup zusätzlich explizit bei will-quit.
+    //
+    // Das Poll-Intervall ist NUR das Raster, in dem gefragt wird „darf jetzt geprüft werden?" — die
+    // eigentliche Kadenz bestimmt der Mindestabstand. Damit ein Nutzer die kürzeste wählbare Stufe
+    // auch tatsächlich bekommt, wird das Raster aus der Stufenliste ABGELEITET statt festverdrahtet:
+    // sonst würde eine später ergänzte Stufe unterhalb des Rasters still auf das Raster aufgerundet
+    // (Review-Befund v0.8.0 — heute unauffällig, weil die kleinste Stufe zufällig dem alten
+    // 6h-Festwert entspricht).
+    const pollIntervallMs = Math.min(...UPDATE_INTERVALL_STUNDEN_STUFEN) * 60 * 60_000
     updateStartTimer = setTimeout(() => void fuehreUpdateCheckAus(comp), 60_000)
     updateStartTimer.unref()
-    updateIntervallTimer = setInterval(() => void fuehreUpdateCheckAus(comp), 6 * 60 * 60_000)
+    updateIntervallTimer = setInterval(() => void fuehreUpdateCheckAus(comp), pollIntervallMs)
     updateIntervallTimer.unref()
 
     // Runner-Phase → Tray-Tooltip + fokusfreie Status-Pille (stiehlt keinen Fokus, ADR-0007).
     comp.sitzung.onStatus = (phase) => {
+      // Befund B (Feld-Log 2026-07-31): Anker für die Pillen-Arbeitsfläche setzen/lösen. 'aufnehmen'
+      // OHNE `bestaetigt` ist die EINZIGE Phase, die runner.start() bei JEDEM neuen Lauf sendet (Hotkey
+      // UND manueller Start, s. runner.ts `start()`) — exakt der vom Auftrag verlangte Phasenbeginn.
+      // Ab hier bleibt die Arbeitsfläche für den gesamten Lauf konstant (pillen-steuerung.ts
+      // laufBeginnt()), selbst wenn der Mauszeiger während der Verarbeitung auf einen anderen Monitor
+      // wandert (genau der Feld-Befund: die Pille sprang der „Zeiger"-Quelle hinterher und wurde dadurch
+      // vom Nutzer nicht mehr gesehen). 'idle' (Abbruch oder App-Start-Ruhezustand) löst den Anker
+      // wieder — die nächste Anzeige OHNE laufenden Lauf ermittelt wieder frisch.
+      if (phase.status === 'aufnehmen' && !phase.bestaetigt) {
+        pillenSteuerung?.laufBeginnt()
+      } else if (phase.status === 'idle') {
+        pillenSteuerung?.laufEndet()
+      }
+
       // Nach Lauf-Ende ausstehende Settings-Änderungen übernehmen (während eines Laufs gespeichert).
       if (
         phase.status === 'fertig' ||
@@ -769,7 +884,14 @@ if (!gotTheLock) {
       // v0.7.3 (B1): ALLE Pillen-Zugriffe laufen über die canSend/isDestroyed-gesicherten Hüllen
       // (pilleSichtbar/pilleHide) — ein während des Betriebs zerstörtes (oder gerade neu geladenes)
       // Pillen-Fenster darf keinen send-auf-Zerstörtes-Crash mehr auslösen.
-      const s = pillenStatus(phase)
+      // v0.8.0 (pillenAnzeigedauerProfil, Sonderfall): `pillenStatus()` läuft hier AUSSERHALB der
+      // composition-root-Closures (kein getConfig/getBaseUrl-Muster verfügbar) — `comp.aktuelleEinstellungen()`
+      // liefert die lebende Settings-Kopie synchron (kein Disk-I/O), `pillenAnzeigedauerWerteFuer` löst
+      // das Profil in die drei Zahlen auf (EINZIGE Berechnungsstelle, shared/laufzeit-profile.ts).
+      const s = pillenStatus(
+        phase,
+        pillenAnzeigedauerWerteFuer(comp.aktuelleEinstellungen().pillenAnzeigedauerProfil)
+      )
       if (pillFehlerTimer) {
         clearTimeout(pillFehlerTimer)
         pillFehlerTimer = null
@@ -790,12 +912,65 @@ if (!gotTheLock) {
     // (loadFile/URL) — der Hook darf erst starten, wenn sie ihre IPC-Listener registriert haben, sonst
     // verpufft der allererste recorder:start / pill:status nach Kaltstart. Timeout = Fallback (der Hook
     // startet IMMER, blockiert nie).
+    const fensterNamen = ['recorder', 'pille'] as const
     const bereitschaft = await warteAufFensterBereit([recorderWindow, pillWindow], 3000)
     if (!bereitschaft.bereit) {
       log.warnung('app.fenster_bereit_timeout', { dauerMs: bereitschaft.dauerMs })
     } else {
       log.debug('app.fenster_bereit', { dauerMs: bereitschaft.dauerMs })
     }
+    // v0.7.4: Ein 'did-fail-load' galt bisher als „fertig geladen" und wurde NIRGENDS protokolliert —
+    // ein gescheitertes pill.html/recorder.html war damit spurlos (Fenster lebt, send() verpufft,
+    // showInactive() zeigt eine leere Fläche). Jetzt einmal beim Start und dauerhaft danach.
+    for (const i of bereitschaft.ladefehler) {
+      log.warnung('fenster.ladefehler', { fenster: fensterNamen[i] ?? 'pille', beimStart: true })
+    }
+    ladefehlerWaechter.push(
+      protokolliereLadefehler(recorderWindow, 'recorder', log),
+      protokolliereLadefehler(pillWindow, 'pille', log)
+    )
+
+    // v0.7.4 (electron#32001) — DIE Ursache für „Status-Pille bleibt unsichtbar", im Feld bestätigt.
+    // Ein mit `show:false` erzeugtes, transparentes Fenster bekommt unter Windows unzuverlässig NIE
+    // einen ersten Compositor-Frame. Ein späteres showInactive() findet dann nichts vor, was es
+    // darstellen könnte: Das Fenster gilt als sichtbar (isVisible() === true) und bleibt trotzdem
+    // vollständig unsichtbar — dauerhaft, auch über jeden Inhaltswechsel hinweg, weshalb auch die
+    // späteren Phasen („Transkribiere …") nichts zeigten. Bestätigter Upstream-Fehler, bis heute OFFEN:
+    // der Fix-PR electron/electron#49938 steht auf Draft, die Backports sind bis einschließlich 44
+    // „pending". Die frühere Notiz „Fix-Backports erst ab 39" war eine Fehlannahme — es gibt derzeit
+    // KEINE Electron-Version, in der der Fehler behoben ist (geprüft mit dem Sprung auf 43.2.0).
+    //
+    // Einmaliges Zeigen+Verstecken direkt nach dem Laden etabliert die Zeichenfläche, solange sie noch
+    // niemand braucht. Kosten: allenfalls ein kurzes Aufblitzen beim App-Start. NICHT entfernen, solange
+    // https://github.com/electron/electron/issues/32001 offen ist — an keine Versionsnummer binden,
+    // sondern vor dem Entfernen den Issue-Stand prüfen. `pille.warmup sichtbar=…` im Log
+    // (info-Stufe, ohne Debug-Schalter sichtbar) belegt bei jedem Start, dass es gegriffen hat.
+    pillenSteuerung?.waermeAuf()
+
+    // Befund A (v0.8.0, Feld-Log 2026-07-31): Mikrofon-Vorwärmung bereits beim App-Start auslösen, statt
+    // erst ab der ERSTEN echten Aufnahme davon zu profitieren. Befund 11 hält den Stream zwischen zwei
+    // Aufnahmen offen — das half aber nur ab der ZWEITEN, weil der Stream vorher schlicht noch nie
+    // geöffnet worden war. Im Feld belegt: der Nutzer ließ die Taste nach ~1,2s los, bevor getUserMedia
+    // beim Kaltstart fertig war ("Keine aktive Aufnahme.", Diktat verloren).
+    //
+    // Fire-and-forget (KEIN await): der App-Start darf NICHT auf ein bereites Mikrofon warten. Wie beim
+    // Pillen-Aufwärmen erst NACH `warteAufFensterBereit`, damit der Recorder-Renderer seinen IPC-Listener
+    // (onWarmup, s. recorder.ts) schon registriert hat — sonst verpufft der Kanal spurlos (H1-Muster).
+    // Bewusst VOR `starteUiohookQuelle` (unten): der Hotkey-Hook ist hier noch nicht aktiv, ein echtes
+    // Diktat kann also unmöglich schon laufen — die Reihenfolge dieser beiden Aufrufe ist damit selbst
+    // schon die erste Absicherung gegen eine Störung eines laufenden Diktats (recorder.ts sichert
+    // zusätzlich über den Generationszähler/die Warm-Stream-Prüfung ab, siehe dortigen Kommentar).
+    //
+    // Schlägt die Vorwärmung fehl (kein Mikrofon, keine Berechtigung), bleibt das FOLGENLOS: kein
+    // Fehler-Popup, keine Fehler-Pille — der Nutzer hat an dieser Stelle nichts angefordert. recorder.ts
+    // protokolliert höchstens eine info-Log-Zeile; hier ist kein Fehlerpfad zu behandeln (sendeAn
+    // schlägt bei nicht sendbarem Fenster ebenfalls folgenlos fehl, kein Log nötig — anders als bei
+    // recorder:start/-stop ist ein verpuffter Warm-up-Versuch nie ein Nutzer-sichtbares Problem).
+    //
+    // AUSGEWEITETER PREIS (ausdrücklich festgehalten): das Windows-Mikrofonsymbol leuchtet damit schon
+    // beim App-Start auf, nicht erst beim ersten Diktat. Das ist dieselbe, vom Nutzer bereits akzeptierte
+    // Dauer-Aktivierung aus Befund 11 — sie beginnt jetzt nur früher. KEIN neuer Fehlerfall.
+    sendeAn(recorderWindow, 'recorder:warmup', comp.aktuelleEinstellungen().mikrofonDeviceId)
 
     // Globaler Hotkey über uiohook → verarbeiteTaste → Sitzung (ersetzt den globalShortcut-Platzhalter).
     // onStatus speist den Start-Erfolg in den Health-Check „Hotkey-Erkennung" (W3-ε).
@@ -809,6 +984,9 @@ if (!gotTheLock) {
 
     // W3-γ: Registry-Autostart-Eintrag an das gespeicherte `autostart`-Feld angleichen (heilt einen
     // verwaisten Eintrag nach dem Verschieben der .exe). Best effort — Fehler werden intern geschluckt.
+    // v0.7.4: text-freier Beleg, aus welcher Quelle der Autostart-Pfad stammt. NUR das Boolean — der
+    // Pfad selbst enthält den Windows-Benutzernamen und darf nie ins Log (Leak-Regel).
+    log.info('autostart.pfadquelle', { portable: istPortablerStart(process.env) })
     void comp.syncAutostartBeimStart()
 
     // Sperre/Standby verschlucken Keyups (Win+L → Secure Desktop, RESEARCH §3): Tasten-Tracking
@@ -851,6 +1029,8 @@ if (!gotTheLock) {
     stopUiohook()
     // v0.7.3 (B1): Fenster-Heilungs-Listener abmelden (kein Reload mehr während des App-Abbaus).
     for (const h of fensterHeilungen) h.entferne()
+    // v0.7.4: dito für die 'did-fail-load'-Wächter — beim Abbau ist ein Ladefehler erwartbar, kein Befund.
+    for (const w of ladefehlerWaechter) w.entferne()
     perf.stoppe() // No-Op bei NOOP_PERF; verhindert einen hängenden Log-Timer bei BLITZTEXT_PERF=1
     // C5: Update-Timer aufräumen (Start-Timeout kann beim Beenden noch ausstehen, Intervall läuft sonst weiter).
     if (updateStartTimer) clearTimeout(updateStartTimer)

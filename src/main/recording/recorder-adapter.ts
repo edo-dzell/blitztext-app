@@ -20,6 +20,8 @@ interface RecorderErgebnis {
   buffer: ArrayBuffer
   durationSeconds: number
   mimeType: string
+  /** v0.7.4: Spitze + Grundrauschen der Aufnahme (RMS, 0…1) oder null, wenn keine Messung gelang. */
+  pegel?: { max: number; median: number } | null
 }
 
 // Duck-typed: ruft isDestroyed() nur, wenn vorhanden (minimale Test-Fakes haben es nicht → gelten als
@@ -36,15 +38,26 @@ function istSendbar(fenster: BrowserWindow): boolean {
 
 // Sicher an das Recorder-Fenster senden; no-op (und NIE werfend), wenn nicht sendbar. Meldet über den
 // Rückgabewert, ob gesendet wurde — stop() macht daraus einen Fehler statt eines ewigen Hängers.
-function sendeSicher(fenster: BrowserWindow, channel: string): boolean {
+// Befund 7a (v0.8.0): `payload` ist optional — bleibt es weg (stop/discard, wie bisher), sendet
+// webContents.send() ganz OHNE zusätzliches Argument (Altweg für den Renderer exakt erhalten). Befund 2
+// (v0.8.x): `payload` bewusst `unknown` statt `string` — der 'recorder:start'-Kanal trägt jetzt ein
+// kleines Objekt ({ deviceId, lauf }, siehe start()), der Helfer selbst bleibt aber generisch/dumm.
+function sendeSicher(fenster: BrowserWindow, channel: string, payload?: unknown): boolean {
   if (!istSendbar(fenster)) return false
   try {
-    fenster.webContents.send(channel)
+    if (payload === undefined) fenster.webContents.send(channel)
+    else fenster.webContents.send(channel, payload)
     return true
   } catch {
     // Race: zwischen Guard und send zerstört. Trotzdem nie werfen.
     return false
   }
+}
+
+/** Nutzlast des 'recorder:start'-Kanals (Befund 7a: deviceId; Befund 2: zusätzlich der Lauf-Bezug). */
+interface StartNutzlast {
+  deviceId?: string
+  lauf?: number
 }
 
 export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLog }): Recorder {
@@ -65,6 +78,15 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
   // der dauerhafte Listener hält sich raus (keine Doppelverarbeitung desselben recorder:error).
   let stopLaeuft = false
 
+  // v0.8.0 (Befund 9): externer Start-Bestätigungskanal, analog zu externerFehlerCb. Der Renderer sendet
+  // 'recorder:gestartet', SOBALD mediaRecorder.start() dort erfolgreich lief — erst dann darf die Pille
+  // von „Starte …" auf „Aufnahme …" wechseln (vorher könnte der Nutzer bei langsamem Gerätestart, z. B.
+  // Defender-Erstscan oder Bluetooth-Mikro, ins Leere sprechen). Kein stop()-Konkurrenzfall wie beim
+  // Fehlerkanal nötig: 'recorder:gestartet' feuert immer VOR jedem stop(), also ohne stopLaeuft-Guard.
+  // Befund 2 (v0.8.x): nimmt zusätzlich den (optionalen) Lauf-Bezug entgegen, den der Recorder-Renderer
+  // aus seiner Start-Nutzlast zurückspiegelt — durchgereicht bis zu runner.meldeAufnahmeBestaetigt.
+  let externerGestartetCb: ((lauf?: number) => void) | null = null
+
   // Dauerhafter Listener (die Lebensdauer des Adapters, NICHT pro stop() abgeräumt): fängt recorder:error
   // AUSSERHALB eines wartenden stop() ab. Der wartende stop() nutzt seinen eigenen once('recorder:error')
   // — der `stopLaeuft`-Guard verhindert, dass BEIDE denselben Fehler verarbeiten.
@@ -75,6 +97,17 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
     externerFehlerCb?.(message ?? 'Aufnahme fehlgeschlagen.')
   }
   ipcMain.on('recorder:error', beiExternemFehler)
+
+  // v0.8.0 (Befund 9): dauerhafter Listener für die Start-Bestätigung — läuft für die Lebensdauer des
+  // Adapters, NICHT pro Lauf neu registriert (gleiches Muster wie beiExternemFehler). Befund 2 (v0.8.x):
+  // `lauf` ist die vom Renderer unverändert zurückgespiegelte Start-Nutzlast (s. u.) — reines Durchreichen,
+  // die Main-eigene Prüfung „ist das noch der erwartete Lauf?" liegt bewusst beim Runner (istAktuell-
+  // Muster), NICHT hier im Adapter (kein zweites, konkurrierendes Konzept).
+  const beiExternerBestaetigung = (_e: IpcMainEvent, lauf?: number): void => {
+    log.debug('recorder.gestartet_bestaetigt')
+    externerGestartetCb?.(lauf)
+  }
+  ipcMain.on('recorder:gestartet', beiExternerBestaetigung)
 
   // Renderer-Tod (Crash/Kill) reißt einen wartenden stop() aus dem Hänger: die once-Listener auf
   // ipcMain feuern dann nie → wir lösen den offenen stop() selbst mit Fehler auf. Einmal registriert,
@@ -93,9 +126,18 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
   }
 
   return {
-    start() {
+    // Befund 7a (v0.8.0): deviceId wird als Nutzlast mitgeschickt, statt sie den Recorder-Renderer per
+    // IPC (settings:get) nachfragen zu lassen. Ohne Angabe (Altweg, alte Aufrufer/Tests) bleibt der
+    // Kanal payload-los — der Renderer fällt dort auf seinen bisherigen IPC-Pull zurück.
+    // Befund 2 (v0.8.x): `lauf` (optional) reist als zweites Nutzlast-Feld mit — der Runner erzeugt ihn
+    // pro Aufnahme-Versuch frisch, der Recorder-Renderer spiegelt ihn unverändert in seiner Start-
+    // Bestätigung zurück (siehe onGestartet/beiExternerBestaetigung). Fehlen BEIDE Felder (Altweg, kein
+    // Aufrufer kennt den Lauf-Bezug), bleibt der Kanal wie bisher komplett payload-los.
+    start(deviceId?: string, lauf?: number) {
+      const payload: StartNutzlast | undefined =
+        deviceId === undefined && lauf === undefined ? undefined : { deviceId, lauf }
       // sendeSicher bleibt generisch; das Ergebnis wird hier zum Feld-Beleg (Kanal), nie im Helfer.
-      if (!sendeSicher(fenster, 'recorder:start')) {
+      if (!sendeSicher(fenster, 'recorder:start', payload)) {
         log.warnung('recorder.sende_fehl', { kanal: 'start' })
         // v0.7.3 (A1): das Aufnahme-Fenster ist nicht verfügbar → der Runner steht in Phase 'aufnehmen'
         // und bekäme sonst nie ein stop()-Ergebnis (der Nutzer hält evtl. nur kurz und lässt gleich los,
@@ -110,6 +152,13 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
       // v0.7.3 (A1): Composition verdrahtet hier runner.meldeAufnahmeFehler. Ein einzelner Empfänger reicht
       // (ein Runner je Recorder); der letzte Aufruf gewinnt.
       externerFehlerCb = cb
+    },
+    onGestartet(cb) {
+      // v0.8.0 (Befund 9): Composition verdrahtet hier runner.meldeAufnahmeBestaetigt. Gleiches Muster wie
+      // onFehler — ein einzelner Empfänger reicht, der letzte Aufruf gewinnt. Befund 2 (v0.8.x): `cb`
+      // erhält jetzt zusätzlich den Lauf-Bezug (optional) — reines Durchreichen, siehe StartNutzlast/
+      // beiExternerBestaetigung oben.
+      externerGestartetCb = cb
     },
     discard() {
       // discard() darf NIE werfen: der Runner ruft es fire-and-forget aus abbrechen() und geht danach
@@ -140,7 +189,10 @@ export function createRecorder(fenster: BrowserWindow, deps?: { log?: EreignisLo
           // MIME-Type setzen, sonst sendet undici application/octet-stream → OpenAI 400 (RESEARCH §5).
           resolve({
             audio: new Blob([data.buffer], { type: data.mimeType || 'audio/webm' }),
-            durationSeconds: data.durationSeconds
+            durationSeconds: data.durationSeconds,
+            // v0.7.4: Messung durchreichen (null bei fehlgeschlagener Analyse → der Stille-Guard im
+            // Runner greift dann bewusst nicht).
+            pegel: data.pegel ?? null
           })
         }
         const onError = (_e: IpcMainEvent, message: string): void => {

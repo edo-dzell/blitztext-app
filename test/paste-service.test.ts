@@ -11,13 +11,31 @@ function fakeZwischenablage(initial = '') {
   }
 }
 
+// Befund 12: EinfügeStrategie.versuch() liefert seit der Drift-Härtung ein dreiwertiges Ergebnis statt
+// `boolean`. Dieser Test-Helfer bildet den bisherigen boolean-Parameter (Aufrufer wollen weiterhin nur
+// "erfolgreich ja/nein" ausdrücken) intern auf 'erfolg'/'fehlschlag' ab — 'drift' wird gezielt über
+// die separate `driftStrategie()`-Hilfe unten simuliert, damit die bestehenden Aufrufstellen unverändert
+// bleiben.
 function strategie(name: 'helfer' | 'powershell', erfolg: boolean) {
   const spy = { name, aufrufe: 0 }
   const s: EinfügeStrategie = {
     name,
     versuch: async () => {
       spy.aufrufe++
-      return erfolg
+      return erfolg ? 'erfolg' : 'fehlschlag'
+    }
+  }
+  return { s, spy }
+}
+
+/** Simuliert eine Strategie, die den Weg-B-Drift meldet (Befund 12: Exit-Code 2 der Helfer-Strategie). */
+function driftStrategie(name: 'helfer' | 'powershell') {
+  const spy = { name, aufrufe: 0 }
+  const s: EinfügeStrategie = {
+    name,
+    versuch: async () => {
+      spy.aufrufe++
+      return 'drift'
     }
   }
   return { s, spy }
@@ -211,6 +229,55 @@ describe('createPasteService — Fokus-Drift (Weg B)', () => {
   })
 })
 
+// Befund 12 (Fehlerjagd): die Helfer-Strategie kann DURCH SICH SELBST einen Drift melden (natives
+// Weg-B-Gate `--paste <hwnd>` im Helfer-Prozess, Exit-Code 2 — unabhängig von der VOR-Prüfung über
+// `aktuellesFenster` oben). Vorher landete das im selben `fehlschlag`-Zweig wie jeder andere Fehlschlag
+// → die Schleife probierte als Nächstes PowerShell, das KEIN Drift-Gate kennt und blind ins
+// (mittlerweile fremde) Vordergrundfenster tippt. Diese Tests sichern die Reaktion auf das
+// dreiwertige `EinfügeStrategie.versuch()`-Ergebnis auf reiner Logik-Ebene ab (ohne echten Prozess).
+describe('createPasteService — Strategie-Ebene meldet Drift (Befund 12)', () => {
+  it('Helfer meldet Drift: KEINE weitere Strategie (PowerShell nie aufgerufen), Drift-Hinweis kommt', async () => {
+    const zwischenablage = fakeZwischenablage('alt')
+    const helfer = driftStrategie('helfer')
+    const powershell = strategie('powershell', true)
+    const drift: number[] = []
+
+    const service = createPasteService({
+      zwischenablage,
+      strategien: [helfer.s, powershell.s],
+      zeigeManuellenHinweis: () => {
+        throw new Error('darf bei Drift nicht aufgerufen werden')
+      },
+      zeigeDriftHinweis: () => drift.push(1)
+    })
+
+    const ergebnis = await service.einfügen('text')
+
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(powershell.spy.aufrufe).toBe(0) // PowerShell-Fallback wird NIE aufgerufen
+    expect(ergebnis).toEqual({ erfolg: false, drift: true })
+    expect(zwischenablage.lies()).toBe('text') // Text bleibt zum manuellen Einfügen in der Zwischenablage
+    expect(drift).toEqual([1])
+  })
+
+  it('Regression: Fehlschlag (nicht Drift) der Helfer-Strategie greift weiterhin auf PowerShell zurück', async () => {
+    const helfer = strategie('helfer', false)
+    const powershell = strategie('powershell', true)
+
+    const service = createPasteService({
+      zwischenablage: fakeZwischenablage(),
+      strategien: [helfer.s, powershell.s],
+      zeigeManuellenHinweis: () => {}
+    })
+
+    const ergebnis = await service.einfügen('text')
+
+    expect(helfer.spy.aufrufe).toBe(1)
+    expect(powershell.spy.aufrufe).toBe(1) // unverändertes Verhalten: Fallback greift bei echtem Fehlschlag
+    expect(ergebnis).toMatchObject({ erfolg: true, strategie: 'powershell' })
+  })
+})
+
 // F2 (Review R2, v0.6.0): Regressionsschutz für den Major-Befund — die A1-Umstellung von
 // `schreibUeberHelfer` auf spawn+Promise machte `Zwischenablage.schreib` fire-and-forget; der Service
 // startete Drift-Prüfung/Strategien, BEVOR das Schreiben abgeschlossen war. Bei langsamem Helfer
@@ -279,7 +346,7 @@ describe('createPasteService — Reihenfolge: Zwischenablage-Schreiben VOR Drift
         versuch: async () => {
           fake.protokoll.push('strategie-versuch')
           helfer.spy.aufrufe++
-          return true
+          return 'erfolg'
         }
       }
     }

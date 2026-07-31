@@ -71,6 +71,30 @@ export function asrPromptText(begriffe: string[]): string | null {
   return `Eigennamen und Begriffe: ${begriffe.join(', ')}`
 }
 
+// B1: Mistrals `context_bias`-Feld (Voxtral-Transkription) hat KEIN Zeichen-Budget wie Whispers
+// `prompt` — die Doku nennt stattdessen eine Obergrenze an EINTRÄGEN ("up to 100 words or phrases",
+// https://docs.mistral.ai/studio-api/audio/speech_to_text/offline_transcription, Stand 2026-07-31).
+// Whispers ASR_PROMPT_BUDGET_ZEICHEN ist auf dessen ~224-Token-Grenze kalibriert und gehört NICHT
+// zum context_bias-Weg — eigene Konstante, damit die beiden Grenzen nie querbeeinflusst werden.
+export const ASR_CONTEXT_BIAS_MAX_EINTRAEGE = 100
+
+/**
+ * Kappt die normalisierte Begriffsliste auf die von Mistral dokumentierte Obergrenze für
+ * `context_bias` (Anzahl statt Zeichen, siehe ASR_CONTEXT_BIAS_MAX_EINTRAEGE). Gleiche Priorität
+ * wie begriffeFuerAsrPrompt: bei Überschreitung bleiben die NEUESTEN (Ende der Liste) erhalten,
+ * älteste fallen zuerst raus; das Ergebnis behält die Original-Reihenfolge.
+ */
+export function begriffeFuerContextBias(
+  begriffe: string[],
+  maxEintraege: number = ASR_CONTEXT_BIAS_MAX_EINTRAEGE
+): string[] {
+  const sauber = normalisiereBegriffe(begriffe)
+  if (sauber.length <= maxEintraege) return sauber
+  // slice() erhält die Original-Reihenfolge automatisch (kein Sortieren nötig) — die letzten
+  // maxEintraege Einträge SIND bereits die neuesten in ihrer ursprünglichen Reihenfolge.
+  return sauber.slice(sauber.length - maxEintraege)
+}
+
 /**
  * Exakter Wortlaut für den Rewrite-Prompt-Anhang (bisher prompt-builder.ts:287-291 / 344-348).
  * `null` bei leerer Liste — der Aufrufer hängt dann nichts an.

@@ -104,12 +104,27 @@ describe('aufloeseWorkflowLauf', () => {
     expect(frei.chatModellAbgewertet).toBe(false) // eigenes Modell = keine Abwertung
   })
 
-  it('Built-ins bleiben auf OpenAI gepinnt, auch wenn der Standard auf Groq wechselt', () => {
+  // v0.8.0 (Auftrag 1, Nutzer-Befund + Freigabe): ERSETZT den früheren Test „Built-ins bleiben auf
+  // OpenAI gepinnt, auch wenn der Standard auf Groq wechselt" (bis v0.7.x). Der alte Test schrieb
+  // GENAU die Zusicherung fest, die der Nutzer aufgehoben hat: wer NUR Mistral/Groq konfiguriert, aber
+  // noch einen (ungenutzten) OpenAI-Eintrag besitzt, sah seine Blitztext+/calm/emoji-Workflows weiter
+  // gegen OpenAI laufen — ohne jede Möglichkeit, das zu bemerken (`anbieterId` war in BUILTIN_WORKFLOWS
+  // hart auf 'openai' gepinnt, unabhängig vom gewählten Standard-Anbieter). Die Auflösungslogik selbst
+  // (aufloeseWorkflowLauf) konnte „erbt Standard" schon immer (anbieterId fehlt/''); es war ausschließlich
+  // der WERKS-Startwert der vier Built-ins in shared/workflows.ts, der das verhinderte. Seit v0.8.0
+  // pinnen die Built-ins keinen anbieterId mehr → sie erben wie jeder eigene Workflow den Standard.
+  // Bestandsschutz für ALTE settings.json-Dateien mit bereits gespeichertem `anbieterId:'openai'` lebt
+  // NICHT hier, sondern in settings/store.ts (parseWorkflow übernimmt den gespeicherten Wert
+  // unverändert) — dieser Test prüft ausschließlich den WERKS-Startwert.
+  it('Built-ins erben den Standard-Anbieter (v0.8.0: keine Pinnung mehr im Werks-Startwert)', () => {
     const ctx = { anbieter: [OPENAI, GROQ], standardAnbieterId: 'groq', language: 'de' }
     const calm = aufloeseWorkflowLauf(getWorkflow('calm', BUILTIN_WORKFLOWS), ctx)
-    // calm pinnt anbieterId 'openai' UND model 'gpt-4o' → unverändert trotz Groq-Standard.
-    expect(calm.anbieter.id).toBe('openai')
-    expect(calm.chatModell).toBe('gpt-4o')
+    // calm pinnt keinen anbieterId mehr → folgt dem Groq-Standard; das gepinnte model 'gpt-4o' ist bei
+    // Groq ein FREMDES Modell → laut chatModellAufloesung Anbieter-Standard statt Absturz (Auftrag 2
+    // macht diese Abwertung jetzt auch bei Hotkey sichtbar, siehe sitzung.ts).
+    expect(calm.anbieter.id).toBe('groq')
+    expect(calm.chatModell).toBe('llama-3.1-8b-instant')
+    expect(calm.chatModellAbgewertet).toBe(true)
   })
 
   // --- A6/D9: Pro-Workflow-ASR-Override entfernt — das ASR-Modell kommt IMMER vom Anbieter ---

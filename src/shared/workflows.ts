@@ -31,7 +31,15 @@ export interface WorkflowDefinition {
   /** Umschreib-Modell; '' = Provider-Standardmodell (chatModell). */
   model: string
   temperature: number
-  /** Anbieter-Zuordnung (v0.2.3, ADR-0010). Fehlt/'' = erbt Standard-Anbieter; Built-ins auf 'openai' gepinnt. */
+  /**
+   * Anbieter-Zuordnung (v0.2.3, ADR-0010). Fehlt/'' = erbt Standard-Anbieter.
+   * v0.8.0 (Auftrag 1, Nutzer-Befund): die vier Built-ins pinnten hier früher hart 'openai' — wer
+   * NUR Mistral/Groq konfiguriert hatte, aber noch einen ungenutzten OpenAI-Eintrag besaß, sah seine
+   * Blitztext+/calm/emoji-Workflows unbemerkt weiter gegen OpenAI laufen. Built-ins pinnen jetzt KEINEN
+   * Anbieter mehr (siehe BUILTIN_WORKFLOWS) — sie erben wie jeder eigene Workflow den Standard.
+   * Bestandsschutz für ALTE settings.json-Dateien mit bereits gespeichertem `anbieterId:'openai'`:
+   * settings/store.ts übernimmt gespeicherte Werte feldweise unverändert (kein stiller Wechsel).
+   */
   anbieterId?: string
   /** Eingabe-/ASR-Sprachcode pro Workflow (v0.2.4, S-3). Fehlt/'' = erbt die globale Sprache. */
   language?: string
@@ -113,6 +121,28 @@ export const DEFAULT_HOTKEYS: Record<WorkflowId, string[]> = {
 // Die vier eingebauten Workflows. Modell/Temperatur reproduzieren exakt das v1-Routing
 // (LLMService.swift: improve/emoji gpt-4o-mini@0.3, calm gpt-4o@0.4). promptModus='berechnet' →
 // der Prompt entsteht weiter dynamisch über buildSystemPrompt (Verhalten unverändert).
+//
+// v0.8.0 (Auftrag 1): KEIN `anbieterId` mehr gesetzt — bis v0.7.x pinnten alle vier Einträge hart
+// 'openai'. Das hieß: ein Nutzer, der Mistral/Groq als Standard-Anbieter wählte, aber (z. B. aus einer
+// früheren Konfiguration) noch einen OpenAI-Eintrag besaß, sah Blitztext+/calm/emoji unbemerkt weiter
+// gegen OpenAI laufen — die Auflösung (`aufloeseWorkflowLauf`) fand den gepinnten 'openai'-Anbieter ja
+// tatsächlich in seiner Liste. Jetzt fehlt `anbieterId` → die Built-ins erben den Standard-Anbieter wie
+// jeder selbst angelegte Workflow (der Workflow-Editor bot „Erbt Standard" für eigene Workflows ohnehin
+// längst an; das war nie technisch nötig, nur der Werks-Startwert hier hat es verhindert).
+// `model` bleibt bewusst UNVERÄNDERT (weiterhin die v1-Modelle) — das reproduziert weiterhin exakt das
+// bisherige Verhalten, SOLANGE der Standard-Anbieter OpenAI ist. Ist der Standard ein anderer Anbieter,
+// bei dem dieses Modell fremd ist, greift die bestehende Abwertungslogik (`chatModellAufloesung`,
+// ADR-0018): automatischer, nicht-abstürzender Fallback auf das Anbieter-Standardmodell, jetzt (Auftrag
+// 2, sitzung.ts) auch bei Hotkey-Auslösung sichtbar gemeldet statt still.
+//
+// BESTANDSSCHUTZ: das betrifft NUR diesen Werks-Startwert (frische Installationen + fehlende/neu
+// angehängte Built-in-Einträge, siehe parseWorkflows in settings/store.ts). Eine BESTEHENDE
+// settings.json mit bereits gespeichertem `anbieterId:'openai'` auf einem Built-in wird davon NICHT
+// berührt — `parseWorkflow` (settings/store.ts) übernimmt gespeicherte Felder unverändert. Aus der
+// Datei allein lässt sich nicht unterscheiden, ob 'openai' dort ein nie angefasster Altwert oder eine
+// bewusste Nutzerwahl war — ein stiller Umzug auf „erbt Standard" würde im Zweifel GENAU die bewusste
+// Wahl überschreiben, die wir eigentlich respektieren wollen. Für eine spätere Oberfläche markiert
+// `builtinAnbieterHinweisAbgeschlossen` (settings/store.ts) einmalig, ob so ein Altbestand vorliegt.
 export const BUILTIN_WORKFLOWS: readonly WorkflowDefinition[] = [
   {
     id: 'transcribe',
@@ -123,8 +153,7 @@ export const BUILTIN_WORKFLOWS: readonly WorkflowDefinition[] = [
     promptModus: 'berechnet',
     systemPrompt: '',
     model: '',
-    temperature: 0,
-    anbieterId: 'openai'
+    temperature: 0
   },
   {
     id: 'improve',
@@ -135,8 +164,7 @@ export const BUILTIN_WORKFLOWS: readonly WorkflowDefinition[] = [
     promptModus: 'berechnet',
     systemPrompt: '',
     model: 'gpt-4o-mini',
-    temperature: 0.3,
-    anbieterId: 'openai'
+    temperature: 0.3
   },
   {
     id: 'calm',
@@ -147,8 +175,7 @@ export const BUILTIN_WORKFLOWS: readonly WorkflowDefinition[] = [
     promptModus: 'berechnet',
     systemPrompt: '',
     model: 'gpt-4o',
-    temperature: 0.4,
-    anbieterId: 'openai'
+    temperature: 0.4
   },
   {
     id: 'emoji',
@@ -159,8 +186,7 @@ export const BUILTIN_WORKFLOWS: readonly WorkflowDefinition[] = [
     promptModus: 'berechnet',
     systemPrompt: '',
     model: 'gpt-4o-mini',
-    temperature: 0.3,
-    anbieterId: 'openai'
+    temperature: 0.3
   }
 ]
 

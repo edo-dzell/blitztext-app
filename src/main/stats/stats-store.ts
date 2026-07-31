@@ -123,7 +123,19 @@ export function komprimiereAeltereAls(zeilen: StatZeile[], grenzeDatum: string):
   return ergebnis
 }
 
-export function createStatsStore({ file }: { file: StatsFile }): StatsStore {
+export function createStatsStore({
+  file,
+  getKompaktierungTage
+}: {
+  file: StatsFile
+  /**
+   * v0.8.0 (statistikKompaktierungTage): Live-Getter — nimmt Vorrang vor KOMPAKTIERUNGS_SCHWELLE_TAGE,
+   * falls gesetzt. Composition-root reicht ihn als Closure über die lebende Settings-Kopie durch
+   * (Muster wie in history-store.ts `getMaxEintraege`). `zusammenfassung()` liest ihn bereits PRO
+   * AUFRUF (kein Store-Neubau nötig) — die Live-Übernahme ergibt sich daraus von selbst.
+   */
+  getKompaktierungTage?: () => number
+}): StatsStore {
   async function ladeAlle(): Promise<StatZeile[]> {
     const raw = await file.read()
     if (raw === null) return []
@@ -164,7 +176,8 @@ export function createStatsStore({ file }: { file: StatsFile }): StatsStore {
     },
     async zusammenfassung(jetztMs = Date.now()) {
       const geladen = await ladeAlle()
-      const grenzeDatum = datumAus(jetztMs - KOMPAKTIERUNGS_SCHWELLE_TAGE * TAG_MS)
+      const schwelleTage = getKompaktierungTage ? getKompaktierungTage() : KOMPAKTIERUNGS_SCHWELLE_TAGE
+      const grenzeDatum = datumAus(jetztMs - schwelleTage * TAG_MS)
       const kompaktiert = komprimiereAeltereAls(geladen, grenzeDatum)
       const hatSichVeraendert = JSON.stringify(kompaktiert) !== JSON.stringify(geladen)
       if (hatSichVeraendert) {

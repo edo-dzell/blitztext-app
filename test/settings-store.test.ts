@@ -1,5 +1,16 @@
 import { describe, it, expect } from 'vitest'
 import { createSettingsStore, defaultSettings, type SettingsFile } from '@main/settings/store'
+import {
+  MINDEST_AUFNAHME_SEKUNDEN_DEFAULT,
+  STILLE_PROFIL_DEFAULT,
+  NETZWERK_PROFIL_DEFAULT,
+  RETRY_VERSUCHE_DEFAULT,
+  VERLAUF_MAXIMUM_DEFAULT,
+  STATISTIK_KOMPAKTIERUNG_TAGE_DEFAULT,
+  UPDATE_INTERVALL_STUNDEN_DEFAULT,
+  PILLEN_ANZEIGEDAUER_PROFIL_DEFAULT,
+  PERF_AKTIV_DEFAULT
+} from '@shared/laufzeit-profile'
 
 function fakeFile(initial: string | null = null): SettingsFile {
   let content = initial
@@ -53,6 +64,16 @@ describe('createSettingsStore', () => {
       ausfuehrlichesProtokoll: true,
       verlaufSortierung: 'aeltesteZuerst' as const,
       onboardingAbgeschlossen: true,
+      builtinAnbieterHinweisAbgeschlossen: true,
+      mindestAufnahmeSekunden: 0.5,
+      stilleProfil: 'streng' as const,
+      netzwerkProfil: 'lang' as const,
+      retryVersuche: 4,
+      verlaufMaximum: 500,
+      statistikKompaktierungTage: 180,
+      updateIntervallStunden: 72,
+      pillenAnzeigedauerProfil: 'kurz' as const,
+      perfAktiv: true,
       workflows: [
         {
           id: 'transcribe',
@@ -741,6 +762,470 @@ describe('createSettingsStore', () => {
         file: fakeFile(JSON.stringify({ onboardingAbgeschlossen: true }))
       }).load()
       expect(loaded.onboardingAbgeschlossen).toBe(true)
+    })
+  })
+
+  // v0.8.0 (Auftrag 1): BUILTIN_WORKFLOWS pinnt seit hier keinen anbieterId mehr (siehe workflows.ts).
+  // Eine BESTEHENDE settings.json mit bereits gespeichertem `anbieterId:'openai'` auf einem Built-in
+  // MUSS diese Zuordnung unverändert behalten (Bestandsschutz — aus der Datei allein lässt sich nicht
+  // unterscheiden, ob 'openai' ein nie angefasster Altwert oder eine bewusste Nutzerwahl war). Die
+  // einmalige Kennzeichnung `builtinAnbieterHinweisAbgeschlossen` markiert für eine SPÄTERE Oberfläche
+  // (nicht Teil dieser Änderung), ob ein solcher Altbestand vorliegt — Heuristik nach dem Muster von
+  // `onboardingAbgeschlossen`, nur mit umgekehrter Stoßrichtung: dort true = „kein Wizard nötig", hier
+  // true = „kein Hinweis nötig" (frische Installationen + bereits entpinnte Bestände).
+  describe('Bestandsschutz: gepinnte Built-ins + builtinAnbieterHinweisAbgeschlossen', () => {
+    it('bestehende settings.json mit gepinntem Built-in behält die Zuordnung (kein stiller Wechsel)', async () => {
+      const store = createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            standardAnbieterId: 'mistral',
+            anbieter: [
+              {
+                id: 'mistral',
+                vorlage: 'mistral',
+                label: 'Mistral',
+                baseUrl: 'https://api.mistral.ai/v1',
+                asrModell: 'voxtral-mini-latest',
+                chatModell: 'mistral-small-latest'
+              },
+              {
+                id: 'openai',
+                vorlage: 'openai',
+                label: 'OpenAI',
+                baseUrl: 'https://api.openai.com/v1',
+                asrModell: 'gpt-4o-mini-transcribe',
+                chatModell: 'gpt-4o-mini'
+              }
+            ],
+            workflows: [
+              {
+                id: 'calm',
+                label: 'Blitztext $%&!',
+                builtin: true,
+                rewrites: true,
+                promptModus: 'berechnet',
+                model: 'gpt-4o',
+                temperature: 0.4,
+                anbieterId: 'openai'
+              }
+            ]
+          })
+        )
+      })
+      const loaded = await store.load()
+      const calm = loaded.workflows.find((w) => w.id === 'calm')
+      // Trotz Standard-Anbieter 'mistral' bleibt der EXPLIZIT gespeicherte 'openai' auf diesem
+      // Built-in erhalten — genau die Konfiguration, die vor dieser Änderung geschrieben wurde.
+      expect(calm?.anbieterId).toBe('openai')
+    })
+
+    it('fehlt das Feld UND kein Built-in ist gepinnt (frische Installation) → true', async () => {
+      const loaded = await createSettingsStore({ file: fakeFile(JSON.stringify({})) }).load()
+      expect(loaded.builtinAnbieterHinweisAbgeschlossen).toBe(true)
+    })
+
+    it('fehlt das Feld, aber mindestens ein Built-in trägt noch einen gepinnten anbieterId → false (Hinweis steht aus)', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              {
+                id: 'improve',
+                label: 'Blitztext+',
+                builtin: true,
+                rewrites: true,
+                promptModus: 'berechnet',
+                model: 'gpt-4o-mini',
+                temperature: 0.3,
+                anbieterId: 'openai'
+              }
+            ]
+          })
+        )
+      }).load()
+      expect(loaded.builtinAnbieterHinweisAbgeschlossen).toBe(false)
+    })
+
+    // Review-Befund v0.8.0: Die Heuristik prüfte zunächst auf „irgendein anbieterId" und hätte damit
+    // auch eine BEWUSSTE Nutzer-Zuweisung als Altbestand gewertet. Nur 'openai' war je der
+    // Werks-Startwert — wer einem Built-in selbst Mistral zugewiesen hat, braucht keinen Hinweis, dass
+    // Built-ins den Standard-Anbieter erben können.
+    it('bewusst zugewiesener Fremd-Anbieter auf einem Built-in gilt NICHT als Altbestand', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              {
+                id: 'improve',
+                label: 'Blitztext+',
+                builtin: true,
+                rewrites: true,
+                promptModus: 'berechnet',
+                model: 'gpt-4o-mini',
+                temperature: 0.3,
+                anbieterId: 'mistral'
+              }
+            ]
+          })
+        )
+      }).load()
+      expect(loaded.builtinAnbieterHinweisAbgeschlossen).toBe(true)
+    })
+
+    it('explizit gesetztes false bleibt false, auch ohne gepinnte Built-ins (respektiert den expliziten Wert)', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(JSON.stringify({ builtinAnbieterHinweisAbgeschlossen: false }))
+      }).load()
+      expect(loaded.builtinAnbieterHinweisAbgeschlossen).toBe(false)
+    })
+
+    it('explizit gesetztes true bleibt true, auch mit gepinntem Built-in', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            builtinAnbieterHinweisAbgeschlossen: true,
+            workflows: [
+              {
+                id: 'improve',
+                label: 'Blitztext+',
+                builtin: true,
+                rewrites: true,
+                promptModus: 'berechnet',
+                model: 'gpt-4o-mini',
+                temperature: 0.3,
+                anbieterId: 'openai'
+              }
+            ]
+          })
+        )
+      }).load()
+      expect(loaded.builtinAnbieterHinweisAbgeschlossen).toBe(true)
+    })
+
+    it('defaultSettings(): frische Installation braucht keinen Hinweis (true)', () => {
+      expect(defaultSettings().builtinAnbieterHinweisAbgeschlossen).toBe(true)
+    })
+
+    it('ein gepinnter EIGENER (nicht-builtin) Workflow löst KEINEN Hinweis aus (nur Built-ins zählen)', async () => {
+      const loaded = await createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            workflows: [
+              {
+                id: 'mein-flow',
+                label: 'Mein Flow',
+                builtin: false,
+                rewrites: true,
+                promptModus: 'statisch',
+                systemPrompt: 'X',
+                anbieterId: 'openai'
+              }
+            ]
+          })
+        )
+      }).load()
+      expect(loaded.builtinAnbieterHinweisAbgeschlossen).toBe(true)
+    })
+  })
+
+  // v0.8.0: Laufzeit-Profile (src/shared/laufzeit-profile.ts) — neun Felder, ausschließlich über
+  // geschlossene Stufenlisten konfigurierbar (Fünfer-Muster je Feld: Round-Trip bereits oben über den
+  // großen Round-Trip-Test erledigt; hier zusätzlich Alt-Datei→Default, Übernahme+Round-Trip,
+  // typfremder Wert→Default, defaultSettings()-Inhalt; Zahlenfelder zusätzlich: Wert außerhalb der
+  // Stufenliste→Default). Bestandsschutz ist hier die Kern-Eigenschaft: jeder Default ist exakt der
+  // heute hart kodierte Wert (siehe laufzeit-profile.ts-Kommentare für die Herleitung).
+  describe('Laufzeit-Profile (v0.8.0)', () => {
+    it('defaultSettings() enthält alle neun Felder mit den dokumentierten Defaults', () => {
+      const d = defaultSettings()
+      expect(d.mindestAufnahmeSekunden).toBe(MINDEST_AUFNAHME_SEKUNDEN_DEFAULT)
+      expect(d.stilleProfil).toBe(STILLE_PROFIL_DEFAULT)
+      expect(d.netzwerkProfil).toBe(NETZWERK_PROFIL_DEFAULT)
+      expect(d.retryVersuche).toBe(RETRY_VERSUCHE_DEFAULT)
+      expect(d.verlaufMaximum).toBe(VERLAUF_MAXIMUM_DEFAULT)
+      expect(d.statistikKompaktierungTage).toBe(STATISTIK_KOMPAKTIERUNG_TAGE_DEFAULT)
+      expect(d.updateIntervallStunden).toBe(UPDATE_INTERVALL_STUNDEN_DEFAULT)
+      expect(d.pillenAnzeigedauerProfil).toBe(PILLEN_ANZEIGEDAUER_PROFIL_DEFAULT)
+      expect(d.perfAktiv).toBe(PERF_AKTIV_DEFAULT)
+    })
+
+    it('alte Datei ohne diese Felder ⇒ alle neun fallen auf ihre Defaults zurück (Bestandsschutz)', async () => {
+      const store = createSettingsStore({
+        file: fakeFile(JSON.stringify({ language: 'de' }))
+      })
+      const loaded = await store.load()
+      expect(loaded.mindestAufnahmeSekunden).toBe(MINDEST_AUFNAHME_SEKUNDEN_DEFAULT)
+      expect(loaded.stilleProfil).toBe(STILLE_PROFIL_DEFAULT)
+      expect(loaded.netzwerkProfil).toBe(NETZWERK_PROFIL_DEFAULT)
+      expect(loaded.retryVersuche).toBe(RETRY_VERSUCHE_DEFAULT)
+      expect(loaded.verlaufMaximum).toBe(VERLAUF_MAXIMUM_DEFAULT)
+      expect(loaded.statistikKompaktierungTage).toBe(STATISTIK_KOMPAKTIERUNG_TAGE_DEFAULT)
+      expect(loaded.updateIntervallStunden).toBe(UPDATE_INTERVALL_STUNDEN_DEFAULT)
+      expect(loaded.pillenAnzeigedauerProfil).toBe(PILLEN_ANZEIGEDAUER_PROFIL_DEFAULT)
+      expect(loaded.perfAktiv).toBe(PERF_AKTIV_DEFAULT)
+    })
+
+    it('gültige, von den Defaults abweichende Werte werden übernommen und round-trippen', async () => {
+      const store = createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            mindestAufnahmeSekunden: 1.0,
+            stilleProfil: 'vorsichtig',
+            netzwerkProfil: 'kurz',
+            retryVersuche: 1,
+            verlaufMaximum: 1000,
+            statistikKompaktierungTage: 365,
+            updateIntervallStunden: 168,
+            pillenAnzeigedauerProfil: 'lang',
+            perfAktiv: true
+          })
+        )
+      })
+      const loaded = await store.load()
+      expect(loaded.mindestAufnahmeSekunden).toBe(1.0)
+      expect(loaded.stilleProfil).toBe('vorsichtig')
+      expect(loaded.netzwerkProfil).toBe('kurz')
+      expect(loaded.retryVersuche).toBe(1)
+      expect(loaded.verlaufMaximum).toBe(1000)
+      expect(loaded.statistikKompaktierungTage).toBe(365)
+      expect(loaded.updateIntervallStunden).toBe(168)
+      expect(loaded.pillenAnzeigedauerProfil).toBe('lang')
+      expect(loaded.perfAktiv).toBe(true)
+
+      await store.save(loaded)
+      const nochmal = await store.load()
+      expect(nochmal.mindestAufnahmeSekunden).toBe(1.0)
+      expect(nochmal.stilleProfil).toBe('vorsichtig')
+      expect(nochmal.netzwerkProfil).toBe('kurz')
+      expect(nochmal.retryVersuche).toBe(1)
+      expect(nochmal.verlaufMaximum).toBe(1000)
+      expect(nochmal.statistikKompaktierungTage).toBe(365)
+      expect(nochmal.updateIntervallStunden).toBe(168)
+      expect(nochmal.pillenAnzeigedauerProfil).toBe('lang')
+      expect(nochmal.perfAktiv).toBe(true)
+    })
+
+    it('typfremde Werte fallen auf die Defaults zurück (kein Absturz)', async () => {
+      const store = createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            mindestAufnahmeSekunden: '0.3',
+            stilleProfil: 5,
+            netzwerkProfil: true,
+            retryVersuche: '2',
+            verlaufMaximum: null,
+            statistikKompaktierungTage: {},
+            updateIntervallStunden: [24],
+            pillenAnzeigedauerProfil: 3,
+            perfAktiv: 'ja'
+          })
+        )
+      })
+      const loaded = await store.load()
+      expect(loaded.mindestAufnahmeSekunden).toBe(MINDEST_AUFNAHME_SEKUNDEN_DEFAULT)
+      expect(loaded.stilleProfil).toBe(STILLE_PROFIL_DEFAULT)
+      expect(loaded.netzwerkProfil).toBe(NETZWERK_PROFIL_DEFAULT)
+      expect(loaded.retryVersuche).toBe(RETRY_VERSUCHE_DEFAULT)
+      expect(loaded.verlaufMaximum).toBe(VERLAUF_MAXIMUM_DEFAULT)
+      expect(loaded.statistikKompaktierungTage).toBe(STATISTIK_KOMPAKTIERUNG_TAGE_DEFAULT)
+      expect(loaded.updateIntervallStunden).toBe(UPDATE_INTERVALL_STUNDEN_DEFAULT)
+      expect(loaded.pillenAnzeigedauerProfil).toBe(PILLEN_ANZEIGEDAUER_PROFIL_DEFAULT)
+      expect(loaded.perfAktiv).toBe(false) // nur === true zählt (Muster wie autostart etc.)
+    })
+
+    it('unbekannte Enum-Werte (nicht Teil der Stufenliste) fallen auf die Defaults zurück', async () => {
+      const store = createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            stilleProfil: 'extrem',
+            netzwerkProfil: 'sehr-lang',
+            pillenAnzeigedauerProfil: 'ewig'
+          })
+        )
+      })
+      const loaded = await store.load()
+      expect(loaded.stilleProfil).toBe(STILLE_PROFIL_DEFAULT)
+      expect(loaded.netzwerkProfil).toBe(NETZWERK_PROFIL_DEFAULT)
+      expect(loaded.pillenAnzeigedauerProfil).toBe(PILLEN_ANZEIGEDAUER_PROFIL_DEFAULT)
+    })
+
+    // Zahlenfelder: ein Wert außerhalb der geschlossenen Stufenliste fällt auf den Default zurück —
+    // auch wenn der Wert selbst eine gültige Zahl ist (z. B. 0.4 ist keine mindestAufnahmeSekunden-Stufe).
+    it('Zahlenfelder: ein Wert außerhalb der Stufenliste fällt auf den Default zurück', async () => {
+      const store = createSettingsStore({
+        file: fakeFile(
+          JSON.stringify({
+            mindestAufnahmeSekunden: 0.4, // gültige Zahl, aber keine Stufe
+            retryVersuche: 5,
+            verlaufMaximum: 150,
+            statistikKompaktierungTage: 45,
+            updateIntervallStunden: 48
+          })
+        )
+      })
+      const loaded = await store.load()
+      expect(loaded.mindestAufnahmeSekunden).toBe(MINDEST_AUFNAHME_SEKUNDEN_DEFAULT)
+      expect(loaded.retryVersuche).toBe(RETRY_VERSUCHE_DEFAULT)
+      expect(loaded.verlaufMaximum).toBe(VERLAUF_MAXIMUM_DEFAULT)
+      expect(loaded.statistikKompaktierungTage).toBe(STATISTIK_KOMPAKTIERUNG_TAGE_DEFAULT)
+      expect(loaded.updateIntervallStunden).toBe(UPDATE_INTERVALL_STUNDEN_DEFAULT)
+    })
+  })
+
+  // A2 (Lost-Update-Schutz) + A7 (Cache): store.ts:mutate() serialisiert load()→fn()→save() als EINE
+  // Transaktion (Muster history-store.ts/A1); load() cacht den zuletzt geparsten Stand statt bei jedem
+  // Aufruf die Datei neu zu lesen.
+  describe('mutate() (A2): serialisierte load()→fn()→save()-Transaktion', () => {
+    // Fake-Port mit steuerbarer Verzögerung: der ERSTE write() hängt an einem extern auflösbaren Gate
+    // fest (kein setTimeout-Raten) — so lässt sich beweisen, dass ein zweiter, „überlappend" gestarteter
+    // mutate()-Aufruf tatsächlich wartet, statt mit einem veralteten Stand loszulaufen.
+    function fakeFileMitGate(initial: string | null) {
+      let content = initial
+      let schreibvorgaenge = 0
+      let freigeben: (() => void) | null = null
+      const wartet = new Promise<void>((resolve) => {
+        freigeben = resolve
+      })
+      return {
+        file: {
+          async read() {
+            return content
+          },
+          async write(next: string) {
+            schreibvorgaenge++
+            if (schreibvorgaenge === 1) await wartet // nur der ERSTE Schreibvorgang hängt fest
+            content = next
+          }
+        } satisfies SettingsFile,
+        freigeben: () => freigeben?.(),
+        get schreibvorgaenge() {
+          return schreibvorgaenge
+        }
+      }
+    }
+
+    it('zwei überlappende mutate()-Aufrufe setzen zwei verschiedene Felder → der Endstand trägt BEIDE (kein Lost-Update)', async () => {
+      const f = fakeFileMitGate(JSON.stringify(defaultSettings()))
+      const store = createSettingsStore({ file: f.file })
+
+      // „Überlappend" gestartet: beide Aufrufe laufen an, BEVOR der erste Schreibvorgang aufgelöst wird.
+      const p1 = store.mutate((aktuell) => ({ ...aktuell, language: 'en' }))
+      const p2 = store.mutate((aktuell) => ({ ...aktuell, tone: 'formal' as const }))
+      f.freigeben() // löst den festhängenden ERSTEN write() — erst danach kann die Kette weiterlaufen
+
+      const [, r2] = await Promise.all([p1, p2])
+
+      // r2 ist der Endstand nach BEIDEN Transaktionen (der zweite mutate()-Aufruf hat auf den ERSTEN
+      // aufgesetzt, weil load()→fn()→save() serialisiert ist) — trägt also beide Felder.
+      expect(r2.language).toBe('en')
+      expect(r2.tone).toBe('formal')
+      expect((await store.load()).language).toBe('en')
+      expect((await store.load()).tone).toBe('formal')
+      expect(f.schreibvorgaenge).toBe(2) // zwei echte, nacheinander abgeschlossene Schreibvorgänge
+    })
+
+    it('ein Fehler in fn() vergiftet die Kette nicht — der nächste mutate()-Aufruf läuft normal weiter', async () => {
+      const store = createSettingsStore({ file: fakeFile() })
+
+      await expect(
+        store.mutate(() => {
+          throw new Error('absichtlich kaputt')
+        })
+      ).rejects.toThrow('absichtlich kaputt')
+
+      const ergebnis = await store.mutate((aktuell) => ({ ...aktuell, language: 'fr' }))
+      expect(ergebnis.language).toBe('fr')
+      expect((await store.load()).language).toBe('fr')
+    })
+
+    it('mutate() liefert den TATSÄCHLICH geschriebenen (voll geparsten) Stand zurück', async () => {
+      const store = createSettingsStore({ file: fakeFile() })
+      const ergebnis = await store.mutate((aktuell) => ({
+        ...aktuell,
+        customTerms: ['Acme', '', 'acme'] // unnormalisiert — save() normalisiert zweitverteidigt
+      }))
+      expect(ergebnis.customTerms).toEqual(['Acme'])
+    })
+  })
+
+  describe('load()-Cache (A7): kein Disk-Read bei jedem Aufruf', () => {
+    function fakeFileMitZaehler(initial: string | null) {
+      let content = initial
+      let liest = 0
+      return {
+        file: {
+          async read() {
+            liest++
+            return content
+          },
+          async write(next: string) {
+            content = next
+          }
+        } satisfies SettingsFile,
+        get liest() {
+          return liest
+        }
+      }
+    }
+
+    it('zweiter load()-Aufruf löst KEIN zweites file.read() aus', async () => {
+      const f = fakeFileMitZaehler(JSON.stringify({ language: 'en' }))
+      const store = createSettingsStore({ file: f.file })
+
+      await store.load()
+      await store.load()
+
+      expect(f.liest).toBe(1)
+    })
+
+    it('nach save() liefert der nächste load() den NEUEN Stand — kein veralteter Cache', async () => {
+      const f = fakeFileMitZaehler(JSON.stringify({ language: 'de' }))
+      const store = createSettingsStore({ file: f.file })
+
+      expect((await store.load()).language).toBe('de') // Cache füllen
+      await store.save({ ...defaultSettings(), language: 'en' })
+
+      expect((await store.load()).language).toBe('en')
+    })
+
+    it('nach mutate() liefert der nächste load() den NEUEN Stand — kein veralteter Cache', async () => {
+      const f = fakeFileMitZaehler(JSON.stringify({ language: 'de' }))
+      const store = createSettingsStore({ file: f.file })
+
+      expect((await store.load()).language).toBe('de') // Cache füllen
+      await store.mutate((aktuell) => ({ ...aktuell, tone: 'formal' as const }))
+
+      expect((await store.load()).tone).toBe('formal')
+    })
+
+    it('Korruptions-Pfad: der Cache hält die Defaults, bis ein echter Schreibvorgang sie ersetzt (kein Endlos-Beiseitelegen)', async () => {
+      let beiseiteGelegt = 0
+      let content: string | null = 'kaputtes json'
+      const file: SettingsFile = {
+        async read() {
+          return content
+        },
+        async write(next) {
+          content = next
+        },
+        async beiseiteLegen() {
+          beiseiteGelegt++
+          content = null
+        }
+      }
+      let callbacks = 0
+      const store = createSettingsStore({ file, aufKorruption: () => callbacks++ })
+
+      await store.load()
+      await store.load() // aus dem Cache — KEIN zweiter Rettungsversuch, KEIN zweiter Callback
+
+      expect(beiseiteGelegt).toBe(1)
+      expect(callbacks).toBe(1)
+
+      // Ein späterer echter Schreibvorgang (z. B. der Nutzer speichert nach der Störfall-Meldung erneut)
+      // ersetzt den Cache normal — die „Rettung" bleibt sichtbar, sobald geschrieben wird.
+      const gerettet = await store.mutate((aktuell) => ({ ...aktuell, language: 'en' }))
+      expect(gerettet.language).toBe('en')
+      expect((await store.load()).language).toBe('en')
     })
   })
 })

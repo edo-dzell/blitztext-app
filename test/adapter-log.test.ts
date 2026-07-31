@@ -19,6 +19,7 @@ import type { spawn } from 'node:child_process'
 import { createRecorder } from '@main/recording/recorder-adapter'
 import { starteUiohookQuelle, type UiohookQuelle } from '@main/hotkey/uiohook-source'
 import { createPasteAusgabe } from '@main/output/paste-adapter'
+import { fokusDriftMeldung, type FehlerMeldung } from '@main/session/fehler-meldung'
 import type { EreignisLog, LogFelder } from '@main/diagnostics/ereignis-log'
 
 /** Sammelt alle Log-Aufrufe als (stufe, ereignis, felder)-Tripel — kein Schreiben auf Disk. */
@@ -230,6 +231,40 @@ function fakePasteSpawn(strategieExit: number): typeof spawn {
   }) as unknown as typeof spawn
 }
 
+/**
+ * Fake-spawn analog zu `fakePasteSpawn` (Befund 12): unterscheidet aber nach KOMMANDO statt nur nach
+ * `--set-clip`, weil der Beweis genau davon abhängt, ob der PowerShell-Fallback aufgerufen wird oder
+ * nicht. `--set-clip` bekommt weiterhin Exit 0; der Helfer (`helferPfad`, hier 'win-paste.exe')
+ * bekommt `helferExit`; ein etwaiger PowerShell-Aufruf wird gezählt (unabhängig vom Exit-Code, den er
+ * bekäme — der Zähler beweist NUR, ob er überhaupt gestartet wurde).
+ */
+function fakePasteSpawnMitPowershellZaehler(helferExit: number) {
+  let powershellAufrufe = 0
+  const spawnFn = ((command: string, args: string[]) => {
+    const kind = new EventEmitter() as unknown as ReturnType<typeof spawn>
+    const stdin = {
+      write: (_text: string, cb?: (fehler?: Error | null) => void) => {
+        cb?.(null)
+      },
+      end: () => {},
+      on: () => {}
+    }
+    // @ts-expect-error - Test-Double
+    kind.stdin = stdin
+    // @ts-expect-error - Test-Double
+    kind.stdout = new EventEmitter()
+    // @ts-expect-error - Test-Double
+    kind.kill = () => {}
+    const istSetClip = args.includes('--set-clip')
+    if (command === 'powershell') powershellAufrufe++
+    queueMicrotask(() => {
+      kind.emit('exit', istSetClip ? 0 : helferExit)
+    })
+    return kind
+  }) as unknown as typeof spawn
+  return { spawnFn, powershellAufrufe: () => powershellAufrufe }
+}
+
 describe('paste-adapter Ereignislog', () => {
   it('Strategie-Fehlschlag → paste.strategie mit erfolg=false + code (Warnung), nie Text', async () => {
     const { log, eintraege } = fakeLog()
@@ -286,5 +321,105 @@ describe('paste-adapter Ereignislog', () => {
     const helfer = eintraege.find((e) => e.ereignis === 'paste.strategie' && e.felder?.name === 'helfer')
     expect(helfer?.stufe).toBe('info')
     expect(helfer?.felder).toEqual({ name: 'helfer', erfolg: true, code: 0 })
+  })
+})
+
+// Befund 12 (Fehlerjagd, ADR-0011 Weg B): win-paste.exe liefert bei `--paste <hwnd>` Exit-Code 2, wenn
+// der Fokus zwischen Zwischenablage-Schreiben und Paste gewandert ist ("nichts getippt, Fokus
+// gewandert"). Der ALTE Code wertete das im Adapter (`versucheMitLog`) wie jeden anderen Fehlschlag
+// (nur `code===0` war Erfolg) → die Strategie-Schleife in paste-service.ts probierte danach den
+// PowerShell-Fallback, der KEIN Drift-Gate kennt und blind ins (mittlerweile fremde) Vordergrundfenster
+// tippt — exakt der Sicherheitsfall, den Weg B verhindern soll. Diese Tests beweisen den Fix End-to-End
+// (über den echten Adapter, nicht nur die reine paste-service-Logik).
+describe('paste-adapter — Exit-Code 2 des Helfers ist Fokus-Drift, kein gewöhnlicher Fehlschlag (Befund 12)', () => {
+  it('Exit-Code 2: PowerShell-Fallback wird NIE aufgerufen, Text bleibt in der Zwischenablage, Drift-Hinweis kommt', async () => {
+    const { log } = fakeLog()
+    const meldungen: FehlerMeldung[] = []
+    let manuellerHinweis = 0
+    const { spawnFn, powershellAufrufe } = fakePasteSpawnMitPowershellZaehler(2)
+
+    const ausgabe = createPasteAusgabe({
+      fenster: {
+        anzeigen: () => {},
+        zeigeEinstellungen: () => {},
+        zeigeManuellenHinweis: () => {
+          manuellerHinweis++
+        },
+        melde: (f) => meldungen.push(f)
+      },
+      spawnFn,
+      spawnSyncFn: (() => ({ status: 1, stdout: '' })) as never,
+      helferPfad: 'win-paste.exe',
+      delayMs: 0,
+      log
+    })
+
+    ausgabe.einfügen('text')
+    // Auf die fire-and-forget-Kette warten (set-clip → Helfer-Strategie → [KEIN PowerShell]).
+    await new Promise((r) => setTimeout(r, 20))
+
+    // Der eigentliche Beweis: die zweite Strategie (PowerShell) darf bei Drift NIE gestartet werden.
+    expect(powershellAufrufe()).toBe(0)
+    // Kein "alle Strategien gescheitert"-Hinweis (das wäre der FALSCHE Pfad) — stattdessen der
+    // etablierte Drift-Hinweis (derselbe wie bei der VOR-Prüfung über `aktuellesFenster`).
+    expect(manuellerHinweis).toBe(0)
+    expect(meldungen).toEqual([fokusDriftMeldung()])
+  })
+
+  it('Regression Exit-Code 1 (echter Fehlschlag): PowerShell-Fallback greift weiterhin wie bisher', async () => {
+    const { log } = fakeLog()
+    const meldungen: FehlerMeldung[] = []
+    let manuellerHinweis = 0
+    const { spawnFn, powershellAufrufe } = fakePasteSpawnMitPowershellZaehler(1)
+
+    const ausgabe = createPasteAusgabe({
+      fenster: {
+        anzeigen: () => {},
+        zeigeEinstellungen: () => {},
+        zeigeManuellenHinweis: () => {
+          manuellerHinweis++
+        },
+        melde: (f) => meldungen.push(f)
+      },
+      spawnFn,
+      spawnSyncFn: (() => ({ status: 1, stdout: '' })) as never,
+      helferPfad: 'win-paste.exe',
+      delayMs: 0,
+      log
+    })
+
+    ausgabe.einfügen('text')
+    await new Promise((r) => setTimeout(r, 20))
+
+    // Unverändertes Verhalten: ein echter Fehlschlag (Exit 1, kein Drift-Gate) lässt weiterhin den
+    // PowerShell-Fallback laufen — der auf denselben Fake-Exit-Code trifft und ebenfalls scheitert,
+    // also landet man beim "alle Strategien gescheitert"-Hinweis, NICHT beim Drift-Hinweis.
+    expect(powershellAufrufe()).toBe(1)
+    expect(manuellerHinweis).toBe(1)
+    expect(meldungen).toEqual([])
+  })
+
+  it('Exit-Code 0 (Erfolg) bleibt unverändert: kein Drift, kein Fallback nötig', async () => {
+    const { log } = fakeLog()
+    const { spawnFn, powershellAufrufe } = fakePasteSpawnMitPowershellZaehler(0)
+
+    const ausgabe = createPasteAusgabe({
+      fenster: {
+        anzeigen: () => {},
+        zeigeEinstellungen: () => {},
+        zeigeManuellenHinweis: () => {},
+        melde: () => {}
+      },
+      spawnFn,
+      spawnSyncFn: (() => ({ status: 1, stdout: '' })) as never,
+      helferPfad: 'win-paste.exe',
+      delayMs: 0,
+      log
+    })
+
+    ausgabe.einfügen('text')
+    await new Promise((r) => setTimeout(r, 20))
+
+    expect(powershellAufrufe()).toBe(0) // Helfer erfolgreich → PowerShell gar nicht nötig
   })
 })

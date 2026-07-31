@@ -3,6 +3,7 @@ import {
   PROVIDER,
   getProvider,
   asrUnterstuetztTextFormat,
+  asrBegriffeFeld,
   modelleFuerVorlage
 } from '@shared/providers'
 
@@ -38,6 +39,16 @@ describe('Provider-Registry', () => {
     expect(asrUnterstuetztTextFormat('whisper-large-v3-turbo')).toBe(true)
     expect(asrUnterstuetztTextFormat('gpt-4o-transcribe')).toBe(false)
     expect(asrUnterstuetztTextFormat('voxtral-mini-latest')).toBe(false)
+  })
+
+  // --- B1: Mistral/Voxtral kennt kein `prompt`-Feld — Begriffe müssen ins Feld `context_bias` ---
+  it('asrBegriffeFeld: Voxtral bekommt context_bias, alle anderen (Default) prompt', () => {
+    expect(asrBegriffeFeld('voxtral-mini-latest')).toBe('context_bias')
+    expect(asrBegriffeFeld('whisper-1')).toBe('prompt')
+    expect(asrBegriffeFeld('whisper-large-v3-turbo')).toBe('prompt')
+    expect(asrBegriffeFeld('gpt-4o-transcribe')).toBe('prompt')
+    expect(asrBegriffeFeld('gpt-4o-mini-transcribe')).toBe('prompt')
+    expect(asrBegriffeFeld('Systran/faster-whisper-small')).toBe('prompt')
   })
 
   // --- v0.2.4 #20: Modell-Registry-Mapping für die Editor-Dropdowns ---

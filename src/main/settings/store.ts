@@ -16,6 +16,29 @@ import { getProvider } from '@shared/providers'
 import { EUR_PRO_USD, type PreisOverrides, type ModellPreis } from '@shared/pricing'
 import { normalisiereBegriffe } from '@shared/begriffe'
 import type { RecordingMode } from '@main/hotkey/matcher'
+import {
+  MINDEST_AUFNAHME_SEKUNDEN_STUFEN,
+  MINDEST_AUFNAHME_SEKUNDEN_DEFAULT,
+  STILLE_PROFIL_STUFEN,
+  STILLE_PROFIL_DEFAULT,
+  type StilleProfil,
+  NETZWERK_PROFIL_STUFEN,
+  NETZWERK_PROFIL_DEFAULT,
+  type NetzwerkProfil,
+  RETRY_VERSUCHE_STUFEN,
+  RETRY_VERSUCHE_DEFAULT,
+  VERLAUF_MAXIMUM_STUFEN,
+  VERLAUF_MAXIMUM_DEFAULT,
+  STATISTIK_KOMPAKTIERUNG_TAGE_STUFEN,
+  STATISTIK_KOMPAKTIERUNG_TAGE_DEFAULT,
+  UPDATE_INTERVALL_STUNDEN_STUFEN,
+  UPDATE_INTERVALL_STUNDEN_DEFAULT,
+  PILLEN_ANZEIGEDAUER_PROFIL_STUFEN,
+  PILLEN_ANZEIGEDAUER_PROFIL_DEFAULT,
+  type PillenAnzeigedauerProfil,
+  PERF_AKTIV_DEFAULT,
+  istStufe
+} from '@shared/laufzeit-profile'
 
 /** Recency-Status eines API-Keys (P1): „zuletzt erfolgreich getestet". NUR im Main verwaltet. */
 export interface ApiKeyStatus {
@@ -71,6 +94,47 @@ export interface BlitztextSettings {
    * Spuren echter Vornutzung, die ein frisch installierter Wizard-Kandidat nicht haben kann.
    */
   onboardingAbgeschlossen: boolean
+
+  /**
+   * v0.8.0 (Auftrag 1, Nutzer-Befund): einmalige Kennzeichnung für eine SPÄTERE Oberfläche (hier nicht
+   * gebaut — reines Datenmodell). BUILTIN_WORKFLOWS (shared/workflows.ts) pinnte bis hierhin auf allen
+   * vier eingebauten Workflows hart `anbieterId: 'openai'`; das ist entfernt (sie erben jetzt den
+   * Standard-Anbieter). Eine BESTEHENDE settings.json mit bereits gespeichertem `anbieterId:'openai'`
+   * auf einem Built-in behält diese Zuordnung unverändert (Bestandsschutz, s. parseWorkflow) — aus der
+   * Datei allein lässt sich nicht unterscheiden, ob das ein nie angefasster Altwert oder eine bewusste
+   * Nutzerwahl war. Damit ein solcher Altbestand trotzdem einmal auffällt (statt für immer unsichtbar
+   * zu bleiben), markiert dieses Feld GENAU DAS: false = ein Hinweis steht noch aus (eine künftige
+   * Oberfläche könnte daraus einen einmaligen Tipp „Built-ins erben jetzt automatisch den
+   * Standard-Anbieter — im Workflow-Editor auf 'Erbt Standard' umstellen?" bauen und das Feld danach
+   * auf true setzen); true = kein Hinweis nötig.
+   * Default true (frische Installationen: der neue, nicht gepinnte Startwert gilt von Anfang an, nichts
+   * hinzuweisen). Migration bei fehlendem Feld (alte Datei, Heuristik wie `onboardingAbgeschlossen`,
+   * nur mit umgekehrter Polung): false, wenn mindestens ein BUILTIN-Workflow noch einen gepinnten
+   * (nicht-leeren) `anbieterId` trägt — sonst true.
+   */
+  builtinAnbieterHinweisAbgeschlossen: boolean
+
+  // --- v0.8.0: Laufzeit-Profile (src/shared/laufzeit-profile.ts) — ausschließlich per geschlossener
+  // Stufenliste konfigurierbar (Dropdown-Vorgabe der Nutzer-Anforderung). Jeder Default reproduziert
+  // exakt das bis hierhin hart kodierte Verhalten (siehe laufzeit-profile.ts für die Herleitung je Stufe).
+  /** Mindest-Aufnahmedauer (Sekunden), löst MINIMUM_RECORDING_SECONDS (quality.ts) ab. Default 0.3. */
+  mindestAufnahmeSekunden: number
+  /** Stille-Erkennungs-Profil, löst STILLE_HART/STILLE_WEICH/STILLE_DYNAMIK (quality.ts) ab. Default 'normal'. */
+  stilleProfil: StilleProfil
+  /** Netzwerk-Timeout-Profil (Fetch + daraus abgeleiteter Watchdog). Default 'normal'. */
+  netzwerkProfil: NetzwerkProfil
+  /** Anzahl Anbieter-Retry-Versuche. Default 2. */
+  retryVersuche: number
+  /** Deckelung der Anzahl gespeicherter Verlauf-Einträge. Default 200. */
+  verlaufMaximum: number
+  /** Ab welchem Alter (Tage) die Statistik monatlich kompaktiert wird. Default 90. */
+  statistikKompaktierungTage: number
+  /** Prüfintervall (Stunden) des opt-in Update-Hinweises. Default 24. */
+  updateIntervallStunden: number
+  /** Pillen-Anzeigedauer-Profil (Auto-Hide-Basis/Obergrenze/ms-pro-Zeichen, pill-status.ts). Default 'normal'. */
+  pillenAnzeigedauerProfil: PillenAnzeigedauerProfil
+  /** Perf-Messung (sonst nur über BLITZTEXT_PERF=1 env). Default false. */
+  perfAktiv: boolean
 }
 
 // Default-Anbieter = OpenAI. ASR auf die moderne Generation `gpt-4o-mini-transcribe` (v0.2.4, per
@@ -100,6 +164,17 @@ export interface SettingsFile {
 export interface SettingsStore {
   load(): Promise<BlitztextSettings>
   save(settings: BlitztextSettings): Promise<void>
+  /**
+   * A2 (Lost-Update-Schutz): load(), fn() und save() als EINE serialisierte Transaktion — behebt, dass
+   * z. B. `settings:save` und `apikey:save` (index.ts) je ein eigenes load()→merge()→save() fuhren, ohne
+   * gegenseitigen Ausschluss. Zwei überlappende Aufrufe (bei ihrer Registrierung serialisiert, siehe
+   * `kette` in createSettingsStore) verlieren dadurch keine Änderung mehr — jeder Aufruf sieht den
+   * bereits von vorherigen mutate()-Aufrufen geschriebenen Stand. Liefert den TATSÄCHLICH geschriebenen
+   * (durch parseSettings voll geparsten/migrierten) Stand zurück.
+   */
+  mutate(
+    fn: (aktuell: BlitztextSettings) => BlitztextSettings | Promise<BlitztextSettings>
+  ): Promise<BlitztextSettings>
 }
 
 export function defaultSettings(): BlitztextSettings {
@@ -125,7 +200,17 @@ export function defaultSettings(): BlitztextSettings {
     updateHinweisAktiv: false,
     ausfuehrlichesProtokoll: false,
     verlaufSortierung: 'neuesteZuerst',
-    onboardingAbgeschlossen: false
+    onboardingAbgeschlossen: false,
+    builtinAnbieterHinweisAbgeschlossen: true,
+    mindestAufnahmeSekunden: MINDEST_AUFNAHME_SEKUNDEN_DEFAULT,
+    stilleProfil: STILLE_PROFIL_DEFAULT,
+    netzwerkProfil: NETZWERK_PROFIL_DEFAULT,
+    retryVersuche: RETRY_VERSUCHE_DEFAULT,
+    verlaufMaximum: VERLAUF_MAXIMUM_DEFAULT,
+    statistikKompaktierungTage: STATISTIK_KOMPAKTIERUNG_TAGE_DEFAULT,
+    updateIntervallStunden: UPDATE_INTERVALL_STUNDEN_DEFAULT,
+    pillenAnzeigedauerProfil: PILLEN_ANZEIGEDAUER_PROFIL_DEFAULT,
+    perfAktiv: PERF_AKTIV_DEFAULT
   }
 }
 
@@ -369,7 +454,54 @@ function parseSettings(raw: unknown): BlitztextSettings {
     onboardingAbgeschlossen:
       typeof o.onboardingAbgeschlossen === 'boolean'
         ? o.onboardingAbgeschlossen
-        : Object.keys(parseApiKeyStatus(o.apiKeyStatus)).length > 0 || workflows.length > 4
+        : Object.keys(parseApiKeyStatus(o.apiKeyStatus)).length > 0 || workflows.length > 4,
+    // v0.8.0 (Auftrag 1): explizit gesetzter boolean wird respektiert (auch `false`, z. B. weil eine
+    // künftige Oberfläche den Hinweis bereits gezeigt und diesen Wert selbst geschrieben hat). Fehlt
+    // das Feld GANZ (alte Datei von vor diesem Feature): true (kein Hinweis nötig), AUSSER mindestens
+    // ein BUILTIN-Workflow trägt noch einen gepinnten (nicht-leeren) anbieterId — dann false (Hinweis
+    // steht aus). `workflows` ist hier bereits geparst (s.o.); ein NICHT-eingebauter Workflow mit
+    // eigenem anbieterId zählt bewusst NICHT (das ist die längst bestehende „Anbieter pro Workflow"-
+    // Funktion, kein Altbestand aus der Built-in-Pinnung).
+    // Geprüft wird gezielt auf `'openai'` und NICHT auf „irgendein anbieterId" (Review-Befund v0.8.0):
+    // nur `'openai'` war je der Werks-Startwert der Built-ins. Wer einem eingebauten Workflow bewusst
+    // einen ANDEREN Anbieter zugewiesen hat, hat die Zuordnung gerade erst selbst getroffen — dem
+    // müsste man nicht erklären, dass Built-ins ihn jetzt erben können.
+    builtinAnbieterHinweisAbgeschlossen:
+      typeof o.builtinAnbieterHinweisAbgeschlossen === 'boolean'
+        ? o.builtinAnbieterHinweisAbgeschlossen
+        : !workflows.some((w) => w.builtin && w.anbieterId === 'openai'),
+    // v0.8.0 (Laufzeit-Profile): jedes Feld gegen seine geschlossene Stufenliste validiert (istStufe,
+    // shared/laufzeit-profile.ts) — ein fehlender/typfremder/nicht in der Liste enthaltener Wert fällt
+    // feldweise auf den Default zurück (kein Absturz, kein Teil-Update anderer Felder).
+    mindestAufnahmeSekunden: istStufe(MINDEST_AUFNAHME_SEKUNDEN_STUFEN, o.mindestAufnahmeSekunden)
+      ? o.mindestAufnahmeSekunden
+      : d.mindestAufnahmeSekunden,
+    stilleProfil: istStufe(STILLE_PROFIL_STUFEN, o.stilleProfil) ? o.stilleProfil : d.stilleProfil,
+    netzwerkProfil: istStufe(NETZWERK_PROFIL_STUFEN, o.netzwerkProfil)
+      ? o.netzwerkProfil
+      : d.netzwerkProfil,
+    retryVersuche: istStufe(RETRY_VERSUCHE_STUFEN, o.retryVersuche)
+      ? o.retryVersuche
+      : d.retryVersuche,
+    verlaufMaximum: istStufe(VERLAUF_MAXIMUM_STUFEN, o.verlaufMaximum)
+      ? o.verlaufMaximum
+      : d.verlaufMaximum,
+    statistikKompaktierungTage: istStufe(
+      STATISTIK_KOMPAKTIERUNG_TAGE_STUFEN,
+      o.statistikKompaktierungTage
+    )
+      ? o.statistikKompaktierungTage
+      : d.statistikKompaktierungTage,
+    updateIntervallStunden: istStufe(UPDATE_INTERVALL_STUNDEN_STUFEN, o.updateIntervallStunden)
+      ? o.updateIntervallStunden
+      : d.updateIntervallStunden,
+    pillenAnzeigedauerProfil: istStufe(
+      PILLEN_ANZEIGEDAUER_PROFIL_STUFEN,
+      o.pillenAnzeigedauerProfil
+    )
+      ? o.pillenAnzeigedauerProfil
+      : d.pillenAnzeigedauerProfil,
+    perfAktiv: o.perfAktiv === true // nur === true zählt (Muster wie autostart etc.)
   }
 }
 
@@ -386,28 +518,100 @@ export function createSettingsStore({
    */
   aufKorruption?: () => void
 }): SettingsStore {
+  // A7 (Cache): der zuletzt geparste Stand — vermeidet einen Disk-Read bei JEDEM load()-Aufruf, u. a.
+  // im Hot-Path „Aufnahme starten" (sitzung.ts liest die Einstellungen bei jedem Lauf-Start neu). NUR
+  // ein Schreiber im Prozess (Single-Instance-Lock, app.requestSingleInstanceLock() in index.ts) → eine
+  // prozessinterne Momentaufnahme genügt, kein FS-Watcher nötig.
+  //
+  // BEWUSST NICHT erkannt: ändert der Nutzer settings.json von Hand, während die App läuft (kein
+  // eigener Schreibvorgang der App), bleibt der Cache auf dem alten Stand — es gibt keinen FS-Watcher,
+  // der externe Änderungen bemerkt. Das ist eine akzeptierte Design-Entscheidung (die App ist der
+  // einzige Schreiber, ein FS-Watcher wäre zusätzliche Komplexität für einen Rand-Fall) und KEIN Bug.
+  let cache: BlitztextSettings | null = null
+
+  // Liefert den gecachten Stand, sonst EINMALIG von der Platte lesen+parsen (identischer Pfad wie
+  // bisher `load()`). Korruptions-Pfad (A3): der geparste Defaults-Fallback WIRD gecacht — die Rettung
+  // selbst ist mit `beiseiteLegen()` bereits abgeschlossen (Datei umbenannt), ein zweiter Versuch würde
+  // ohnehin nur wieder auf dieselbe (nun fehlende) Datei treffen. Eine spätere Rettung/Neuanlage bleibt
+  // trotzdem sichtbar: der nächste ECHTE Schreibvorgang (save()/mutate(), z. B. weil der Nutzer nach der
+  // Störfall-Meldung die Einstellungen erneut speichert) aktualisiert den Cache ohnehin auf den frisch
+  // geschriebenen Stand (siehe `schreibeUndCache` unten) — nichts bleibt dauerhaft „eingefroren".
+  async function ladeIntern(): Promise<BlitztextSettings> {
+    if (cache) return cache
+    const raw = await file.read()
+    if (raw === null) {
+      cache = defaultSettings() // fehlende Datei = frische Installation, keine Korruption
+      return cache
+    }
+    try {
+      // JSON.parse UND parseSettings defensiv kapseln: auch ein struktureller Absturz in der
+      // feldweisen Migration (unerwarteter Wert) darf den Start nicht verhindern.
+      cache = parseSettings(JSON.parse(raw))
+    } catch {
+      // Kaputte Datei beiseitelegen (→ settings.json.korrupt), damit der nächste Start sie nicht
+      // erneut ablehnt; dann Callback und Defaults. beiseiteLegen/Callback wirft nie.
+      await file.beiseiteLegen?.()
+      aufKorruption?.()
+      cache = defaultSettings()
+    }
+    return cache
+  }
+
+  // Schreiben + Cache in EINEM Schritt aktualisieren — über `parseSettings` (nicht den rohen
+  // `settings`-Parameter direkt), damit load() DANACH garantiert denselben Stand liefert, den ein
+  // frischer Disk-Read ergäbe (eine einzige Quelle der Wahrheit für Migration/Validierung, kein
+  // zweiter, potenziell abweichender Cache-Pfad).
+  async function schreibeUndCache(settings: BlitztextSettings): Promise<BlitztextSettings> {
+    // Zweite Verteidigungslinie (defense-in-depth): normalisiert auch dann, wenn ein künftiger
+    // Aufrufer (z. B. IPC-Handler) ungeprüfte customTerms direkt an save() durchreicht, ohne den
+    // load()-Pfad zu durchlaufen.
+    const normalisiert = { ...settings, customTerms: normalisiereBegriffe(settings.customTerms) }
+    await file.write(JSON.stringify(normalisiert))
+    cache = parseSettings(normalisiert)
+    return cache
+  }
+
+  // A2 (Lost-Update-Schutz): Muster wortgleich zu history-store.ts (A1). NUR schreibende Operationen
+  // (save()/mutate()) laufen über die Kette — reines Lesen (load(), analog `liste()` im Verlauf-Store)
+  // bleibt unserialisiert, weil ein Read allein keinen Lost-Update erzeugen kann. Jede Aufgabe hängt sich
+  // an die vorherige an (Erfolg ODER Fehler); die Ketten-Referenz selbst wird mit einem entschärften
+  // .then weitergeführt, damit ein einzelner Fehlschlag (z. B. ein werfendes `fn` in mutate()) die Kette
+  // nicht dauerhaft in den rejected-Zustand versetzt — sonst würde JEDE künftige Operation sofort mitwerfen.
+  let kette: Promise<unknown> = Promise.resolve()
+  function serialisiert<T>(aufgabe: () => Promise<T>): Promise<T> {
+    const ergebnis = kette.then(aufgabe, aufgabe)
+    kette = ergebnis.then(
+      () => undefined,
+      () => undefined
+    )
+    return ergebnis
+  }
+
   return {
-    async load() {
-      const raw = await file.read()
-      if (raw === null) return defaultSettings() // fehlende Datei = frische Installation, keine Korruption
-      try {
-        // JSON.parse UND parseSettings defensiv kapseln: auch ein struktureller Absturz in der
-        // feldweisen Migration (unerwarteter Wert) darf den Start nicht verhindern.
-        return parseSettings(JSON.parse(raw))
-      } catch {
-        // Kaputte Datei beiseitelegen (→ settings.json.korrupt), damit der nächste Start sie nicht
-        // erneut ablehnt; dann Callback und Defaults. beiseiteLegen/Callback wirft nie.
-        await file.beiseiteLegen?.()
-        aufKorruption?.()
-        return defaultSettings()
-      }
+    load() {
+      return ladeIntern()
     },
-    async save(settings) {
-      // Zweite Verteidigungslinie (defense-in-depth): normalisiert auch dann, wenn ein künftiger
-      // Aufrufer (z. B. IPC-Handler) ungeprüfte customTerms direkt an save() durchreicht, ohne den
-      // load()-Pfad zu durchlaufen.
-      const normalisiert = { ...settings, customTerms: normalisiereBegriffe(settings.customTerms) }
-      await file.write(JSON.stringify(normalisiert))
+    save(settings) {
+      return serialisiert(() => schreibeUndCache(settings)).then(() => undefined)
+    },
+    mutate(fn) {
+      return serialisiert(async () => {
+        const aktuell = await ladeIntern()
+        const next = await fn(aktuell)
+        // Echter No-Op-Schutz: liefert `fn` den unveränderten Stand zurück (Referenzgleichheit), wird
+        // NICHT geschrieben — sonst würde z. B. `mergeApiKeyStatus` (index.ts) bei einem bereits
+        // fehlenden apiKeyStatus-Eintrag einen folgenlosen Disk-Write auslösen (die alte load()→save()-
+        // Variante hatte für genau diesen Fall einen frühen `return`, siehe dort).
+        //
+        // 🔴 VORAUSSETZUNG an jeden Aufrufer (Review-Befund v0.8.0): `fn` MUSS ein NEUES Objekt
+        // liefern, wenn es etwas ändert — typischerweise `{ ...aktuell, feld: wert }`. Wer `aktuell`
+        // an Ort und Stelle verändert und dieselbe Referenz zurückgibt, bekommt hier stillschweigend
+        // KEINEN Schreibvorgang: der Cache zeigte dann einen Stand, der nie auf der Platte landet, und
+        // die Änderung wäre nach dem nächsten Start verloren. Beide heutigen Aufrufer (index.ts)
+        // spreaden korrekt.
+        if (next === aktuell) return aktuell
+        return schreibeUndCache(next)
+      })
     }
   }
 }

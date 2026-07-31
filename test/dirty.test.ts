@@ -50,6 +50,32 @@ describe('einstellungenGeaendert (P8)', () => {
     } as unknown as ReturnType<typeof defaultSettings>
     expect(einstellungenGeaendert(mitStatus, defaultSettings())).toBe(false)
   })
+
+  // v0.8.0: die neuen Laufzeit-Profile + GUI-Lücken-Felder brauchten KEINE Anpassung von
+  // einstellungenGeaendert (Ganz-Objekt-Vergleich via tiefGleich) — dieser Test belegt das für
+  // jedes neu in der Einstellungen-Oberfläche bedienbare Feld statt es nur zu behaupten.
+  it('erkennt Änderungen an jedem neuen v0.8.0-Feld (Laufzeit-Profile + GUI-Lücken + Spiegelung)', () => {
+    const basis = defaultSettings()
+    const patches: Array<Partial<ReturnType<typeof defaultSettings>>> = [
+      { mindestAufnahmeSekunden: 1.0 },
+      { stilleProfil: 'streng' },
+      { netzwerkProfil: 'lang' },
+      { retryVersuche: 4 },
+      { verlaufMaximum: 1000 },
+      { statistikKompaktierungTage: 365 },
+      { updateIntervallStunden: 168 },
+      { pillenAnzeigedauerProfil: 'lang' },
+      { perfAktiv: true },
+      { fokusRueckkehr: false },
+      { tone: 'casual' },
+      { emojiDensity: 'viel' },
+      { verlaufAktiv: true },
+      { verlaufSortierung: 'aeltesteZuerst' }
+    ]
+    for (const patch of patches) {
+      expect(einstellungenGeaendert({ ...basis, ...patch }, basis)).toBe(true)
+    }
+  })
 })
 
 describe('apiKeyEntwurfGeaendert (W1-E — ungespeicherter API-Key als Dirty-Quelle)', () => {

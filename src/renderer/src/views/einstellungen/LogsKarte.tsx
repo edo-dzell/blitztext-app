@@ -8,12 +8,19 @@ import { Switch } from '@/components/ui/switch'
 // (nie Diktate/Texte/API-Keys) — die Karte macht es nur zugänglich. Der Debug-Schalter steuert nur
 // die Detailtiefe (BLITZTEXT_DEBUG=1 erzwingt sie ohnehin). IPC-Fehler (Pfad ermitteln/Ordner
 // öffnen/Löschen) werden still gefangen: die Diagnose-Karte darf nie werfen.
+// v0.8.0: `perfAktiv` (bislang nur per BLITZTEXT_PERF=1 env erzwingbar) als zweiter Schalter ergänzt —
+// gleiche Karte, da beide Schalter „mehr interne Diagnose-Daten schreiben" bedeuten. Wirkt laut Vertrag
+// erst nach einem Neustart (Perf-Messung wird beim Start einmalig verdrahtet, kein Live-Reconfigure).
 export default function LogsKarte({
   an,
-  aendere
+  aendere,
+  perfAn,
+  aendrePerfAn
 }: {
   an: boolean
   aendere: (v: boolean) => void
+  perfAn: boolean
+  aendrePerfAn: (v: boolean) => void
 }) {
   const [pfad, setPfad] = useState('')
   const [geleert, setGeleert] = useState(false)
@@ -68,6 +75,15 @@ export default function LogsKarte({
             </p>
           </div>
           <Switch checked={an} onCheckedChange={aendere} />
+        </div>
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium">Performance-Messung</p>
+            <p className="text-xs text-muted-foreground">
+              Misst interne Laufzeiten zur Fehlersuche. Wirkt erst nach einem Neustart der App.
+            </p>
+          </div>
+          <Switch checked={perfAn} onCheckedChange={aendrePerfAn} />
         </div>
         {pfad && <p className="font-mono text-xs text-muted-foreground">{pfad}</p>}
         {geleert && <p className="text-xs text-emerald-500">Logs gelöscht.</p>}

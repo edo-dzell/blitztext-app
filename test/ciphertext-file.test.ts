@@ -115,6 +115,33 @@ describe('createCiphertextFile — write / atomares Ersetzen', () => {
   })
 })
 
+// A1: Korruptions-Rettung — wörtlich dasselbe Muster wie settings-file.ts (ersetzeAtomar auf
+// `${filePath}.korrupt`, wirft NIE). Genutzt von history-store.ts (Verlauf) und api-key-vault.ts
+// (Key-Tresor), damit eine nicht entschlüsselbare Datei beiseitegelegt statt überschrieben wird.
+describe('createCiphertextFile — beiseiteLegen (A1)', () => {
+  it('benennt die Datei nach <pfad>.korrupt um', async () => {
+    const file = createCiphertextFile(ZIEL)
+    await file.beiseiteLegen!()
+
+    expect(rename).toHaveBeenCalledTimes(1)
+    expect(rename).toHaveBeenCalledWith(ZIEL, `${ZIEL}.korrupt`)
+  })
+
+  it('wirft nie, auch wenn das Umbenennen endgültig scheitert (best effort, Aufrufer hat Vorrang)', async () => {
+    rename.mockRejectedValue(fehler('EACCES'))
+    const file = createCiphertextFile(ZIEL)
+
+    await expect(file.beiseiteLegen!()).resolves.toBeUndefined()
+  })
+
+  it('wirft nie bei ENOENT (Quelle existiert nicht mehr)', async () => {
+    rename.mockRejectedValue(fehler('ENOENT'))
+    const file = createCiphertextFile(ZIEL)
+
+    await expect(file.beiseiteLegen!()).resolves.toBeUndefined()
+  })
+})
+
 describe('createCiphertextFile — read / remove', () => {
   it('read liefert Uint8Array bei vorhandener Datei', async () => {
     readFile.mockResolvedValueOnce(Buffer.from([1, 2, 3]))

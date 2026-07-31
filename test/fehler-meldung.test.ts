@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { fehlerMeldung, teilErfolgMeldung, fokusDriftMeldung } from '@main/session/fehler-meldung'
+import {
+  fehlerMeldung,
+  teilErfolgMeldung,
+  fokusDriftMeldung,
+  fehlenderApiKeyMeldung,
+  unbekannterWorkflowMeldung
+} from '@main/session/fehler-meldung'
 
 describe('fehlerMeldung', () => {
   it('konfiguration → Sprung in die Einstellungen, trägt die Ursache', () => {
@@ -60,6 +66,32 @@ describe('fokusDriftMeldung (W3-A, ADR-0011 Weg B)', () => {
     const m = fokusDriftMeldung()
     expect(m.titel).toContain('Fokus')
     expect(m.koerper).toContain('Strg+V')
+    expect(m.aktion).toBeUndefined()
+  })
+})
+
+// v0.8.0 (Auftrag 2, Befund 17): bislang brach ein per Hotkey ausgelöstes Diktat ohne API-Key WORTLOS
+// ab. Nach dem Muster von fokusDriftMeldung — reiner, nicht-blockierender Hinweis, keine Sprung-Aktion
+// (das Nachvorn-Holen der Einstellungen bleibt der manuellen Auslösung vorbehalten, s. sitzung.ts).
+describe('fehlenderApiKeyMeldung (v0.8.0, Befund 17)', () => {
+  it('nennt den betroffenen Anbieter, keine Sprung-Aktion', () => {
+    const m = fehlenderApiKeyMeldung('OpenAI')
+    expect(m.koerper).toContain('OpenAI')
+    expect(m.aktion).toBeUndefined()
+  })
+
+  it('nennt einen ANDEREN Anbieter, wenn ein anderer betroffen ist', () => {
+    const m = fehlenderApiKeyMeldung('Mistral')
+    expect(m.koerper).toContain('Mistral')
+  })
+})
+
+// v0.8.0 (Auftrag 2): derselbe stille Fehler wie der fehlende API-Key — ein verwaister Hotkey (Chord
+// zeigt auf eine gelöschte/unbekannte Workflow-Id) brach bislang ebenso wortlos ab.
+describe('unbekannterWorkflowMeldung (v0.8.0)', () => {
+  it('meldet, dass der Workflow nicht mehr existiert, keine Sprung-Aktion', () => {
+    const m = unbekannterWorkflowMeldung()
+    expect(m.titel).toBe('Workflow nicht gefunden')
     expect(m.aktion).toBeUndefined()
   })
 })

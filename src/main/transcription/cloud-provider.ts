@@ -5,10 +5,11 @@
 // V2 (Strang B): Base-URL + Modell kommen aus der aktiven Provider-Config (getConfig). Default ist
 // exakt v1: OpenAI/whisper-1 → byte-identische URL + response_format=text.
 
-import { asrUnterstuetztTextFormat } from '@shared/providers'
+import { asrUnterstuetztTextFormat, asrBegriffeFeld } from '@shared/providers'
 import { leseFehlerDetail, type AnbieterFehler } from '@main/workflow/fehler-klassifikation'
 import { pruefeAnbieterUrlSicherheit } from '@shared/anbieter-url-guard'
-import { asrPromptText, begriffeFuerAsrPrompt } from '@shared/begriffe'
+import { asrPromptText, begriffeFuerAsrPrompt, begriffeFuerContextBias } from '@shared/begriffe'
+import { dateinameFuerMime } from '@shared/audio-dateiname'
 
 export interface TranscribeOptions {
   language?: string
@@ -58,11 +59,17 @@ export function createCloudTranscriptionProvider(deps: {
   maxUploadBytes?: number
   /** Eigener Fetch-Timeout in ms; Default DEFAULT_FETCH_TIMEOUT_MS. Injizierbar für Tests. */
   fetchTimeoutMs?: number
+  /**
+   * v0.8.0 (netzwerkProfil): Live-Getter für den Fetch-Timeout — nimmt Vorrang vor der statischen
+   * `fetchTimeoutMs` (Tests), falls gesetzt. Composition-root reicht ihn als Closure über die lebende
+   * Settings-Kopie durch (Muster wie `getConfig` oben), damit eine Profiländerung ab dem NÄCHSTEN
+   * Aufruf greift, ohne den Provider neu zu bauen.
+   */
+  getFetchTimeoutMs?: () => number
 }): TranscriptionProvider {
   const fetchFn = deps.fetchFn ?? fetch
   const getConfig = deps.getConfig ?? (() => OPENAI_DEFAULT)
   const maxUploadBytes = deps.maxUploadBytes ?? MAX_UPLOAD_BYTES
-  const fetchTimeoutMs = deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS
 
   return {
     async transcribe(audio, options = {}) {
@@ -92,21 +99,49 @@ export function createCloudTranscriptionProvider(deps: {
       const textFormat = asrUnterstuetztTextFormat(model)
 
       const form = new FormData()
-      form.append('file', audio, 'audio.webm')
+      // A4: Dateiname folgt dem echten Blob-MIME-Typ statt hart 'audio.webm' (Anbieter entscheiden
+      // teils anhand der Endung) — reine Absicherung, kein Transcoding.
+      form.append('file', audio, dateinameFuerMime(audio.type))
       form.append('model', model)
       // Whisper-Familie kann response_format=text; andere (gpt-4o-transcribe*, Voxtral) nur JSON.
       form.append('response_format', textFormat ? 'text' : 'json')
       if (options.language && options.language.trim() !== '') {
         form.append('language', options.language.trim())
       }
-      // Terms-Kern: Budget-Guard (Whisper schneidet den prompt-Parameter serverseitig still ab)
-      // + Normalisierung liegen in @shared/begriffe, EINE Quelle für alle Aufrufer.
-      const promptText = asrPromptText(begriffeFuerAsrPrompt(options.vocabularyHints ?? []))
-      if (promptText) form.append('prompt', promptText)
+      // B1: WELCHES Feld die Begriffe bekommt, hängt vom Anbieter/Modell ab — asrBegriffeFeld()
+      // verzweigt genau wie asrUnterstuetztTextFormat() oben rein anhand des Modellnamens.
+      // Terms-Kern: Budget-/Anzahl-Guard + Normalisierung liegen in @shared/begriffe, EINE Quelle
+      // für alle Aufrufer.
+      if (asrBegriffeFeld(model) === 'context_bias') {
+        // Mistral/Voxtral: die ROHE, normalisierte Begriffsliste (kein Fließtext-Satz wie bei
+        // Whisper) — auf die von Mistral dokumentierte Anzahl-Obergrenze gekappt (nicht Whispers
+        // Zeichen-Budget, das ist eine andere Grenze für einen anderen Weg).
+        //
+        // ⚠️ Kodierung UNSICHER, NUR gegen die echte API zu bestätigen (siehe Bericht/HITL-Hinweis):
+        // Mistrals Doku belegt Feldname + Array-Typ + 100er-Obergrenze, macht aber keine verbindliche
+        // Aussage zur Multipart-Kodierung eines Array-Feldes bei Datei-Upload. Gewählt: WIEDERHOLTE
+        // Multipart-Felder gleichen Namens (form.append('context_bias', x) je Begriff) — das ist (a)
+        // die natürliche FormData-Semantik in JS, (b) der community-dokumentierte Workaround in
+        // einem offiziellen Beispiel (GitHub-Issue mistralai/client-python#338: `-F
+        // context_bias=Scriba -F context_bias=Mistral`). Falls Mistral stattdessen einen
+        // JSON-kodierten String erwartet: NUR die folgende Zeile ändern.
+        for (const begriff of begriffeFuerContextBias(options.vocabularyHints ?? [])) {
+          form.append('context_bias', begriff)
+        }
+      } else {
+        // Whisper/OpenAI-kompatibel (Default) — exakt wie bisher, kein Verhaltenswechsel.
+        const promptText = asrPromptText(begriffeFuerAsrPrompt(options.vocabularyHints ?? []))
+        if (promptText) form.append('prompt', promptText)
+      }
 
       // Eigener Fetch-Timeout (W1-F, unter dem 90s-Runner-Watchdog): kombiniert mit einem etwaig
       // durchgereichten Abbruch-Signal (Nutzer-Abbruch oder Watchdog des Aufrufers), sodass BEIDE
       // Gründe weiter abbrechen können. `internTimeout.signal` feuert NUR bei unserem eigenen Timer.
+      // v0.8.0: PRO AUFRUF aufgelöst (nicht mehr einmalig beim Provider-Bau) — damit ein via
+      // `getFetchTimeoutMs` live gereichtes netzwerkProfil ab dem NÄCHSTEN Aufruf greift.
+      const fetchTimeoutMs = deps.getFetchTimeoutMs
+        ? deps.getFetchTimeoutMs()
+        : (deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS)
       const internTimeout = new AbortController()
       const timeoutTimer = setTimeout(
         () => internTimeout.abort(new DOMException('Zeitüberschreitung.', 'TimeoutError')),

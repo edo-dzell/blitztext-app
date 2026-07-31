@@ -408,4 +408,41 @@ describe('createStatsStore.zusammenfassung — Monats-Kompaktierung (B1)', () =>
     expect(s.zeilen).toHaveLength(1)
     expect(s.gesamtAnzahl).toBe(1)
   })
+
+  // --- v0.8.0 (statistikKompaktierungTage): Live-Getter, nimmt Vorrang vor KOMPAKTIERUNGS_SCHWELLE_TAGE ---
+
+  it('getKompaktierungTage=30 kompaktiert eine 45 Tage alte Zeile, die der Default (90) noch tagesgenau ließe', async () => {
+    const vor45Tagen = '2026-05-01' // 45 Tage vor 2026-06-15
+    const file = fakeFile()
+    file.content = JSON.stringify([
+      { datum: vor45Tagen, workflowId: 't', anzahl: 1, audioSekunden: 5, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 }
+    ] satisfies StatZeile[])
+
+    const storeDefault = createStatsStore({ file })
+    const sDefault = await storeDefault.zusammenfassung(jetzt2026_06_15)
+    expect(sDefault.zeilen[0]!.datum).toBe(vor45Tagen) // Default (90): 45 Tage sind noch nicht alt genug
+
+    const file2 = fakeFile()
+    file2.content = JSON.stringify([
+      { datum: vor45Tagen, workflowId: 't', anzahl: 1, audioSekunden: 5, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 }
+    ] satisfies StatZeile[])
+    const storeKurz = createStatsStore({ file: file2, getKompaktierungTage: () => 30 })
+    const sKurz = await storeKurz.zusammenfassung(jetzt2026_06_15)
+    expect(sKurz.zeilen[0]!.datum).toBe('2026-05') // abweichender Wert kommt an: jetzt kompaktiert
+  })
+
+  it('wird bei JEDEM zusammenfassung()-Aufruf frisch gelesen (Live-Änderung ohne Store-Neubau)', async () => {
+    const vor45Tagen = '2026-05-01'
+    const file = fakeFile()
+    file.content = JSON.stringify([
+      { datum: vor45Tagen, workflowId: 't', anzahl: 1, audioSekunden: 5, asrModell: 'whisper-1', chatModell: '', promptTokens: 0, completionTokens: 0 }
+    ] satisfies StatZeile[])
+    let schwelleTage = 90
+    const store = createStatsStore({ file, getKompaktierungTage: () => schwelleTage })
+
+    expect((await store.zusammenfassung(jetzt2026_06_15)).zeilen[0]!.datum).toBe(vor45Tagen)
+
+    schwelleTage = 30 // Live-Änderung, wie composition-root sie über die Closure durchreicht
+    expect((await store.zusammenfassung(jetzt2026_06_15)).zeilen[0]!.datum).toBe('2026-05')
+  })
 })

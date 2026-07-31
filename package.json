@@ -1,6 +1,6 @@
 {
   "name": "blitztext-app",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "description": "Windows-Neuschrieb der Blitztext Speech-to-Text App (Electron + React + TypeScript)",
   "private": true,
   "author": "edo-dzell",
@@ -35,16 +35,16 @@
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^33.2.0",
-    "electron-builder": "^25.1.8",
-    "electron-vite": "^3.1.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
     "eslint": "^10.4.1",
     "tailwindcss": "^4.3.0",
     "ts-prune": "^0.10.3",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.60.1",
-    "vite": "^6.4.3",
+    "vite": "^7.3.6",
     "vitest": "^3.2.7"
   }
 }

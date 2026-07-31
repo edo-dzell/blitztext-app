@@ -28,6 +28,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import {
   createPasteService,
   type EinfügeStrategie,
+  type StrategieErgebnis,
   type Zwischenablage
 } from '@main/output/paste-service'
 import { winPastePfad } from '@main/output/win-paste-path'
@@ -88,8 +89,9 @@ interface ProzessAusgang {
 
 /**
  * Prozess starten und auf Exit-Code 0 als Erfolg prüfen; Spawn-Fehler (ENOENT) → erfolg=false/code=null.
- * v0.7.2: gibt zusätzlich den Exit-Code zurück (dateilokal, fürs `paste.strategie`-Log). Das nach außen
- * sichtbare Erfolg/Misserfolg-Verhalten bleibt unverändert — die Strategien mappen wieder auf `boolean`.
+ * v0.7.2: gibt zusätzlich den Exit-Code zurück (dateilokal, fürs `paste.strategie`-Log). Diese Funktion
+ * bleibt bewusst zweiwertig (erfolg/code) — erst `versucheMitLog` (unten) verfeinert den Exit-Code auf
+ * das dreiwertige `StrategieErgebnis` (Befund 12: Exit-Code 2 der Helfer-Strategie = 'drift').
  */
 function prozessErfolg(spawnFn: typeof spawn, command: string, args: string[]): Promise<ProzessAusgang> {
   return new Promise((resolve) => {
@@ -188,15 +190,30 @@ export function createPasteAusgabe(deps: PasteAusgabeDeps): Ausgabe {
   const log = deps.log ?? NOOP_EREIGNISLOG
 
   // Führt eine Strategie aus und loggt ihren Ausgang (Name/Erfolg/Exit-Code) — Erfolg als info,
-  // Fehlschlag als warnung. Rückgabe bleibt `boolean` (Vertrag der EinfügeStrategie unverändert).
-  // NIE der Text, nur Meta: `code` wird nur gesetzt, wenn ein numerischer Exit-Code vorliegt.
-  const versucheMitLog = async (name: 'helfer' | 'powershell', command: string, args: string[]): Promise<boolean> => {
+  // Fehlschlag/Drift als warnung. NIE der Text, nur Meta: `code` wird nur gesetzt, wenn ein
+  // numerischer Exit-Code vorliegt.
+  // Befund 12 (Fehlerjagd): früher mappte diese Funktion auf `boolean` — Exit-Code 2 der HELFER-
+  // Strategie (natives Weg-B-Drift-Gate, `--paste <hwnd>` in win-paste.c) landete damit im selben
+  // `erfolg:false`-Zweig wie jeder andere Fehlschlag, und die Strategie-Schleife in paste-service.ts
+  // probierte als Nächstes den PowerShell-Fallback — der KEIN Drift-Gate kennt und blind ins
+  // (mittlerweile fremde) Vordergrundfenster tippt. Jetzt dreiwertig: nur die 'helfer'-Strategie kennt
+  // die Exit-Code-2-Bedeutung (PowerShell hat kein eigenes Drift-Protokoll), und der Aufrufer
+  // (paste-service.ts) bricht bei 'drift' sofort ab statt die nächste Strategie zu versuchen.
+  const versucheMitLog = async (
+    name: 'helfer' | 'powershell',
+    command: string,
+    args: string[]
+  ): Promise<StrategieErgebnis> => {
     const ausgang = await prozessErfolg(spawnFn, command, args)
     const felder: LogFelder = { name, erfolg: ausgang.erfolg }
     if (typeof ausgang.code === 'number') felder.code = ausgang.code
+    if (name === 'helfer' && ausgang.code === 2) {
+      log.warnung('paste.strategie', felder)
+      return 'drift'
+    }
     if (ausgang.erfolg) log.info('paste.strategie', felder)
     else log.warnung('paste.strategie', felder)
-    return ausgang.erfolg
+    return ausgang.erfolg ? 'erfolg' : 'fehlschlag'
   }
 
   // MAL-2: Text bevorzugt über den Helfer (`--set-clip`) in die Zwischenablage schreiben — der setzt

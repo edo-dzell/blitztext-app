@@ -222,4 +222,90 @@ describe('createRecorder', () => {
     ee.emit('recorder:error', {}, 'späterer Ausfall')
     expect(gemeldet).toEqual(['späterer Ausfall'])
   })
+
+  // --- v0.8.0 (Befund 9): dauerhafter Start-Bestätigungskanal (recorder:gestartet) ---
+
+  it('recorder:gestartet ruft den onGestartet-Callback auf (Start-Bestätigung durchgereicht)', () => {
+    const ee = ipcMain as unknown as EventEmitter
+    const recorder = createRecorder(fakeFenster())
+    let aufrufe = 0
+    recorder.onGestartet?.(() => {
+      aufrufe++
+    })
+
+    ee.emit('recorder:gestartet')
+
+    expect(aufrufe).toBe(1)
+  })
+
+  it('recorder:gestartet ohne registrierten onGestartet-Callback ist ein folgenloses No-Op', () => {
+    const ee = ipcMain as unknown as EventEmitter
+    createRecorder(fakeFenster()) // KEIN onGestartet registriert
+
+    expect(() => ee.emit('recorder:gestartet')).not.toThrow()
+  })
+
+  it('mehrere recorder:gestartet-Ereignisse rufen den Callback jeweils erneut auf (dauerhafter Listener)', () => {
+    const ee = ipcMain as unknown as EventEmitter
+    const recorder = createRecorder(fakeFenster())
+    let aufrufe = 0
+    recorder.onGestartet?.(() => {
+      aufrufe++
+    })
+
+    ee.emit('recorder:gestartet')
+    ee.emit('recorder:gestartet')
+
+    expect(aufrufe).toBe(2)
+  })
+
+  // --- Befund 2 (adversariale Review, v0.8.x): Lauf-Bezug wird unverändert durchgereicht ---
+
+  it('recorder:gestartet mit Lauf-Bezug reicht ihn unverändert an den onGestartet-Callback durch', () => {
+    const ee = ipcMain as unknown as EventEmitter
+    const recorder = createRecorder(fakeFenster())
+    const empfangen: (number | undefined)[] = []
+    recorder.onGestartet?.((lauf) => {
+      empfangen.push(lauf)
+    })
+
+    ee.emit('recorder:gestartet', {}, 7)
+
+    expect(empfangen).toEqual([7])
+  })
+
+  // --- Befund 7a (v0.8.0)/Befund 2 (v0.8.x): deviceId + Lauf-Bezug als Nutzlast über 'recorder:start' ---
+
+  it('start(deviceId, lauf) sendet BEIDE Felder als ein Nutzlast-Objekt über den bestehenden Kanal', () => {
+    const send = vi.fn()
+    const recorder = createRecorder({ webContents: { send } } as never)
+
+    recorder.start('mic-42', 7)
+
+    // Befund 2: die Nutzlast ist jetzt ein Objekt (statt der reinen deviceId-Zeichenkette aus Befund 7a),
+    // damit der Lauf-Bezug ohne einen zweiten Kanal mitreisen kann — der Renderer entpackt es (recorder.ts
+    // via preload/index.ts onStart).
+    expect(send).toHaveBeenCalledWith('recorder:start', { deviceId: 'mic-42', lauf: 7 })
+  })
+
+  it('start(deviceId) OHNE Lauf-Bezug sendet die deviceId + lauf:undefined im Nutzlast-Objekt', () => {
+    // Justiert gegenüber dem Vor-Befund-2-Stand (der eine reine Zeichenkette sendete): der Aufrufer kennt
+    // hier keinen Lauf-Bezug (z. B. ein alter Test/Aufrufer) — das Objekt trägt das trotzdem konsistent
+    // als `lauf: undefined`, statt zwei verschiedene Payload-FORMEN (Zeichenkette vs. Objekt) zu mischen.
+    const send = vi.fn()
+    const recorder = createRecorder({ webContents: { send } } as never)
+
+    recorder.start('mic-42')
+
+    expect(send).toHaveBeenCalledWith('recorder:start', { deviceId: 'mic-42', lauf: undefined })
+  })
+
+  it('start() OHNE deviceId UND OHNE Lauf-Bezug sendet KEINE Nutzlast (Altweg für alte Aufrufer bleibt intakt)', () => {
+    const send = vi.fn()
+    const recorder = createRecorder({ webContents: { send } } as never)
+
+    recorder.start()
+
+    expect(send).toHaveBeenCalledWith('recorder:start')
+  })
 })

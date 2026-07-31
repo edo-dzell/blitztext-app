@@ -164,11 +164,18 @@ export function inhaltswoerter(text: string): string[] {
 // - MIN_FEHLQUOTE: die fehlenden Wörter müssen zusätzlich einen SUBSTANTIELLEN Anteil der Inhaltswörter
 //   ausmachen (40%) — ein langes Diktat mit vielen Inhaltswörtern, von denen nur wenige (aber absolut
 //   gesehen >=3) fehlen, ist eher normale Kürzung als ein weggelassener Aussagenblock.
-// - MIN_WOERTER_ROHTEXT: unter 8 Wörtern im Rohtext ist die Wort-Statistik zu instabil (ein einzelnes
-//   Wort kippt die Quote um zig Prozentpunkte) — kurze Diktate bleiben außen vor.
+// - MIN_WOERTER_ROHTEXT (Befund C, v0.8.0, angehoben von 8 auf 15 — Feld-Log): bei 8-14 Wörtern
+//   Rohtext ist die Wort-Statistik NICHT nur „etwas instabil", sondern bereits bei ALLTÄGLICHER,
+//   vollständiger Politur (Höflichkeitsform, 2-3 naheliegende Synonyme) systematisch fehlalarmfähig —
+//   siehe test/vollstaendigkeit.test.ts, Block „Befund C" für die konstruierten Rot-Beweise: bei nur
+//   4-7 Inhaltswörtern (typisch für 8-11-Wort-Diktate) reichen bereits 3 Synonymersetzungen (KEIN
+//   Aussagen-Verlust), um sowohl MIN_FEHLENDE_WOERTER als auch MIN_FEHLQUOTE zu reißen. 15 ist die
+//   kleinste Schwelle, die ALLE bisher konstruierten Fehlalarme ausschließt, aber BEIDE bekannten
+//   echten Vorfälle (15 bzw. 22 Wörter) weiter erkennt — angehoben nur so weit wie durch Belege nötig,
+//   nicht „auf Nummer sicher" darüber hinaus (ein zu später Auslöser verpasst reale Weglassungen).
 const MIN_FEHLENDE_WOERTER = 3
 const MIN_FEHLQUOTE = 0.4
-const MIN_WOERTER_ROHTEXT = 8
+const MIN_WOERTER_ROHTEXT = 15
 
 /**
  * Heuristik: Wirkt der Endtext unvollständig gegenüber dem Rohtext — hat er einen satten Block von
@@ -185,7 +192,8 @@ const MIN_WOERTER_ROHTEXT = 8
  * Feuert NUR, wenn ALLE drei Bedingungen zutreffen (siehe Schwellwerte oben):
  *   1) mindestens 3 Inhaltswörter aus dem Rohtext fehlen im Endtext, UND
  *   2) diese fehlenden Wörter machen mindestens 40% aller Rohtext-Inhaltswörter aus, UND
- *   3) der Rohtext hat mindestens 8 Wörter (Wort-Statistik sonst zu instabil).
+ *   3) der Rohtext hat mindestens 15 Wörter (s. MIN_WOERTER_ROHTEXT — bei kürzeren Diktaten reißt schon
+ *      legitime Politur/Synonymersetzung die anderen beiden Schwellen, siehe Befund-C-Kommentar oben).
  */
 export function wirktUnvollstaendig(rohtext: string, endtext: string): boolean {
   const rohtextWoerter = rohtext.trim().split(/\s+/).filter(Boolean)

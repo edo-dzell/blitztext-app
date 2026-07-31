@@ -17,9 +17,10 @@ function fakeCipher(available = true): SecretCipher {
   }
 }
 
-function fakeFile(): CiphertextFile & { data: Uint8Array | null } {
+function fakeFile(): CiphertextFile & { data: Uint8Array | null; beiseiteGelegt: number } {
   const f = {
     data: null as Uint8Array | null,
+    beiseiteGelegt: 0,
     async read() {
       return f.data
     },
@@ -27,6 +28,12 @@ function fakeFile(): CiphertextFile & { data: Uint8Array | null } {
       f.data = d
     },
     async remove() {
+      f.data = null
+    },
+    // A1: Muster wie settings-file.test.ts — „umbenennen" simuliert durch Datei auf null setzen +
+    // Zähler hochzählen, damit Tests die Reihenfolge/Häufigkeit prüfen können.
+    async beiseiteLegen() {
+      f.beiseiteGelegt++
       f.data = null
     }
   }
@@ -171,6 +178,43 @@ describe('createVerlaufStore', () => {
     expect(liste[liste.length - 1]!.id).toBe('0')
   })
 
+  // --- v0.8.0 (verlaufMaximum): Live-Getter, nimmt Vorrang vor der statischen maxEintraege ---
+
+  describe('getMaxEintraege (Live-Getter)', () => {
+    it('nimmt Vorrang vor der statischen maxEintraege', async () => {
+      const file = fakeFile()
+      const store = createVerlaufStore({
+        cipher: fakeCipher(),
+        file,
+        istAktiv: () => true,
+        maxEintraege: 5, // würde ohne den Getter gelten
+        getMaxEintraege: () => 1
+      })
+      await store.aufzeichnen(eintrag('a'))
+      await store.aufzeichnen(eintrag('b'))
+      const liste = await store.liste()
+      expect(liste.map((e) => e.id)).toEqual(['b']) // 1, nicht 5
+    })
+
+    it('wird bei JEDEM aufzeichnen()-Aufruf frisch gelesen (Live-Änderung ohne Store-Neubau)', async () => {
+      const file = fakeFile()
+      let grenze = 2
+      const store = createVerlaufStore({
+        cipher: fakeCipher(),
+        file,
+        istAktiv: () => true,
+        getMaxEintraege: () => grenze
+      })
+      await store.aufzeichnen(eintrag('a'))
+      await store.aufzeichnen(eintrag('b'))
+      expect((await store.liste()).map((e) => e.id)).toEqual(['b', 'a'])
+
+      grenze = 1 // Live-Änderung, wie composition-root sie über die Closure durchreicht
+      await store.aufzeichnen(eintrag('c'))
+      expect((await store.liste()).map((e) => e.id)).toEqual(['c'])
+    })
+  })
+
   it('kappt bei 201 Einträgen auf 200 und wirft den ältesten heraus', async () => {
     const file = fakeFile()
     const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
@@ -180,5 +224,152 @@ describe('createVerlaufStore', () => {
     expect(liste[0]!.id).toBe('200') // neuester behalten
     expect(liste[liste.length - 1]!.id).toBe('1') // '0' (ältester) herausgefallen
     expect(liste.some((e) => e.id === '0')).toBe(false)
+  })
+
+  // --- A1: kaputtes Chiffrat darf nie still überschrieben werden ---
+  describe('Korruptions-Rettung (A1)', () => {
+    it('kaputtes Chiffrat + Datei vorhanden: aufzeichnen() legt zuerst beiseite, DANN schreibt es, und meldet den Störfall', async () => {
+      const file = fakeFile()
+      file.data = new TextEncoder().encode('NICHT-ENTSCHLUESSELBAR')
+      const reihenfolge: string[] = []
+      const beobachtet: CiphertextFile = {
+        read: () => file.read(),
+        async write(d) {
+          reihenfolge.push('write')
+          await file.write(d)
+        },
+        remove: () => file.remove(),
+        async beiseiteLegen() {
+          reihenfolge.push('beiseiteLegen')
+          await file.beiseiteLegen!()
+        }
+      }
+      let korruptGemeldet = 0
+      const store = createVerlaufStore({
+        cipher: fakeCipher(),
+        file: beobachtet,
+        istAktiv: () => true,
+        aufKorruption: () => korruptGemeldet++
+      })
+
+      expect(await store.aufzeichnen(eintrag('a'))).toBe(true)
+
+      expect(reihenfolge).toEqual(['beiseiteLegen', 'write']) // beiseiteLegen VOR dem Schreiben
+      expect(korruptGemeldet).toBe(1) // Störfall genau einmal gemeldet
+      expect(file.beiseiteGelegt).toBe(1)
+      // Die neu geschriebene Datei enthält NUR den neuen Eintrag — die alte (kaputte) ist weg, nicht
+      // überschrieben (sie wurde vorher beiseitegelegt).
+      expect((await store.liste()).map((e) => e.id)).toEqual(['a'])
+    })
+
+    it('Datei existiert NICHT: kein beiseiteLegen, kein Störfall-Callback (kein Lärm bei Erstnutzung)', async () => {
+      const file = fakeFile() // data bleibt null
+      let korruptGemeldet = 0
+      const store = createVerlaufStore({
+        cipher: fakeCipher(),
+        file,
+        istAktiv: () => true,
+        aufKorruption: () => korruptGemeldet++
+      })
+
+      expect(await store.aufzeichnen(eintrag('a'))).toBe(true)
+
+      expect(file.beiseiteGelegt).toBe(0)
+      expect(korruptGemeldet).toBe(0)
+    })
+
+    it('liste() auf kaputtem Chiffrat legt ebenfalls beiseite + meldet (nicht nur aufzeichnen)', async () => {
+      const file = fakeFile()
+      file.data = new TextEncoder().encode('NICHT-ENTSCHLUESSELBAR')
+      let korruptGemeldet = 0
+      const store = createVerlaufStore({
+        cipher: fakeCipher(),
+        file,
+        istAktiv: () => true,
+        aufKorruption: () => korruptGemeldet++
+      })
+
+      expect(await store.liste()).toEqual([])
+
+      expect(file.beiseiteGelegt).toBe(1)
+      expect(korruptGemeldet).toBe(1)
+    })
+
+    it('Fake-Port OHNE beiseiteLegen: wirft nicht, meldet trotzdem den Störfall (optionale Methode)', async () => {
+      // Minimal-Fake ohne beiseiteLegen — genau wie ein älterer/unvollständiger Fake-Port im Bestand.
+      let data: Uint8Array | null = new TextEncoder().encode('NICHT-ENTSCHLUESSELBAR')
+      const minimalesFile: CiphertextFile = {
+        async read() {
+          return data
+        },
+        async write(d) {
+          data = d
+        },
+        async remove() {
+          data = null
+        }
+      }
+      let korruptGemeldet = 0
+      const store = createVerlaufStore({
+        cipher: fakeCipher(),
+        file: minimalesFile,
+        istAktiv: () => true,
+        aufKorruption: () => korruptGemeldet++
+      })
+
+      await expect(store.aufzeichnen(eintrag('a'))).resolves.toBe(true)
+      expect(korruptGemeldet).toBe(1)
+    })
+
+    it('ohne aufKorruption-Callback: kaputtes Chiffrat wird trotzdem beiseitegelegt (No-Op-Default)', async () => {
+      const file = fakeFile()
+      file.data = new TextEncoder().encode('NICHT-ENTSCHLUESSELBAR')
+      const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+
+      await expect(store.aufzeichnen(eintrag('a'))).resolves.toBe(true)
+      expect(file.beiseiteGelegt).toBe(1)
+    })
+  })
+
+  // --- Befund 14: aufzeichnen/loeschen/loeschenEintrag ohne gegenseitigen Ausschluss verlieren
+  // Änderungen bei Überlappung (Lost Update). Fixture-Fakes sind bereits „echte" async-Funktionen
+  // (mindestens ein Microtask-Tick pro read/encrypt/write) — zwei parallel gestartete Aufrufe
+  // verzahnen sich dadurch deterministisch, ganz ohne setTimeout-Raten.
+  describe('Serialisierung gleichzeitiger Schreibvorgänge (Befund 14)', () => {
+    it('zwei GLEICHZEITIGE aufzeichnen()-Aufrufe verlieren keinen Eintrag', async () => {
+      const file = fakeFile()
+      const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+
+      const p1 = store.aufzeichnen(eintrag('a'))
+      const p2 = store.aufzeichnen(eintrag('b'))
+      await Promise.all([p1, p2])
+
+      const ids = (await store.liste()).map((e) => e.id).sort()
+      expect(ids).toEqual(['a', 'b'])
+    })
+
+    it('aufzeichnen() gleichzeitig mit loeschenEintrag() bleibt konsistent (keine verlorene Änderung)', async () => {
+      const file = fakeFile()
+      const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+      await store.aufzeichnen(eintrag('alt'))
+
+      const p1 = store.aufzeichnen(eintrag('neu'))
+      const p2 = store.loeschenEintrag('alt')
+      await Promise.all([p1, p2])
+
+      const ids = (await store.liste()).map((e) => e.id)
+      expect(ids).toEqual(['neu']) // 'alt' gelöscht, 'neu' nicht verloren gegangen
+    })
+
+    it('drei GLEICHZEITIGE aufzeichnen()-Aufrufe behalten alle drei Einträge', async () => {
+      const file = fakeFile()
+      const store = createVerlaufStore({ cipher: fakeCipher(), file, istAktiv: () => true })
+
+      const ps = [eintrag('a'), eintrag('b'), eintrag('c')].map((e) => store.aufzeichnen(e))
+      await Promise.all(ps)
+
+      const ids = (await store.liste()).map((e) => e.id).sort()
+      expect(ids).toEqual(['a', 'b', 'c'])
+    })
   })
 })

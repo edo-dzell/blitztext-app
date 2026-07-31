@@ -66,6 +66,23 @@ describe('createCloudTranscriptionProvider', () => {
     expect(body?.get('prompt')).toBe('Eigennamen und Begriffe: Widget, Blitztext')
   })
 
+  // --- A4: Upload-Dateiname folgt dem echten Blob-MIME-Typ statt hart 'audio.webm' ---
+
+  it('A4: Blob mit type audio/ogg → das file-Feld trägt den Namen audio.ogg', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response('ok', { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({ getApiKey: async () => 'sk', fetchFn })
+
+    const oggBlob = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/ogg' })
+    await provider.transcribe(oggBlob)
+
+    const file = body?.get('file') as File
+    expect(file.name).toBe('audio.ogg')
+  })
+
   it('lässt language und prompt weg, wenn nicht gesetzt', async () => {
     let body: FormData | undefined
     const fetchFn = (async (_u: string, i: RequestInit) => {
@@ -472,6 +489,166 @@ describe('createCloudTranscriptionProvider', () => {
 
       expect(await provider.transcribe(audioBlob())).toBe('Hallo Welt')
     })
+
+    // --- v0.8.0 (netzwerkProfil): getFetchTimeoutMs (Live-Getter) nimmt Vorrang vor der statischen
+    // fetchTimeoutMs — composition-root reicht ihn als Closure über die lebende Settings-Kopie durch. ---
+
+    it('getFetchTimeoutMs nimmt Vorrang vor der statischen fetchTimeoutMs (fake timers)', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetchFn = ((_u: string, i: RequestInit) => {
+          return new Promise<Response>((_resolve, reject) => {
+            const sig = i.signal as AbortSignal
+            sig.addEventListener('abort', () => reject(sig.reason))
+          })
+        }) as unknown as typeof fetch
+
+        const provider = createCloudTranscriptionProvider({
+          getApiKey: async () => 'sk',
+          fetchTimeoutMs: 60_000, // würde OHNE den Getter gelten
+          getFetchTimeoutMs: () => 2_000,
+          fetchFn
+        })
+
+        const p = provider.transcribe(audioBlob())
+        const assertion = expect(p).rejects.toMatchObject({ transport: true })
+        // Bei 2_000ms (Getter) bricht der Timeout bereits ab — bei 60_000 (statisch) wäre er hier noch nicht gefeuert.
+        await vi.advanceTimersByTimeAsync(2_000)
+        await assertion
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('wird bei JEDEM Aufruf frisch gelesen (dieselbe Provider-Instanz, Live-Änderung ohne Neubau)', async () => {
+      vi.useFakeTimers()
+      try {
+        let ms = 60_000
+        const haengend = ((_u: string, i: RequestInit) => {
+          return new Promise<Response>((_resolve, reject) => {
+            const sig = i.signal as AbortSignal
+            sig.addEventListener('abort', () => reject(sig.reason))
+          })
+        }) as unknown as typeof fetch
+        const provider = createCloudTranscriptionProvider({
+          getApiKey: async () => 'sk',
+          getFetchTimeoutMs: () => ms,
+          fetchFn: haengend
+        })
+
+        const p1 = provider.transcribe(audioBlob())
+        const assertion1 = expect(p1).rejects.toMatchObject({ transport: true })
+        await vi.advanceTimersByTimeAsync(60_000)
+        await assertion1
+
+        ms = 5_000 // Live-Änderung, wie composition-root sie über dieselbe Closure durchreicht
+        const p2 = provider.transcribe(audioBlob())
+        const assertion2 = expect(p2).rejects.toMatchObject({ transport: true })
+        await vi.advanceTimersByTimeAsync(5_000) // wäre mit dem ALTEN Wert (60_000) noch nicht gefeuert
+        await assertion2
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  // --- B1: Mistral/Voxtral kennt kein `prompt`-Feld (Whisper-spezifisch) — die Begriffsliste
+  // muss stattdessen im dokumentierten `context_bias`-Array-Feld ankommen, sonst verpufft das
+  // Wörterbuch des Nutzers still (keine Fehlermeldung, unbekannte Multipart-Felder werden ignoriert).
+
+  it('B1 RED-Beweis: Voxtral bekommt HEUTE (Bug) die Begriffe im prompt-Feld statt in context_bias', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response(JSON.stringify({ text: 'ok' }), { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({
+      getApiKey: async () => 'sk',
+      getConfig: () => ({ baseUrl: 'https://api.mistral.ai/v1', model: 'voxtral-mini-latest' }),
+      fetchFn
+    })
+
+    await provider.transcribe(audioBlob(), { vocabularyHints: ['Acme', 'Blitztext'] })
+
+    // Soll-Zustand (nach dem Fix): context_bias trägt die Begriffe, prompt bleibt leer.
+    expect(body?.getAll('context_bias')).toEqual(['Acme', 'Blitztext'])
+    expect(body?.get('prompt')).toBeNull()
+  })
+
+  it('B1: Voxtral mit leerem Wörterbuch → weder prompt noch context_bias werden gesendet', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response(JSON.stringify({ text: 'ok' }), { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({
+      getApiKey: async () => 'sk',
+      getConfig: () => ({ baseUrl: 'https://api.mistral.ai/v1', model: 'voxtral-mini-latest' }),
+      fetchFn
+    })
+
+    await provider.transcribe(audioBlob())
+
+    expect(body?.getAll('context_bias')).toEqual([])
+    expect(body?.get('prompt')).toBeNull()
+  })
+
+  it('B1: Voxtral kappt context_bias auf die dokumentierte 100er-Obergrenze (neueste zuerst)', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response(JSON.stringify({ text: 'ok' }), { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({
+      getApiKey: async () => 'sk',
+      getConfig: () => ({ baseUrl: 'https://api.mistral.ai/v1', model: 'voxtral-mini-latest' }),
+      fetchFn
+    })
+    const begriffe = Array.from({ length: 130 }, (_, i) => `Begriff-${i}`)
+
+    await provider.transcribe(audioBlob(), { vocabularyHints: begriffe })
+
+    const gesendet = body?.getAll('context_bias')
+    expect(gesendet).toHaveLength(100)
+    expect(gesendet).toEqual(begriffe.slice(30)) // die 100 neuesten (Begriff-30 … Begriff-129)
+  })
+
+  it('B1 Regression: whisper-1 bleibt exakt wie heute (prompt gesetzt, KEIN context_bias)', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response('ok', { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({
+      getApiKey: async () => 'sk',
+      getConfig: () => ({ baseUrl: 'https://api.openai.com/v1', model: 'whisper-1' }),
+      fetchFn
+    })
+
+    await provider.transcribe(audioBlob(), { vocabularyHints: ['Acme', 'Blitztext'] })
+
+    expect(body?.get('prompt')).toBe('Eigennamen und Begriffe: Acme, Blitztext')
+    expect(body?.getAll('context_bias')).toEqual([])
+    expect(body?.get('response_format')).toBe('text')
+  })
+
+  it('B1 Regression: gpt-4o-mini-transcribe bleibt exakt wie heute (prompt gesetzt, KEIN context_bias)', async () => {
+    let body: FormData | undefined
+    const fetchFn = (async (_u: string, i: RequestInit) => {
+      body = i.body as FormData
+      return new Response(JSON.stringify({ text: 'ok' }), { status: 200 })
+    }) as unknown as typeof fetch
+    const provider = createCloudTranscriptionProvider({
+      getApiKey: async () => 'sk',
+      getConfig: () => ({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini-transcribe' }),
+      fetchFn
+    })
+
+    await provider.transcribe(audioBlob(), { vocabularyHints: ['Acme', 'Blitztext'] })
+
+    expect(body?.get('prompt')).toBe('Eigennamen und Begriffe: Acme, Blitztext')
+    expect(body?.getAll('context_bias')).toEqual([])
+    expect(body?.get('response_format')).toBe('json')
   })
 
   // --- F2: URL-Guard im Main durchsetzen (Security-Review P1) ---

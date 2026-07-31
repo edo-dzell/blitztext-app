@@ -11,6 +11,7 @@ import {
 } from '@shared/pricing'
 import { preisModellListen } from '@/lib/preis-modelle'
 import { preiseGeaendert } from '@/lib/dirty'
+import { sortiereStatistikZeilen } from '@shared/statistik-zeilen'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -89,10 +90,17 @@ function NutzungPane({ settings }: { settings: BlitztextSettings }) {
 
   if (!summary) return <p className="text-sm text-muted-foreground">Lade…</p>
 
+  // A5: der Store liefert Zeilen in Einfüge-Reihenfolge; im Grenzmonat (90-Tage-Kompaktierungsschwelle)
+  // stehen dort arithmetisch korrekt sowohl eine 'YYYY-MM'-Monatszeile als auch mehrere
+  // 'YYYY-MM-DD'-Tageszeilen desselben Monats nebeneinander — ohne Sortierung wirkt das wie doppelte/
+  // durcheinandergewürfelte Zeilen. sortiereStatistikZeilen macht die Reihenfolge deterministisch
+  // (neueste zuerst, sekundär workflowId) und mutiert `summary.zeilen` nicht.
+  const zeilenSortiert = sortiereStatistikZeilen(summary.zeilen)
+
   const gesamtTokens = summary.gesamtPromptTokens + summary.gesamtCompletionTokens
   let gesamtEur = 0
   let unbekannt = false
-  for (const z of summary.zeilen) {
+  for (const z of zeilenSortiert) {
     const e = zeileEur(z)
     if (e === null) unbekannt = true
     else gesamtEur += e
@@ -141,7 +149,7 @@ function NutzungPane({ settings }: { settings: BlitztextSettings }) {
               </tr>
             </thead>
             <tbody>
-              {summary.zeilen.map((z, i) => {
+              {zeilenSortiert.map((z, i) => {
                 const e = zeileEur(z)
                 return (
                   <tr key={i} className="border-b last:border-0">
@@ -159,7 +167,7 @@ function NutzungPane({ settings }: { settings: BlitztextSettings }) {
                   </tr>
                 )
               })}
-              {summary.zeilen.length === 0 && (
+              {zeilenSortiert.length === 0 && (
                 <tr>
                   <td colSpan={8} className="p-5 text-center text-muted-foreground">
                     Noch keine Daten.

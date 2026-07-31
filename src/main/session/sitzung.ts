@@ -7,7 +7,13 @@ import { findWorkflow, type WorkflowId } from '@shared/workflows'
 import { aufloeseWorkflowLauf, type AnbieterKonfig } from '@shared/anbieter'
 import type { WorkflowRunner, WorkflowPhase } from '@main/workflow/runner'
 import type { SettingsStore } from '@main/settings/store'
-import { fehlerMeldung, teilErfolgMeldung, type FehlerMeldung } from '@main/session/fehler-meldung'
+import {
+  fehlerMeldung,
+  teilErfolgMeldung,
+  fehlenderApiKeyMeldung,
+  unbekannterWorkflowMeldung,
+  type FehlerMeldung
+} from '@main/session/fehler-meldung'
 import { NOOP_EREIGNISLOG, redigiereFehler, type EreignisLog } from '@main/diagnostics/ereignis-log'
 
 export type Auslösequelle = 'hotkey' | 'manuell'
@@ -123,12 +129,31 @@ export interface Sitzung {
   onStatus?: (phase: WorkflowPhase) => void
 }
 
+/**
+ * Kontext des laufenden Workflows (Label + genutzte Modelle) fürs Protokoll beim Abschluss.
+ * Befund 10 (v0.8.0): trägt zusätzlich die Lauf-Kennung + den Auslöse-Zeitpunkt für die Gesamtdauer-
+ * Messung der Kette (Transkription/Umschreiben/Einfügen) — siehe `verarbeiteTerminal` unten.
+ */
+interface AktiverLaufKontext {
+  label: string
+  asrModell: string
+  chatModell: string
+  /**
+   * Dieselbe laufGeneration, die starteWorkflow beim Auslösen vergeben hat (kein neuer Zähler) — via
+   * RunInput.laufKennung an den Runner durchgereicht, dessen Log-Zeilen (workflow.phase/aufnahme/
+   * transkribiert/umgeschrieben) tragen daher DIESELBE Kennung.
+   */
+  laufKennung: number
+  /** Date.now() beim Auslösen (Reservierung) — Basis für die Gesamtdauer-Messung. */
+  beginnMs: number
+}
+
 export function createSitzung(deps: SitzungDeps): Sitzung {
   // v0.7.2: TEXT-FREIES Ereignislog. Ohne Dep ein No-Op → Bestandsverhalten unverändert.
   const log = deps.log ?? NOOP_EREIGNISLOG
   let aktiveQuelle: Auslösequelle | null = null
   // Kontext des laufenden Workflows für das Protokoll beim Abschluss (Label + genutzte Modelle).
-  let aktiverKontext: { label: string; asrModell: string; chatModell: string } | null = null
+  let aktiverKontext: AktiverLaufKontext | null = null
   // Weg B (W3-A): das beim Auslösen erfasste Fenster + fokusRueckkehr-Schalter, an einfügen durchgereicht.
   // v0.7.2 (Erstlauf-Fix B): die HWND-Erfassung (win-paste.exe --hwnd) lief bislang als dritter Await
   // VOR runner.start() im kritischen Pfad — der allererste Spawn (Defender-Erstscan, bis 2000ms-Timeout)
@@ -140,7 +165,7 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   // Terminal-Zustand identisch routen kann (gleiche Quelle/Label/Modelle/Fokus), ohne aktive Reservierung.
   let letzterLauf: {
     quelle: Auslösequelle
-    kontext: { label: string; asrModell: string; chatModell: string } | null
+    kontext: AktiverLaufKontext | null
     fokusKontext: EinfügeKontext | null
   } | null = null
   // W2-A: Generationszähler gegen zwei Start-Races. starteWorkflow hat vor runner.start() DREI awaits
@@ -161,11 +186,15 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   const sitzung: Sitzung = {
     async starteWorkflow(workflow, quelle) {
       if (aktiveQuelle !== null) return // ein Lauf zur Zeit; während aktiv neue Auslösungen ignorieren
-      // v0.7.2 debug: ein Lauf beginnt (nach dem „ein Lauf zur Zeit"-Guard). Nur Workflow-Id + Quelle-Enum.
-      log.debug('sitzung.start', { workflow, quelle })
       // Reservierung SOFORT, synchron, vor dem ersten await → schließt das Doppel-Start-Fenster (1).
       aktiveQuelle = quelle
       const meineGeneration = ++laufGeneration
+      // Befund 10 (v0.8.0): Zeitpunkt des Auslösens — Basis der Gesamtdauer-Messung der Kette
+      // (Transkription/Umschreiben/Einfügen), protokolliert bei 'fertig' in verarbeiteTerminal.
+      const laufBeginnMs = Date.now()
+      // v0.7.2 debug: ein Lauf beginnt (nach dem „ein Lauf zur Zeit"-Guard). Nur Workflow-Id + Quelle-Enum
+      // + (Befund 10) die Lauf-Kennung — dieselbe, die gleich an den Runner durchgereicht wird.
+      log.debug('sitzung.start', { workflow, quelle, lauf: meineGeneration })
       // True, sobald dieser Lauf inzwischen entwertet wurde (Abbruch (2) oder eine spätere Reservierung).
       const veraltet = (): boolean => laufGeneration !== meineGeneration
       // Reservierung nur zurücknehmen, wenn sie noch MIR gehört — sonst ein späterer Lauf leer räumen.
@@ -176,94 +205,139 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
         }
       }
 
-      const settings = await deps.einstellungen.load()
-      // (2) Abbruch während des load-Awaits: sauber aussteigen, ohne runner.start(). brichAb() hat die
-      // Reservierung bereits geräumt und die Generation erhöht → nichts weiter zu tun.
-      if (veraltet()) {
-        log.info('sitzung.start_entwertet', { quelle })
-        return
-      }
-      // Workflow-Definition auflösen; unbekannte Id (z. B. verwaister Hotkey) → still abbrechen.
-      const def = findWorkflow(workflow, settings.workflows)
-      if (!def) {
-        // v0.7.2: verwaister Hotkey / unbekannte Workflow-Id — sonst still. `workflow` ist eine Id, kein Text.
-        log.warnung('sitzung.workflow_unbekannt', { workflow, quelle })
-        gibReservierungFrei()
-        if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
-        return
-      }
-      // Pro Lauf den Anbieter + die TATSÄCHLICH genutzten Modelle auflösen (ADR-0010).
-      const lauf = aufloeseWorkflowLauf(def, {
-        anbieter: settings.anbieter,
-        standardAnbieterId: settings.standardAnbieterId,
-        language: settings.language
-      })
-      // Gate: ohne Key des AUFGELÖSTEN Anbieters gar nicht erst aufnehmen (Cloud-only, ADR-0001).
-      // L1: key-loser lokaler Anbieter braucht kein Gate; sonst ohne Key gar nicht erst aufnehmen.
-      if (!lauf.anbieter.keinKeyNoetig) {
-        const hatKey = await deps.apiKeys.has(lauf.anbieter.id)
-        // (2) Abbruch während des has-Awaits: aussteigen, ohne runner.start().
+      // v0.7.4: Der gesamte Start läuft in einem try/catch. Grund (realer Feld-Pfad): `einstellungen.load()`
+      // und `apiKeys.has()` lesen Dateien, und beide Adapter re-werfen ALLES außer ENOENT
+      // (settings-file.ts / ciphertext-file.ts) — ein Defender-/OneDrive-/Indexer-Lock liefert dort EBUSY
+      // oder EPERM. Ohne diesen Fang blieb `aktiveQuelle` reserviert (die Freigabe steht in den
+      // Erfolgspfaden), die Ablehnung lief ungefangen in den prozessweiten Wächter (index.ts) und der
+      // beendet die App über `app.exit(1)` — ein einzelner gesperrter Dateizugriff riss also Blitztext
+      // herunter. Jetzt: Reservierung freigeben, text-frei protokollieren, Nutzer ehrlich informieren
+      // (Projektlinie „keine stillen Ausfälle"), App bleibt am Leben. Der nächste Hotkey funktioniert.
+      try {
+        const settings = await deps.einstellungen.load()
+        // (2) Abbruch während des load-Awaits: sauber aussteigen, ohne runner.start(). brichAb() hat die
+        // Reservierung bereits geräumt und die Generation erhöht → nichts weiter zu tun.
         if (veraltet()) {
           log.info('sitzung.start_entwertet', { quelle })
           return
         }
-        if (!hatKey) {
-          // v0.7.2: ohne Key gar nicht erst aufnehmen — sonst (Hotkey) ein stiller Abbruch. Nur Ids.
-          log.warnung('sitzung.start_ohne_key', { anbieter: lauf.anbieter.id, quelle })
+        // Workflow-Definition auflösen; unbekannte Id (z. B. verwaister Hotkey) → still abbrechen.
+        const def = findWorkflow(workflow, settings.workflows)
+        if (!def) {
+          // v0.7.2: verwaister Hotkey / unbekannte Workflow-Id — sonst still. `workflow` ist eine Id, kein Text.
+          log.warnung('sitzung.workflow_unbekannt', { workflow, quelle })
           gibReservierungFrei()
+          // v0.8.0 (Auftrag 2): derselbe stille Fehler wie der fehlende API-Key unten — „derselbe
+          // Fehler in grün" (Nutzer-Befund). manuell holt weiterhin die Einstellungen nach vorn
+          // (unverändert); hotkey bekam bis hierhin GAR KEINE Rückmeldung. Jetzt: eine sichtbare,
+          // nicht-blockierende Meldung, OHNE das Fenster nach vorn zu holen (kein Fokus-Diebstahl).
           if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
-          return // Hotkey: still abbrechen
+          else deps.ausgabe.melde(unbekannterWorkflowMeldung())
+          return
         }
-      }
-      // v0.4.5 (ADR-0018): ehrlich statt still. Wurde ein Umschreib-Workflow auf den Anbieter-Standard
-      // ABGEWERTET (gepinntes, dem Anbieter fremdes Modell), den Nutzer bei MANUELLER Auslösung
-      // nicht-blockierend informieren (Hotkey bleibt bewusst unsichtbar). Sonst ein No-Op.
-      if (quelle === 'manuell' && def.rewrites && lauf.chatModellAbgewertet) {
+        // Pro Lauf den Anbieter + die TATSÄCHLICH genutzten Modelle auflösen (ADR-0010).
+        const lauf = aufloeseWorkflowLauf(def, {
+          anbieter: settings.anbieter,
+          standardAnbieterId: settings.standardAnbieterId,
+          language: settings.language
+        })
+        // Gate: ohne Key des AUFGELÖSTEN Anbieters gar nicht erst aufnehmen (Cloud-only, ADR-0001).
+        // L1: key-loser lokaler Anbieter braucht kein Gate; sonst ohne Key gar nicht erst aufnehmen.
+        if (!lauf.anbieter.keinKeyNoetig) {
+          const hatKey = await deps.apiKeys.has(lauf.anbieter.id)
+          // (2) Abbruch während des has-Awaits: aussteigen, ohne runner.start().
+          if (veraltet()) {
+            log.info('sitzung.start_entwertet', { quelle })
+            return
+          }
+          if (!hatKey) {
+            // v0.7.2: ohne Key gar nicht erst aufnehmen. Nur Ids geloggt (text-frei).
+            log.warnung('sitzung.start_ohne_key', { anbieter: lauf.anbieter.id, quelle })
+            gibReservierungFrei()
+            // v0.8.0 (Auftrag 2, Befund 17, Nutzer-Freigabe): bis hierhin brach der Hotkey-Fall HIER
+            // wortlos ab („Hotkey: still abbrechen") — der Nutzer drückte die Taste, sprach, und nichts
+            // passierte, ohne jede Erklärung. Jetzt: eine sichtbare, nicht-blockierende Meldung, die
+            // den betroffenen Anbieter benennt. manuell holt weiterhin (unverändert) die Einstellungen
+            // nach vorn; das bleibt der manuellen Auslösung vorbehalten — kein Fokus-Diebstahl bei
+            // Hotkey, deshalb hier `melde()` statt `zeigeEinstellungen()`.
+            if (quelle === 'manuell') deps.ausgabe.zeigeEinstellungen()
+            else deps.ausgabe.melde(fehlenderApiKeyMeldung(lauf.anbieter.label))
+            return
+          }
+        }
+        // v0.4.5 (ADR-0018): ehrlich statt still. Wurde ein Umschreib-Workflow auf den Anbieter-Standard
+        // ABGEWERTET (gepinntes, dem Anbieter fremdes Modell), den Nutzer nicht-blockierend informieren.
+        // v0.8.0 (Auftrag 2): bis hierhin nur bei MANUELLER Auslösung — genau das verhinderte, dass
+        // jemand mit einem hotkey-getriggerten Built-in bemerken konnte, dass ein anderes Modell lief
+        // als im Workflow gepinnt (der Auslöser dieses gesamten Umbaus). `melde()` steckt bei Hotkey nie
+        // hinter `zeigeEinstellungen()` (kein Fokus-Diebstahl) — die Quelle-Unterscheidung entfällt hier
+        // deshalb ersatzlos.
+        if (def.rewrites && lauf.chatModellAbgewertet) {
+          deps.ausgabe.melde({
+            titel: 'Modell ersetzt',
+            koerper: `Das gewählte Modell ist bei „${lauf.anbieter.label}" nicht verfügbar — es läuft „${lauf.chatModell}".`
+          })
+        }
+        deps.aktiviereAnbieter?.(lauf.anbieter)
+        aktiverKontext = {
+          label: def.label,
+          asrModell: lauf.asrModell,
+          chatModell: lauf.chatModell,
+          // Befund 10: für die Gesamtdauer-Messung + die Runner-Log-Korrelation (RunInput.laufKennung).
+          laufKennung: meineGeneration,
+          beginnMs: laufBeginnMs
+        }
+        // Weg B (W3-A): NUR bei Hotkey (das Ergebnis wird eingefügt) das aktuelle Vordergrundfenster
+        // erfassen — das ist das Paste-Ziel. Bei manueller Quelle wird angezeigt, nicht getippt → egal.
+        // v0.7.2 (Erstlauf-Fix B): die Erfassung ist ein Helfer-Spawn (win-paste.exe --hwnd) und beim
+        // ALLERERSTEN Lauf zäh (Defender-Erstscan, bis 2000ms-Timeout). Sie darf runner.start() (und damit
+        // Pille + Aufnahmebeginn) NICHT mehr blockieren: das Versprechen SOFORT anstoßen (nicht awaiten),
+        // Fehler → null (nie werfen). Es sind damit wieder ZWEI Await-Punkte vor runner.start (load/has).
+        // Die Debug-Messung `sitzung.fenster_erfasst` hängt an der Auflösung des Versprechens (weiter loggen;
+        // Feldwerte reine Zahl/Boolean: Dauer in ms + ob ein Fenster erfasst wurde).
+        let hwndVersprechen: Promise<number | null> | null = null
+        if (quelle === 'hotkey') {
+          const beginn = Date.now()
+          hwndVersprechen = deps.ausgabe
+            .erfasseFenster()
+            .catch(() => null)
+            .then((erfasstesHwnd) => {
+              log.debug('sitzung.fenster_erfasst', {
+                dauerMs: Date.now() - beginn,
+                gefunden: erfasstesHwnd !== null
+              })
+              return erfasstesHwnd
+            })
+        }
+        aktiverFokusKontext =
+          quelle === 'hotkey' && hwndVersprechen
+            ? { fokusRueckkehr: settings.fokusRueckkehr, hwndVersprechen }
+            : null
+
+        deps.runner.start({
+          def,
+          chatModell: lauf.chatModell,
+          language: lauf.language,
+          customTerms: settings.customTerms,
+          rewriteSettings: settings,
+          // Befund 7a: deviceId ist hier schon geladen — direkt mitgeben statt den Recorder-Renderer per
+          // IPC (settings:get) danach fragen zu lassen.
+          mikrofonDeviceId: settings.mikrofonDeviceId,
+          // Befund 10: dieselbe laufGeneration, die oben schon für 'sitzung.start' geloggt wurde.
+          laufKennung: meineGeneration
+        })
+      } catch (err) {
+        // Nur redigierter Fehler (name + gekürzte message) — nie Pfade, Keys oder Texte.
+        log.fehler('sitzung.start_fehl', redigiereFehler(err))
+        gibReservierungFrei()
+        // Bewusst KEINE der vier FehlerArt-Schubladen: Ein gescheiterter Dateizugriff ist weder ein
+        // Aufnahme- noch ein Anbieter- noch ein Konfigurationsfehler; 'konfiguration' würde den Nutzer
+        // fälschlich in die Einstellungen schicken.
         deps.ausgabe.melde({
-          titel: 'Modell ersetzt',
-          koerper: `Das gewählte Modell ist bei „${lauf.anbieter.label}" nicht verfügbar — es läuft „${lauf.chatModell}".`
+          titel: 'Start fehlgeschlagen',
+          koerper: 'Blitztext konnte die Aufnahme nicht starten — bitte noch einmal auslösen.'
         })
       }
-      deps.aktiviereAnbieter?.(lauf.anbieter)
-      aktiverKontext = {
-        label: def.label,
-        asrModell: lauf.asrModell,
-        chatModell: lauf.chatModell
-      }
-      // Weg B (W3-A): NUR bei Hotkey (das Ergebnis wird eingefügt) das aktuelle Vordergrundfenster
-      // erfassen — das ist das Paste-Ziel. Bei manueller Quelle wird angezeigt, nicht getippt → egal.
-      // v0.7.2 (Erstlauf-Fix B): die Erfassung ist ein Helfer-Spawn (win-paste.exe --hwnd) und beim
-      // ALLERERSTEN Lauf zäh (Defender-Erstscan, bis 2000ms-Timeout). Sie darf runner.start() (und damit
-      // Pille + Aufnahmebeginn) NICHT mehr blockieren: das Versprechen SOFORT anstoßen (nicht awaiten),
-      // Fehler → null (nie werfen). Es sind damit wieder ZWEI Await-Punkte vor runner.start (load/has).
-      // Die Debug-Messung `sitzung.fenster_erfasst` hängt an der Auflösung des Versprechens (weiter loggen;
-      // Feldwerte reine Zahl/Boolean: Dauer in ms + ob ein Fenster erfasst wurde).
-      let hwndVersprechen: Promise<number | null> | null = null
-      if (quelle === 'hotkey') {
-        const beginn = Date.now()
-        hwndVersprechen = deps.ausgabe
-          .erfasseFenster()
-          .catch(() => null)
-          .then((erfasstesHwnd) => {
-            log.debug('sitzung.fenster_erfasst', {
-              dauerMs: Date.now() - beginn,
-              gefunden: erfasstesHwnd !== null
-            })
-            return erfasstesHwnd
-          })
-      }
-      aktiverFokusKontext =
-        quelle === 'hotkey' && hwndVersprechen
-          ? { fokusRueckkehr: settings.fokusRueckkehr, hwndVersprechen }
-          : null
-
-      deps.runner.start({
-        def,
-        chatModell: lauf.chatModell,
-        language: lauf.language,
-        customTerms: settings.customTerms,
-        rewriteSettings: settings
-      })
     },
     async stoppe() {
       // Desync-Schutz: ohne aktiven Lauf ist nichts zu stoppen. Der Hotkey-Dispatcher arbitriert
@@ -380,7 +454,7 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
   function verarbeiteTerminal(
     terminal: WorkflowPhase,
     quelle: Auslösequelle,
-    kontext: { label: string; asrModell: string; chatModell: string } | null,
+    kontext: AktiverLaufKontext | null,
     fokusKontext: EinfügeKontext | null
   ): void {
     if (terminal.status !== 'fertig' && terminal.status !== 'teilErfolg' && terminal.status !== 'fehler') {
@@ -394,6 +468,16 @@ export function createSitzung(deps: SitzungDeps): Sitzung {
       // Weg B (W3-A): beim Hotkey den Fokus-Kontext mitreichen → der Adapter degradiert bei Drift.
       if (quelle === 'hotkey') deps.ausgabe.einfügen(terminal.text, fokusKontext ?? undefined)
       else deps.ausgabe.anzeigen(terminal.text)
+      // Befund 10 (v0.8.0): Gesamtdauer der Kette (Transkription/Umschreiben/Einfügen) vom Auslösen
+      // (Reservierung in starteWorkflow) bis zum fertigen Einfügen/Anzeigen — bislang gab es nur
+      // Einzeldauern (Runner: workflow.transkribiert/umgeschrieben), aber keine Summe und keinen
+      // gemeinsamen Bezug. `lauf` ist dieselbe laufGeneration wie in den Runner-Log-Zeilen dieses Laufs
+      // (RunInput.laufKennung) — im Ereignislog nach `lauf=N` filtern, um alle Zeilen EINES Diktats zu
+      // finden. Immer info-Stufe (nicht debug): ein einzelnes, seltenes Ereignis pro Diktat, das auch
+      // OHNE „Ausführliches Protokoll" sichtbar bleiben soll.
+      if (kontext) {
+        log.info('sitzung.lauf_fertig', { lauf: kontext.laufKennung, dauerMs: Date.now() - kontext.beginnMs })
+      }
       // Fire-and-forget: das Einfügen ist bereits erfolgt; das Protokoll schreibt asynchron und
       // feuert danach onHistoryChanged. stoppe() bleibt Promise<void> (Kontext als Closure-Arg).
       void protokolliere(kontext)

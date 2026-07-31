@@ -64,6 +64,35 @@ export function fokusDriftMeldung(): FehlerMeldung {
 }
 
 /**
+ * Fehlender API-Key bei HOTKEY-Auslösung (v0.8.0, Befund 17, Nutzer-Freigabe). Bis hierhin brach ein
+ * per Hotkey ausgelöstes Diktat ohne Schlüssel WORTLOS ab (`sitzung.ts`, Kommentar „Hotkey: still
+ * abbrechen") — der Nutzer drückte die Taste, sprach, und nichts passierte, ohne jede Erklärung. Nach
+ * dem Muster von {@link fokusDriftMeldung}: eine reine, nicht-blockierende Sichtbarkeits-Meldung, KEINE
+ * Sprung-Aktion (das Nachvorn-Holen des Einstellungsfensters bleibt der manuellen Auslösung
+ * vorbehalten — kein Fokus-Diebstahl bei Hotkey, s. sitzung.ts). Nennt den betroffenen Anbieter, damit
+ * bei mehreren konfigurierten Anbietern klar ist, WELCHER Key fehlt.
+ */
+export function fehlenderApiKeyMeldung(anbieterLabel: string): FehlerMeldung {
+  return {
+    titel: 'Kein API-Key hinterlegt',
+    koerper: `Für „${anbieterLabel}" ist kein API-Key hinterlegt — es wurde nichts aufgenommen.`
+  }
+}
+
+/**
+ * Verwaister Hotkey / unbekannter Workflow bei HOTKEY-Auslösung (v0.8.0). Derselbe stille Fehler wie
+ * der fehlende API-Key (s. {@link fehlenderApiKeyMeldung}) — ein Chord zeigte auf eine Workflow-Id, die
+ * es nicht (mehr) gibt (z. B. ein gelöschter eigener Workflow mit übrig gebliebener Hotkey-Zuordnung).
+ * Ebenfalls reine, nicht-blockierende Sichtbarkeits-Meldung ohne Sprung-Aktion.
+ */
+export function unbekannterWorkflowMeldung(): FehlerMeldung {
+  return {
+    titel: 'Workflow nicht gefunden',
+    koerper: 'Dieser Kurzbefehl gehört zu keinem vorhandenen Workflow mehr — es wurde nichts aufgenommen.'
+  }
+}
+
+/**
  * @param retrybar Bei transienten Fehlern (netzwerk/anbieter) hält die Sitzung das Audio flüchtig im
  * Speicher (W3-B) → die Meldung trägt `aktion:'erneut'`, damit die UI (Staffel 3.2) einen erneuten
  * Versuch ab Transkription anbieten kann (kein neues Diktat nötig).

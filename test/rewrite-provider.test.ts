@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest'
-import { createCloudRewriteProvider } from '@main/rewrite/cloud-provider'
+import { describe, it, expect, vi } from 'vitest'
+import { createCloudRewriteProvider, DEFAULT_FETCH_TIMEOUT_MS } from '@main/rewrite/cloud-provider'
+import { klassifiziere } from '@main/workflow/fehler-klassifikation'
 
 function respondingWith(content: string): typeof fetch {
   return (async () =>
@@ -137,7 +138,10 @@ describe('createCloudRewriteProvider', () => {
 
   // --- v0.2.x #01: Abbruch-Signal ---
 
-  it('reicht das AbortSignal an fetch weiter', async () => {
+  it('reicht das AbortSignal an fetch weiter (kombiniert mit dem eigenen Timeout-Signal)', async () => {
+    // A3: intern wird das übergebene Signal mit einem eigenen Timeout-Signal kombiniert
+    // (AbortSignal.any) — deshalb keine Objekt-Identität mehr, aber ein Abbruch des übergebenen
+    // Controllers muss weiterhin das an fetch gereichte Signal abbrechen.
     let init: RequestInit | undefined
     const fetchFn = (async (_u: string, i: RequestInit) => {
       init = i
@@ -153,7 +157,9 @@ describe('createCloudRewriteProvider', () => {
       { model: 'm', temperature: 0.3, signal: controller.signal }
     )
 
-    expect(init?.signal).toBe(controller.signal)
+    expect(init?.signal?.aborted).toBe(false)
+    controller.abort(new DOMException('Abbruch durch Nutzer.', 'AbortError'))
+    expect(init?.signal?.aborted).toBe(true)
   })
 
   it('reicht AbortError unverändert weiter (nicht als Netzwerkfehler)', async () => {
@@ -370,5 +376,238 @@ describe('createCloudRewriteProvider', () => {
     const r = await provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
     expect(r.text).toBe('lokal-ok')
     expect(called).toBe(true)
+  })
+
+  // --- A3: eigener Fetch-Timeout (unter dem 90s-Runner-Watchdog), wie transcription/cloud-provider.ts ---
+
+  describe('Fetch-Timeout', () => {
+    it('DEFAULT_FETCH_TIMEOUT_MS liegt unter dem 90s-Runner-Watchdog', () => {
+      expect(DEFAULT_FETCH_TIMEOUT_MS).toBeLessThan(90_000)
+    })
+
+    it('bricht die fetch mit dem eigenen Timeout ab, wenn sie hängt (fake timers)', async () => {
+      vi.useFakeTimers()
+      try {
+        let signalSeenAsAborted: boolean | undefined
+        const fetchFn = ((_u: string, i: RequestInit) => {
+          return new Promise<Response>((_resolve, reject) => {
+            const sig = i.signal as AbortSignal
+            sig.addEventListener('abort', () => {
+              signalSeenAsAborted = sig.aborted
+              reject(sig.reason)
+            })
+          })
+        }) as unknown as typeof fetch
+
+        const provider = createCloudRewriteProvider({
+          getApiKey: async () => 'sk',
+          fetchTimeoutMs: 5_000,
+          fetchFn
+        })
+
+        const p = provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+        // Erwartete Ablehnung erst NACH dem Timer beobachten (sonst unhandled rejection vor advance).
+        const assertion = expect(p).rejects.toMatchObject({ transport: true })
+        await vi.advanceTimersByTimeAsync(5_000)
+        await assertion
+        expect(signalSeenAsAborted).toBe(true)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('der eigene Timeout wird als netzwerk-artig klassifiziert (Retry greift)', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetchFn = ((_u: string, i: RequestInit) => {
+          return new Promise<Response>((_resolve, reject) => {
+            const sig = i.signal as AbortSignal
+            sig.addEventListener('abort', () => reject(sig.reason))
+          })
+        }) as unknown as typeof fetch
+
+        const provider = createCloudRewriteProvider({
+          getApiKey: async () => 'sk',
+          fetchTimeoutMs: 1_000,
+          fetchFn
+        })
+
+        const p = provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+        const assertion = (async () => {
+          try {
+            await p
+            expect.unreachable('sollte werfen')
+          } catch (err) {
+            expect(klassifiziere(err, { istWatchdogTimeout: false })).toBe('netzwerk')
+          }
+        })()
+        await vi.advanceTimersByTimeAsync(1_000)
+        await assertion
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('räumt den Timeout-Timer bei Erfolg auf (kein hängender Timer)', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetchFn = respondingWith('fertig')
+        const provider = createCloudRewriteProvider({
+          getApiKey: async () => 'sk',
+          fetchTimeoutMs: 5_000,
+          fetchFn
+        })
+
+        const result = await provider.rewrite(
+          { system: 's', user: 'u' },
+          { model: 'm', temperature: 0.3 }
+        )
+        expect(result.text).toBe('fertig')
+        // Nach Erfolg dürfen keine offenen Timer mehr aus dem Provider stammen.
+        expect(vi.getTimerCount()).toBe(0)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('ein durchgereichter Nutzer-Abbruch bleibt AbortError (nicht vom eigenen Timeout überschrieben)', async () => {
+      const fetchFn = (async (_u: string, i: RequestInit) => {
+        const sig = i.signal as AbortSignal
+        // Wie echtes fetch: sofort ablehnen, falls das Signal beim Aufruf bereits abgebrochen ist —
+        // sonst erst bei einem SPÄTEREN abort-Event.
+        return new Promise<Response>((_resolve, reject) => {
+          if (sig.aborted) return reject(sig.reason)
+          sig.addEventListener('abort', () => reject(sig.reason))
+        })
+      }) as unknown as typeof fetch
+      const provider = createCloudRewriteProvider({
+        getApiKey: async () => 'sk',
+        fetchTimeoutMs: 60_000,
+        fetchFn
+      })
+      const controller = new AbortController()
+
+      const p = provider.rewrite(
+        { system: 's', user: 'u' },
+        { model: 'm', temperature: 0.3, signal: controller.signal }
+      )
+      controller.abort(new DOMException('Abbruch durch Nutzer.', 'AbortError'))
+
+      await expect(p).rejects.toMatchObject({ name: 'AbortError' })
+    })
+
+    it('ein durchgereichter Watchdog-TimeoutError des Aufrufers bleibt unverändert (nicht netzwerk)', async () => {
+      const fetchFn = (async (_u: string, i: RequestInit) => {
+        const sig = i.signal as AbortSignal
+        return new Promise<Response>((_resolve, reject) => {
+          if (sig.aborted) return reject(sig.reason)
+          sig.addEventListener('abort', () => reject(sig.reason))
+        })
+      }) as unknown as typeof fetch
+      const provider = createCloudRewriteProvider({
+        getApiKey: async () => 'sk',
+        fetchTimeoutMs: 60_000,
+        fetchFn
+      })
+      const controller = new AbortController()
+
+      const p = provider.rewrite(
+        { system: 's', user: 'u' },
+        { model: 'm', temperature: 0.3, signal: controller.signal }
+      )
+      controller.abort(new DOMException('Zeitüberschreitung beim Anbieter.', 'TimeoutError'))
+
+      await expect(p).rejects.toMatchObject({ name: 'TimeoutError' })
+    })
+
+    it('Erfolgsfall bleibt bei injiziertem fetchTimeoutMs unverändert', async () => {
+      const provider = createCloudRewriteProvider({
+        getApiKey: async () => 'sk',
+        fetchTimeoutMs: 30_000,
+        fetchFn: respondingWith('  fertige Nachricht  ')
+      })
+
+      const result = await provider.rewrite(
+        { system: 's', user: 'u' },
+        { model: 'm', temperature: 0.3 }
+      )
+      expect(result.text).toBe('fertige Nachricht')
+    })
+
+    it('ohne Injektion gilt der Default DEFAULT_FETCH_TIMEOUT_MS', async () => {
+      const provider = createCloudRewriteProvider({
+        getApiKey: async () => 'sk',
+        fetchFn: respondingWith('ok')
+      })
+
+      // Kein direkter Zugriff auf den internen Timer möglich — der Erfolgsfall ohne Injektion
+      // muss weiterhin funktionieren (Default greift, ohne das Verhalten zu ändern).
+      const result = await provider.rewrite(
+        { system: 's', user: 'u' },
+        { model: 'm', temperature: 0.3 }
+      )
+      expect(result.text).toBe('ok')
+    })
+
+    // --- v0.8.0 (netzwerkProfil): getFetchTimeoutMs (Live-Getter) nimmt Vorrang vor der statischen
+    // fetchTimeoutMs — composition-root reicht ihn als Closure über die lebende Settings-Kopie durch. ---
+
+    it('getFetchTimeoutMs nimmt Vorrang vor der statischen fetchTimeoutMs (fake timers)', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetchFn = ((_u: string, i: RequestInit) => {
+          return new Promise<Response>((_resolve, reject) => {
+            const sig = i.signal as AbortSignal
+            sig.addEventListener('abort', () => reject(sig.reason))
+          })
+        }) as unknown as typeof fetch
+
+        const provider = createCloudRewriteProvider({
+          getApiKey: async () => 'sk',
+          fetchTimeoutMs: 60_000, // würde OHNE den Getter gelten
+          getFetchTimeoutMs: () => 2_000,
+          fetchFn
+        })
+
+        const p = provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+        const assertion = expect(p).rejects.toMatchObject({ transport: true })
+        // Bei 2_000ms (Getter) bricht der Timeout bereits ab — bei 60_000 (statisch) wäre er hier noch nicht gefeuert.
+        await vi.advanceTimersByTimeAsync(2_000)
+        await assertion
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('wird bei JEDEM Aufruf frisch gelesen (dieselbe Provider-Instanz, Live-Änderung ohne Neubau)', async () => {
+      vi.useFakeTimers()
+      try {
+        let ms = 60_000
+        const haengend = ((_u: string, i: RequestInit) => {
+          return new Promise<Response>((_resolve, reject) => {
+            const sig = i.signal as AbortSignal
+            sig.addEventListener('abort', () => reject(sig.reason))
+          })
+        }) as unknown as typeof fetch
+        const provider = createCloudRewriteProvider({
+          getApiKey: async () => 'sk',
+          getFetchTimeoutMs: () => ms,
+          fetchFn: haengend
+        })
+
+        const p1 = provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+        const assertion1 = expect(p1).rejects.toMatchObject({ transport: true })
+        await vi.advanceTimersByTimeAsync(60_000)
+        await assertion1
+
+        ms = 5_000 // Live-Änderung, wie composition-root sie über dieselbe Closure durchreicht
+        const p2 = provider.rewrite({ system: 's', user: 'u' }, { model: 'm', temperature: 0.3 })
+        const assertion2 = expect(p2).rejects.toMatchObject({ transport: true })
+        await vi.advanceTimersByTimeAsync(5_000) // wäre mit dem ALTEN Wert (60_000) noch nicht gefeuert
+        await assertion2
+      } finally {
+        vi.useRealTimers()
+      }
+    })
   })
 })

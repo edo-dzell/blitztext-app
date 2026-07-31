@@ -35,17 +35,25 @@ npmRebuild: false
 # Portable, unsigniert (ADR-0006). Zielgruppe: kleines internes Team auf bekannten Maschinen.
 # Nutzer-Regel (2026-06-14): IMMER eine fertige portable .exe ausliefern (nicht das zip) — eine
 # einzelne, selbst-entpackende Datei, win-paste.exe steckt als extraResource darin (resourcesPath).
-# Das portable-Target baut auf Linux OHNE wine, SOLANGE signAndEditExecutable=false ist (der
-# signtool/rcedit-Schritt ist das Einzige, das wine bräuchte). Deckt sich mit dem CI-Release
+# Das portable-Target baut auf Linux OHNE wine. Deckt sich mit dem CI-Release
 # (.github/workflows/release.yml: `electron-builder --win portable`).
 win:
   target:
     - portable
   artifactName: ${productName}-${version}-win-portable.${ext}
-  # Unsigniert (ADR-0006). signAndEditExecutable=false ueberspringt den signtool/rcedit-Schritt,
-  # der auf Linux sonst WINE braucht — so baut die portable .exe komplett ohne wine. Folge: keine
-  # in die .exe gestempelten Versions-Metadaten/Icon (kosmetisch, in v2 mit Signierung wieder aktiv).
-  signAndEditExecutable: false
+  # Unsigniert (ADR-0006), ABER mit eingestempeltem Icon und Versions-Metadaten.
+  #
+  # Bis v0.7.x stand hier `signAndEditExecutable: false`. Diese Option schaltet BEIDES ab — das
+  # Signieren UND das Resource-Editing (rcedit), das build/icon.ico sowie ProductName/Version in die
+  # .exe schreibt. Damals war das nötig, weil rcedit auf Linux wine verlangte; die sichtbare Folge war
+  # das Electron-Standardicon in Taskleiste und Explorer, obwohl das Tray-Icon korrekt war.
+  #
+  # Mit electron-builder 26 gilt das nicht mehr: `signExecutable: false` überspringt NUR das
+  # Signieren, das Resource-Editing läuft — und zwar auf Linux ohne wine. Verifiziert am 2026-07-31
+  # gegen 26.15.3: die gebaute .exe enthält die Bilddaten aus icon.ico sowie "Blitztext"/"0.7.3.0"
+  # als ProductName/FileDescription. Der Build-Log sagt dann "file signing skipped via
+  # signExecutable configuration" statt "resource editing and code signing skipped".
+  signExecutable: false
 
 # nsis-Installer + Code-Signierung = v2/RMM (ADR-0005, #09), in v1 bewusst nicht aktiv:
 # nsis:

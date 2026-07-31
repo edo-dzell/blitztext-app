@@ -12,7 +12,13 @@ import { createCloudTranscriptionProvider } from '@main/transcription/cloud-prov
 import { createCloudRewriteProvider } from '@main/rewrite/cloud-provider'
 import { createTreueDetektor } from '@main/rewrite/treue-detektor'
 import { resolveSystemPrompt } from '@main/rewrite/prompt-builder'
-import { shouldRejectRecording, cleanedTranscript, rohtextAus } from '@main/transcription/quality'
+import {
+  shouldRejectRecording,
+  cleanedTranscript,
+  rohtextAus,
+  istStilleAufnahme
+} from '@main/transcription/quality'
+import { netzwerkProfilWerte, stilleSchwellenFuer } from '@shared/laufzeit-profile'
 import {
   createSettingsStore,
   type SettingsFile,
@@ -92,6 +98,14 @@ export interface CompositionDeps extends NativePorts {
    * Startpfad-Store durch (Log + Notification). Optional/No-Op-Default → headless-Tests unverändert.
    */
   aufSettingsKorruption?: () => void
+  /**
+   * A1: Störfall-Callback für den Verlauf-Store (analog `aufSettingsKorruption`) — feuert, wenn die
+   * verschlüsselte Verlauf-Datei existiert, aber nicht entschlüsselbar/parsebar ist. Der Store legt sie
+   * dann als `history.bin.korrupt` beiseite und liefert eine leere Liste statt sie zu überschreiben.
+   * index.ts loggt/benachrichtigt (Muster `meldeSettingsKorrupt`). Optional/No-Op-Default → headless-
+   * Tests unverändert.
+   */
+  aufVerlaufKorruption?: () => void
 }
 
 export interface MainComposition {
@@ -109,6 +123,13 @@ export interface MainComposition {
   erneutVersuchen(): void
   /** Einstellungs-Store für die Settings-IPC (get/save). */
   einstellungen: SettingsStore
+  /**
+   * v0.8.0 (Sonderfall pillenAnzeigedauerProfil): synchroner Zugriff auf die LEBENDE Settings-Kopie
+   * (kein Disk-I/O, kein await) — für Aufrufer AUSSERHALB der composition-root-Closures, allen voran
+   * index.ts' onStatus-Handler, der `pillenStatus()` direkt aufruft. `einstellungen.load()` wäre dort
+   * ein unnötiger Async-Umweg (liest ohnehin nur den bereits geladenen Cache).
+   */
+  aktuelleEinstellungen(): BlitztextSettings
   /** Verlauf-Store für die Verlauf-IPC (liste/loeschen). */
   verlauf: VerlaufStore
   /** Statistik-Store für die Statistik-IPC. */
@@ -230,10 +251,16 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
   // Key des PRO LAUF aktiven Anbieters (Vault, eine Datei je Anbieter).
   const getApiKey = (): Promise<string | null> => deps.apiKeys.get(aktiverAnbieter.id)
 
+  // v0.8.0 (netzwerkProfil): EINE Closure für beide Provider + den Runner-Watchdog — liest `settings`
+  // live (Muster wie `getApiKey`/`getBaseUrl` oben), `netzwerkProfilWerte` bleibt die EINZIGE Stelle,
+  // die fetchTimeoutMs/watchdogMs berechnet (siehe shared/laufzeit-profile.ts).
+  const getNetzwerkWerte = () => netzwerkProfilWerte(settings.netzwerkProfil)
+
   const rewriteProvider = createCloudRewriteProvider({
     getApiKey,
     getBaseUrl: () => aktiverAnbieter.baseUrl,
-    erlaubeOhneKey: () => aktiverAnbieter.keinKeyNoetig === true
+    erlaubeOhneKey: () => aktiverAnbieter.keinKeyNoetig === true,
+    getFetchTimeoutMs: () => getNetzwerkWerte().fetchTimeoutMs
   })
 
   const runner = createWorkflowRunner({
@@ -241,13 +268,27 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
     transcription: createCloudTranscriptionProvider({
       getApiKey,
       getConfig: () => ({ baseUrl: aktiverAnbieter.baseUrl, model: aktiverAnbieter.asrModell }),
-      erlaubeOhneKey: () => aktiverAnbieter.keinKeyNoetig === true
+      erlaubeOhneKey: () => aktiverAnbieter.keinKeyNoetig === true,
+      getFetchTimeoutMs: () => getNetzwerkWerte().fetchTimeoutMs
     }),
     rewrite: rewriteProvider,
     resolveSystemPrompt,
-    quality: { shouldRejectRecording, cleanedTranscript, rohtextAus },
+    // v0.8.0 (mindestAufnahmeSekunden/stilleProfil): Closures über die lebende `settings`-Variable
+    // (Muster wie getConfig/getBaseUrl) — quality.ts selbst kennt keine Settings, bekommt die
+    // aufgelösten Zahlen/Schwellen hier hereingereicht. 'aus' → stilleSchwellenFuer liefert null →
+    // istStilleAufnahme lehnt dann NIE als Stille ab (sicherheitsrelevant, siehe laufzeit-profile.ts).
+    quality: {
+      shouldRejectRecording: (durationSeconds) =>
+        shouldRejectRecording(durationSeconds, settings.mindestAufnahmeSekunden),
+      cleanedTranscript,
+      rohtextAus,
+      istStilleAufnahme: (messung) => istStilleAufnahme(messung, stilleSchwellenFuer(settings.stilleProfil))
+    },
     // v0.4.5 (ADR-0018): deterministischer Treue-Detektor, kein zusätzlicher Modell-Aufruf.
     treueDetektor: createTreueDetektor(),
+    // v0.8.0 (retryVersuche/netzwerkProfil): live pro Lauf aufgelöst, kein Runner-Neubau nötig.
+    getRetryVersuche: () => settings.retryVersuche,
+    getWatchdogMs: () => getNetzwerkWerte().watchdogMs,
     log
   })
 
@@ -257,14 +298,34 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
   // Optional (?.): Recorder-Fakes ohne den Kanal lassen die Verdrahtung ein No-Op.
   deps.recorder.onFehler?.((message) => runner.meldeAufnahmeFehler(message))
 
+  // v0.8.0 (Befund 9), Gegenstück zum Fehlerkanal: der Renderer bestätigt, dass mediaRecorder.start()
+  // TATSÄCHLICH gelaufen ist. Bis dahin zeigt die Pille „Starte …" statt „Aufnahme …", weil der Runner
+  // die Phase schon vor dem Gerätestart setzt und der Nutzer sonst in eine Lücke hinein losspricht
+  // (langsamer Gerätestart: Defender-Erstscan, Bluetooth-Mikro).
+  // DIESE ZEILE IST PFLICHT: fehlt sie, bleibt die Pille für die gesamte Aufnahme auf „Starte …"
+  // stehen — schlechter als der Zustand vorher. Optional (?.) nur wegen Recorder-Fakes ohne den Kanal.
+  //
+  // Der `lauf`-Bezug MUSS durchgereicht werden (nicht `() => …` schreiben!): ohne ihn kann eine
+  // verspätete Bestätigung aus einem abgebrochenen Lauf einen neuen, noch nicht bereiten Lauf
+  // fälschlich auf „Aufnahme" schalten — genau die Lücke, die der Zwischenzustand schließen soll.
+  deps.recorder.onGestartet?.((lauf) => runner.meldeAufnahmeBestaetigt(lauf))
+
   // Verlauf (verschlüsselt, opt-in) + Statistik (text-frei) + Protokoll-Adapter (Strang D).
   const verlauf = createVerlaufStore({
     cipher: deps.verlaufCipher,
     file: deps.verlaufFile,
     // Live: aktiv nur, wenn opt-in an UND die Verlauf-Sperre nicht greift.
-    istAktiv: () => settings.verlaufAktiv && !settings.verlaufGesperrt
+    istAktiv: () => settings.verlaufAktiv && !settings.verlaufGesperrt,
+    // A1: Störfall-Callback durchreichen (Store legt eine kaputte Datei beiseite + meldet).
+    aufKorruption: deps.aufVerlaufKorruption,
+    // v0.8.0 (verlaufMaximum): Live-Getter (Muster wie `istAktiv` oben).
+    getMaxEintraege: () => settings.verlaufMaximum
   })
-  const stats = createStatsStore({ file: deps.statsFile })
+  const stats = createStatsStore({
+    file: deps.statsFile,
+    // v0.8.0 (statistikKompaktierungTage): Live-Getter (Muster wie `istAktiv`/`getMaxEintraege`).
+    getKompaktierungTage: () => settings.statistikKompaktierungTage
+  })
   const protokoll = createProtokoll({
     verlauf,
     stats,
@@ -353,6 +414,9 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
       void sitzung.erneutVersuchen()
     },
     einstellungen,
+    aktuelleEinstellungen() {
+      return settings
+    },
     verlauf,
     stats,
     verarbeiteTaste(event) {
@@ -417,7 +481,9 @@ export async function createMainComposition(deps: CompositionDeps): Promise<Main
         optIn: settings.updateHinweisAktiv, // live aus den Einstellungen (Opt-in)
         lokaleVersion: deps.appVersion ?? '0.0.0',
         holer: deps.updateHoler,
-        speicher: deps.updateCache
+        speicher: deps.updateCache,
+        // v0.8.0 (updateIntervallStunden): live aus den Einstellungen (Stunden → ms).
+        mindestabstandMs: settings.updateIntervallStunden * 60 * 60 * 1000
       })
     },
     async diagnose(mikrofonAnzahl) {

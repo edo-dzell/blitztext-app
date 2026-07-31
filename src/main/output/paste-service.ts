@@ -24,9 +24,22 @@ export interface Zwischenablage {
   schreib(text: string): Promise<void>
 }
 
+/**
+ * Ergebnis eines einzelnen Strategie-Versuchs (Befund 12, Fehlerjagd): früher `boolean`, jetzt
+ * dreiwertig, weil „nicht erfolgreich" zwei GRUNDVERSCHIEDENE Fälle zusammenwarf. `erfolg` = eingefügt.
+ * `fehlschlag` = die Strategie hat es schlicht nicht geschafft (Helfer fehlt, PowerShell verweigert,
+ * …) → bisheriges Verhalten: die nächste Strategie versuchen. `drift` = die Helfer-Strategie hat das
+ * native Weg-B-Drift-Gate ausgelöst (`--paste <hwnd>`, Exit-Code 2 in win-paste.c): der Fokus ist
+ * zwischen Zwischenablage-Schreiben und Paste gewandert, NICHTS wurde getippt. Das darf NIE wie ein
+ * gewöhnlicher Fehlschlag zur nächsten Strategie durchgereicht werden — der PowerShell-Fallback kennt
+ * kein Drift-Gate und würde blind ins (fremde) Vordergrundfenster tippen, also genau den Sicherheitsfall
+ * herbeiführen, den Weg B verhindern soll (ADR-0011).
+ */
+export type StrategieErgebnis = 'erfolg' | 'fehlschlag' | 'drift'
+
 export interface EinfügeStrategie {
   name: 'helfer' | 'powershell'
-  versuch: () => Promise<boolean>
+  versuch: () => Promise<StrategieErgebnis>
 }
 
 export interface PasteServiceDeps {
@@ -94,7 +107,15 @@ export function createPasteService(deps: PasteServiceDeps): PasteService {
       }
 
       for (const strategie of deps.strategien) {
-        if (await strategie.versuch()) {
+        const ergebnis = await strategie.versuch()
+        // Befund 12: Drift SOFORT abbrechen — keine weitere Strategie (insbesondere NICHT den
+        // PowerShell-Fallback ohne Drift-Gate). Derselbe, bereits erprobte Drift-Hinweis wie bei der
+        // VOR-Prüfung oben — der Text bleibt unangetastet in der Zwischenablage.
+        if (ergebnis === 'drift') {
+          deps.zeigeDriftHinweis?.()
+          return { erfolg: false, drift: true }
+        }
+        if (ergebnis === 'erfolg') {
           // Wiederherstellen ist eine Absicht: der Adapter ruft sie verzögert auf (nach dem Paste).
           // Inhalts-Guard: nur zurücksetzen, wenn die Zwischenablage noch unseren Text trägt —
           // sonst hätte der Nutzer zwischenzeitlich etwas kopiert (vgl. macOS Marker-Check).
@@ -107,6 +128,7 @@ export function createPasteService(deps: PasteServiceDeps): PasteService {
           }
           return { erfolg: true, strategie: strategie.name, wiederherstellen }
         }
+        // 'fehlschlag' → bisheriges Verhalten: die nächste Strategie versuchen.
       }
       deps.zeigeManuellenHinweis()
       return { erfolg: false }

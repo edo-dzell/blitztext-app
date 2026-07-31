@@ -15,6 +15,7 @@ import { istNeuesteZuerst, toggleSortierung } from '@/lib/verlauf-sortierung'
 import { wortDiff } from '@/lib/wort-diff'
 import { laufKosten } from '@shared/pricing'
 import { normalisiereBegriffe } from '@shared/begriffe'
+import { modellLabelFuerEintrag } from '@shared/modell-label'
 
 interface Props {
   settings: BlitztextSettings
@@ -117,6 +118,10 @@ export default function VerlaufView({ settings, speichern }: Props) {
   }
 
   const aktiv = eintraege.find((e) => e.id === auswahl) ?? null
+  // A6 (Fehlerjagd-Nachtrag): das TATSÄCHLICH gelaufene Modell (asrModell/chatModell) war bislang
+  // nirgends sichtbar — nur intern für laufKosten() genutzt. Alt-Einträge ohne diese Felder liefern
+  // einen leeren String (siehe modellLabelFuerEintrag), dann wird gar kein Badge gerendert.
+  const modellLabel = aktiv ? modellLabelFuerEintrag(aktiv) : ''
 
   // W3-F2 (Review-Befund D): wortDiff ist ein O(n·m)-DP über Token-Paare (bis 4000×4000 ≈ 64 MB Uint32Array,
   // s. MAX_DIFF_TOKENS) — ohne Memoisierung würde JEDER Re-Render von VerlaufView (z. B. durch das
@@ -223,6 +228,17 @@ export default function VerlaufView({ settings, speichern }: Props) {
                     title={`Prompt-Stand: ${aktiv.promptKennung}`}
                   >
                     {aktiv.promptKennung}
+                  </span>
+                )}
+                {/* A6: das tatsächlich gelaufene Modell — gleicher Badge-Stil wie promptKennung oben,
+                    direkt daneben. Alt-Einträge ohne asrModell/chatModell zeigen KEINEN Badge (leeres
+                    modellLabel → kein Rendern, keine leere Hülle). */}
+                {modellLabel && (
+                  <span
+                    className="rounded border px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground/70"
+                    title={`Modell: ${modellLabel}`}
+                  >
+                    {modellLabel}
                   </span>
                 )}
               </span>

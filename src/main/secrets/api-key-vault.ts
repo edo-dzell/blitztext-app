@@ -19,15 +19,28 @@ const MASKE_LAENGE = 6
 export function createApiKeyVault(deps: {
   cipher: SecretCipher
   dateiFuer: (anbieterId: string) => CiphertextFile
+  /**
+   * Störfall-Callback (A1, Muster wörtlich wie `SettingsStore.aufKorruption` in settings/store.ts):
+   * feuert mit der betroffenen `anbieterId` (NIE Key-Material), wenn ein Key-Chiffrat EXISTIERT, aber
+   * nicht entschlüsselbar ist (anderer Benutzer/Profil, DPAPI-Bindungswechsel, Korruption). Optional,
+   * No-Op-Default; der Kern loggt/benachrichtigt bewusst NICHT selbst — das übernimmt index.ts.
+   */
+  aufKorruption?: (anbieterId: string) => void
 }): ApiKeyVault {
   async function leseKey(anbieterId: string): Promise<string | null> {
-    const data = await deps.dateiFuer(anbieterId).read()
-    if (data === null) return null
+    const datei = deps.dateiFuer(anbieterId)
+    const data = await datei.read()
+    if (data === null) return null // Datei existiert nicht → kein Key, KEIN Störfall
     try {
       return await deps.cipher.decrypt(data)
     } catch {
-      // Nicht entschlüsselbar (anderer Benutzer/Profil/Korruption, RESEARCH R2) → wie „kein Key",
-      // statt zu werfen (kein Crash beim Start).
+      // Nicht entschlüsselbar, ABER die Datei EXISTIERT (anderer Benutzer/Profil/Korruption,
+      // RESEARCH R2) → NICHT stillschweigend wie „kein Key" behandeln: has()/maske() würden sonst
+      // einen arglosen Neu-Eintrag des Keys anstoßen, dessen set() das alte Chiffrat überschreibt.
+      // Stattdessen beiseite legen (Muster settings-file.ts, .korrupt-Suffix) UND melden — beides
+      // BEVOR wir wie bisher „kein Key" zurückgeben (kein Crash beim Start).
+      await datei.beiseiteLegen?.()
+      deps.aufKorruption?.(anbieterId)
       return null
     }
   }
@@ -49,6 +62,11 @@ export function createApiKeyVault(deps: {
       if (!deps.cipher.isEncryptionAvailable()) {
         throw new Error('Verschlüsselung nicht verfügbar')
       }
+      // Ein vorhandenes, aber kaputtes altes Chiffrat NIE stillschweigend überschreiben — auch dann
+      // nicht, wenn set() ohne vorherigen has()/maske()/get()-Aufruf direkt aufgerufen wird. leseKey()
+      // legt ein defektes Chiffrat beiseite + meldet den Störfall; ein gültiges wird nur gelesen und
+      // verworfen (kein zusätzlicher Seiteneffekt).
+      await leseKey(anbieterId)
       await datei.write(await deps.cipher.encrypt(key))
     },
     async clear(anbieterId) {

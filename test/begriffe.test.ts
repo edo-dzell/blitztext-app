@@ -4,7 +4,9 @@ import {
   begriffeFuerAsrPrompt,
   asrPromptText,
   begriffeFuerRewritePrompt,
-  ASR_PROMPT_BUDGET_ZEICHEN
+  begriffeFuerContextBias,
+  ASR_PROMPT_BUDGET_ZEICHEN,
+  ASR_CONTEXT_BIAS_MAX_EINTRAEGE
 } from '@shared/begriffe'
 
 describe('normalisiereBegriffe', () => {
@@ -101,6 +103,46 @@ describe('asrPromptText', () => {
 
   it('liefert exakt den heutigen Wortlaut', () => {
     expect(asrPromptText(['Acme', 'GmbH'])).toBe('Eigennamen und Begriffe: Acme, GmbH')
+  })
+})
+
+// --- B1: Mistrals context_bias hat eine Anzahl-Obergrenze statt Whispers Zeichen-Budget ---
+describe('begriffeFuerContextBias (Anzahl-Guard für Mistral/Voxtral)', () => {
+  it('lässt eine Liste unverändert, die klar unter der Obergrenze liegt', () => {
+    const begriffe = ['Acme', 'GmbH', 'Blitztext']
+    expect(begriffeFuerContextBias(begriffe)).toEqual(begriffe)
+  })
+
+  it('normalisiert zuerst (trim/leer raus/Dedupe) wie begriffeFuerAsrPrompt', () => {
+    expect(begriffeFuerContextBias(['Acme', '', '  ', 'GmbH', 'acme'])).toEqual(['Acme', 'GmbH'])
+  })
+
+  it('kappt auf die injizierte Obergrenze, NEUESTE ZUERST, Original-Reihenfolge im Ergebnis', () => {
+    const begriffe = ['alt', 'mitte', 'neu']
+    expect(begriffeFuerContextBias(begriffe, 2)).toEqual(['mitte', 'neu'])
+  })
+
+  it('nutzt den Default ASR_CONTEXT_BIAS_MAX_EINTRAEGE (100), wenn keine Grenze übergeben wird', () => {
+    const begriffe = Array.from({ length: 130 }, (_, i) => `Begriff-${i}`)
+    const ergebnis = begriffeFuerContextBias(begriffe)
+    expect(ergebnis).toHaveLength(ASR_CONTEXT_BIAS_MAX_EINTRAEGE)
+    expect(ergebnis).toEqual(begriffe.slice(30))
+  })
+
+  it('behält alle Begriffe GENAU an der Obergrenze (kein Off-by-one)', () => {
+    const begriffe = Array.from({ length: ASR_CONTEXT_BIAS_MAX_EINTRAEGE }, (_, i) => `B-${i}`)
+    expect(begriffeFuerContextBias(begriffe)).toEqual(begriffe)
+  })
+
+  it('leere Liste bleibt leer', () => {
+    expect(begriffeFuerContextBias([])).toEqual([])
+  })
+
+  it('ist idempotent auch wenn tatsächlich gekürzt werden musste', () => {
+    const viele = Array.from({ length: 150 }, (_, i) => `Begriff-${i}`)
+    const einmal = begriffeFuerContextBias(viele)
+    const zweimal = begriffeFuerContextBias(einmal)
+    expect(zweimal).toEqual(einmal)
   })
 })
 

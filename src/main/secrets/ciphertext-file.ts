@@ -24,6 +24,15 @@ export function createCiphertextFile(filePath: string): CiphertextFile {
     },
     async remove() {
       await rm(filePath, { force: true })
+    },
+    // Korruptions-Rettung (A1) — wörtlich das Muster aus settings-file.ts: nicht wirft, damit ein
+    // fehlgeschlagenes Umbenennen (z. B. AV-Lock erschöpft) den Aufrufer nicht zu Fall bringt.
+    async beiseiteLegen() {
+      try {
+        await ersetzeAtomar(filePath, `${filePath}.korrupt`)
+      } catch {
+        // bewusst geschluckt: die Rettung ist optional, der Aufrufer (Vault/Verlauf) hat Vorrang
+      }
     }
   }
 }

@@ -264,6 +264,49 @@ describe('Ereignislog-Verdrahtung: runner.transition()', () => {
     expect(um!.felder.zeichen).toBe('GEHEIM poliert'.length)
     expect(JSON.stringify(um!.felder)).not.toContain('poliert')
   })
+
+  // v0.8.0 (Befund B, Feld-Log): „Keine Aufnahme erkannt." deckte bislang ZWEI ursächlich verschiedene
+  // Fälle ab (zu kurz gehalten / lang genug, aber Transkription leer) — im Feld-Log nur per Code-Analyse
+  // zu trennen. Jetzt zwei eigene Log-Ereignisse, damit die Trennung auch OHNE Code-Analyse möglich ist.
+  it('Kurzaufnahme-Guard: loggt workflow.zu_kurz mit gerundeter Dauer, NICHT workflow.leere_transkription', async () => {
+    const { log, aufrufe } = fakeLog()
+    const runner = createWorkflowRunner(runnerDeps({ log, recorder: fakeRecorder(0.2) }))
+
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
+    const terminal = await runner.stop()
+
+    const treffer = aufrufe.find((a) => a.ereignis === 'workflow.zu_kurz')
+    expect(treffer).toBeDefined()
+    expect(treffer!.stufe).toBe('info')
+    expect(treffer!.felder.dauerSekunden).toBe(0.2)
+    expect(aufrufe.some((a) => a.ereignis === 'workflow.leere_transkription')).toBe(false)
+    expect(terminal).toMatchObject({
+      status: 'fehler',
+      art: 'aufnahme',
+      message: 'Zu kurz aufgenommen — bitte die Taste länger gedrückt halten.'
+    })
+  })
+
+  it('leere/artefaktige Transkription: loggt workflow.leere_transkription, NICHT workflow.zu_kurz', async () => {
+    const { log, aufrufe } = fakeLog()
+    const runner = createWorkflowRunner(
+      runnerDeps({ log, recorder: fakeRecorder(1.5), transcription: { async transcribe() { return '' } } })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
+    const terminal = await runner.stop()
+
+    const treffer = aufrufe.find((a) => a.ereignis === 'workflow.leere_transkription')
+    expect(treffer).toBeDefined()
+    expect(treffer!.stufe).toBe('info')
+    expect(treffer!.felder.dauerSekunden).toBe(1.5)
+    expect(aufrufe.some((a) => a.ereignis === 'workflow.zu_kurz')).toBe(false)
+    expect(terminal).toMatchObject({
+      status: 'fehler',
+      art: 'aufnahme',
+      message: 'Kein verwertbarer Text erkannt — bitte erneut versuchen.'
+    })
+  })
 })
 
 // --- Sitzung-Gates: stille Abbrüche werden sichtbar (TEXT-FREI: nur Ids/Quelle/Status) ---
@@ -383,5 +426,101 @@ describe('Ereignislog-Verdrahtung: Sitzung-Gates', () => {
     expect(treffer).toBeDefined()
     expect(treffer!.stufe).toBe('info')
     expect(treffer!.felder.quelle).toBe('hotkey')
+  })
+})
+
+// --- Befund 10 (v0.8.0): Lauf-Kennung + Gesamtdauer verbinden die Zeilen EINES Laufs im Ereignislog ---
+
+describe('Ereignislog-Verdrahtung: Befund 10 (Lauf-Kennung + Gesamtdauer)', () => {
+  it('mehrere workflow.phase-Zeilen EINES Laufs tragen dieselbe Lauf-Kennung (RunInput.laufKennung)', async () => {
+    const { log, aufrufe } = fakeLog()
+    const runner = createWorkflowRunner(runnerDeps({ log }))
+
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini', laufKennung: 42 })
+    await runner.stop()
+
+    const phasen = aufrufe.filter((a) => a.ereignis === 'workflow.phase')
+    // aufnehmen, transkribieren, fertig — alle drei mit derselben Kennung.
+    expect(phasen.length).toBeGreaterThanOrEqual(3)
+    for (const p of phasen) expect(p.felder.lauf).toBe(42)
+  })
+
+  it('ohne laufKennung bleibt das lauf-Feld in den Phasen-Zeilen weg (Altweg/Bestandstests unverändert)', async () => {
+    const { log, aufrufe } = fakeLog()
+    const runner = createWorkflowRunner(runnerDeps({ log }))
+
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
+    await runner.stop()
+
+    const phasen = aufrufe.filter((a) => a.ereignis === 'workflow.phase')
+    expect(phasen.length).toBeGreaterThan(0)
+    for (const p of phasen) expect(p.felder.lauf).toBeUndefined()
+  })
+
+  it('debug: workflow.transkribiert/umgeschrieben tragen ebenfalls die Lauf-Kennung', async () => {
+    const { log, aufrufe } = fakeLog()
+    const runner = createWorkflowRunner(
+      runnerDeps({ log, rewrite: { async rewrite() { return { text: 'poliert' } } } })
+    )
+
+    runner.start({ def: def('improve'), chatModell: 'gpt-4o-mini', laufKennung: 7 })
+    await runner.stop()
+
+    const transkribiert = aufrufe.find((a) => a.ereignis === 'workflow.transkribiert')
+    const umgeschrieben = aufrufe.find((a) => a.ereignis === 'workflow.umgeschrieben')
+    expect(transkribiert?.felder.lauf).toBe(7)
+    expect(umgeschrieben?.felder.lauf).toBe(7)
+  })
+
+  it('Sitzung: ein erfolgreicher Hotkey-Lauf protokolliert die Gesamtdauer, mit derselben Lauf-Kennung wie die Runner-Phasen', async () => {
+    const { log, aufrufe } = fakeLog()
+    const recorder = fakeRecorder(1.5)
+    const runner = createWorkflowRunner(
+      runnerDeps({ log, recorder, transcription: { async transcribe() { return 'roh' } } })
+    )
+    let content: string | null = null
+    const einstellungen = createSettingsStore({
+      file: {
+        async read() {
+          return content
+        },
+        async write(next) {
+          content = next
+        }
+      }
+    })
+    const ausgabe: Ausgabe = {
+      einfügen: () => {},
+      anzeigen: () => {},
+      zeigeEinstellungen: () => {},
+      melde: () => {},
+      inZwischenablage: () => {},
+      erfasseFenster: async () => null
+    }
+    const apiKeys = {
+      async has() {
+        return true
+      }
+    }
+    const sitzung = createSitzung({ runner, einstellungen, apiKeys, ausgabe, log })
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+    await sitzung.stoppe()
+
+    // (b) Gesamtdauer protokolliert, IMMER sichtbar (info-Stufe, nicht hinter dem Debug-Schalter).
+    const gesamt = aufrufe.find((a) => a.ereignis === 'sitzung.lauf_fertig')
+    expect(gesamt).toBeDefined()
+    expect(gesamt!.stufe).toBe('info')
+    expect(typeof gesamt!.felder.dauerMs).toBe('number')
+    expect(gesamt!.felder.dauerMs as number).toBeGreaterThanOrEqual(0)
+
+    // (a) dieselbe Lauf-Kennung taucht in mehreren Runner-Log-Zeilen DIESES Laufs auf (kein neuer Zähler
+    // — dieselbe laufGeneration, die starteWorkflow beim Auslösen vergeben hat).
+    const laufKennung = gesamt!.felder.lauf
+    expect(typeof laufKennung).toBe('number')
+    const phasenMitKennung = aufrufe.filter(
+      (a) => a.ereignis === 'workflow.phase' && a.felder.lauf === laufKennung
+    )
+    expect(phasenMitKennung.length).toBeGreaterThanOrEqual(2)
   })
 })

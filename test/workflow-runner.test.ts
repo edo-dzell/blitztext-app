@@ -14,11 +14,16 @@ const audio = new Blob(['x'], { type: 'audio/webm' })
 // Bequeme Auflösung einer eingebauten Definition für die RunInput.
 const def = (id: string) => getWorkflow(id, BUILTIN_WORKFLOWS)
 
-function fakeRecorder(durationSeconds: number) {
+function fakeRecorder(
+  durationSeconds: number,
+  pegel: { max: number; median: number } | null = { max: 0.2, median: 0.02 }
+) {
   return {
     start(): void {},
     async stop() {
-      return { audio, durationSeconds }
+      // v0.7.4: `pegel` = Spitze + Grundrauschen der Aufnahme. Default = deutlich hörbares, stoßhaftes
+      // Sprechen, damit alle Bestandstests unverändert durch den Stille-Guard laufen.
+      return { audio, durationSeconds, pegel }
     },
     discard(): void {}
   }
@@ -76,8 +81,68 @@ describe('createWorkflowRunner', () => {
     runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
     const terminal = await runner.stop()
 
-    expect(terminal).toEqual({ status: 'fehler', art: 'aufnahme', message: 'Keine Aufnahme erkannt.' })
+    // v0.8.0 (Befund B): eigene Meldung statt der früher geteilten „Keine Aufnahme erkannt." — dieser
+    // Fall (zu kurz gehalten) bekommt eine eigene, handlungsleitende Meldung.
+    expect(terminal).toEqual({
+      status: 'fehler',
+      art: 'aufnahme',
+      message: 'Zu kurz aufgenommen — bitte die Taste länger gedrückt halten.'
+    })
     expect(transcribeCalled).toBe(false)
+  })
+
+  // v0.7.4 — Realer Vorfall: garantiert leere Aufnahme (~1 s), Modell lieferte „Vielen Dank.", der
+  // Text wurde umgeschrieben und ins Zielfenster eingefügt. Der Dauer×Länge-Artefaktfilter kann das
+  // nicht fangen (kurzer Text aus normal langer Aufnahme), deshalb entscheidet der gemessene Pegel —
+  // und zwar VOR dem API-Aufruf, damit eine Fehlauslösung auch nichts kostet.
+  it('Stille-Guard: stille Aufnahme → fehler, Transkription wird NICHT aufgerufen', async () => {
+    let transcribeCalled = false
+    const runner = createWorkflowRunner(
+      makeDeps({
+        recorder: fakeRecorder(1.0, { max: 0.0008, median: 0.0007 }),
+        transcription: {
+          async transcribe() {
+            transcribeCalled = true
+            return 'Vielen Dank.'
+          }
+        }
+      })
+    )
+
+    runner.start({ def: def('improve'), chatModell: 'gpt-4o-mini' })
+    const terminal = await runner.stop()
+
+    expect(terminal).toEqual({
+      status: 'fehler',
+      art: 'aufnahme',
+      message: 'Es war nichts zu hören — bitte Mikrofon prüfen.'
+    })
+    expect(transcribeCalled).toBe(false)
+  })
+
+  it('Stille-Guard: hörbare Aufnahme läuft normal durch', async () => {
+    // v0.8.0 (Befund A): 0,02 (die frühere STILLE_WEICH-Grenze) liegt jetzt UNTER der neuen absoluten
+    // Untergrenze (0,05) und würde selbst als Stille gelten (s. transcription-quality.test.ts,
+    // „Befund A" — genau dieser Pegelbereich rutschte im Feld-Log durch). Der Pegel hier liegt deshalb
+    // klar darüber, um weiterhin den „hörbare Aufnahme läuft normal durch"-Pfad zu prüfen.
+    const runner = createWorkflowRunner(makeDeps({ recorder: fakeRecorder(1.0, { max: 0.2, median: 0.01 }) }))
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
+    expect(await runner.stop()).toEqual({ status: 'fertig', text: 'roh' })
+  })
+
+  // Invariante: Ohne Messwert (ältere Renderer, fehlgeschlagene Audio-Analyse) darf der Guard NIE
+  // greifen — eine echte Aufnahme darf nicht an einer fehlenden Diagnose scheitern.
+  it('Stille-Guard: ohne Messwert wird nicht abgelehnt', async () => {
+    const runner = createWorkflowRunner(makeDeps({ recorder: fakeRecorder(1.0, null) }))
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
+    expect(await runner.stop()).toEqual({ status: 'fertig', text: 'roh' })
+  })
+
+  it('Stille-Guard: nach Ablehnung wird kein Audio für einen Retry gehalten', async () => {
+    const runner = createWorkflowRunner(makeDeps({ recorder: fakeRecorder(1.0, { max: 0, median: 0 }) }))
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
+    await runner.stop()
+    expect(runner.kannErneutVersuchen()).toBe(false)
   })
 
   it('Artefakt-Guard: kurze Aufnahme mit artefakt-verdächtigem Rohtext → fehler', async () => {
@@ -92,7 +157,13 @@ describe('createWorkflowRunner', () => {
     runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
     const terminal = await runner.stop()
 
-    expect(terminal).toEqual({ status: 'fehler', art: 'aufnahme', message: 'Keine Aufnahme erkannt.' })
+    // v0.8.0 (Befund B): eigene Meldung — die Aufnahme war lang genug, nur die Transkription lieferte
+    // nichts Verwertbares (anders als der Kurzaufnahme-Guard oben).
+    expect(terminal).toEqual({
+      status: 'fehler',
+      art: 'aufnahme',
+      message: 'Kein verwertbarer Text erkannt — bitte erneut versuchen.'
+    })
   })
 
   it('Provider-Fehler: wirft die Transkription, geht der Runner mit deren Meldung nach fehler', async () => {
@@ -270,6 +341,50 @@ describe('createWorkflowRunner', () => {
     expect(runner.phase).toEqual({ status: 'aufnehmen' })
   })
 
+  // --- Befund 7a (v0.8.0): mikrofonDeviceId wird 1:1 an recorder.start() durchgereicht ---
+
+  it('start() reicht die gewünschte mikrofonDeviceId an recorder.start() weiter', () => {
+    let empfangen: string | undefined = 'unveraendert'
+    const runner = createWorkflowRunner(
+      makeDeps({
+        recorder: {
+          start(deviceId) {
+            empfangen = deviceId
+          },
+          async stop() {
+            return { audio, durationSeconds: 1.5 }
+          },
+          discard() {}
+        }
+      })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini', mikrofonDeviceId: 'mic-7' })
+
+    expect(empfangen).toBe('mic-7')
+  })
+
+  it('start() ohne mikrofonDeviceId ruft recorder.start() mit undefined auf (Altweg intakt)', () => {
+    let empfangen: string | undefined = 'unveraendert'
+    const runner = createWorkflowRunner(
+      makeDeps({
+        recorder: {
+          start(deviceId) {
+            empfangen = deviceId
+          },
+          async stop() {
+            return { audio, durationSeconds: 1.5 }
+          },
+          discard() {}
+        }
+      })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'gpt-4o-mini' })
+
+    expect(empfangen).toBeUndefined()
+  })
+
   it('abbrechen() verwirft eine laufende Aufnahme und geht nach idle', () => {
     let discarded = 0
     const runner = createWorkflowRunner(
@@ -368,6 +483,40 @@ describe('createWorkflowRunner', () => {
       art: 'anbieter',
       message: 'Zeitüberschreitung beim Anbieter.'
     })
+  })
+
+  // --- v0.8.0 (netzwerkProfil): getWatchdogMs ersetzt den 90s-Default NUR, wenn `starteWatchdog`
+  // NICHT injiziert ist (bestehende Tests mit injiziertem starteWatchdog bleiben unberührt). ---
+
+  it('netzwerkProfil (v0.8.0): getWatchdogMs ersetzt den 90s-Default-Watchdog (fake timers)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const runner = createWorkflowRunner(
+        makeDeps({ transcription: haengendeTranskription(), getWatchdogMs: () => 5_000 })
+      )
+
+      runner.start({ def: def('transcribe'), chatModell: 'm' })
+      const stopP = runner.stop()
+      // recorder.stop() (kein echter Timer, nur ein Microtask) auflösen lassen — setTimeout ist hier
+      // gefaked, ein rohes `new Promise(setTimeout...)` würde nie auflösen (Deadlock-Falle).
+      await vi.advanceTimersByTimeAsync(0)
+      expect(runner.phase).toEqual({ status: 'transkribieren', istWiederholung: false })
+
+      // Vor der (abweichenden) Frist: noch nicht gefeuert.
+      await vi.advanceTimersByTimeAsync(4_000)
+      expect(runner.phase.status).toBe('transkribieren')
+
+      // Bei 5_000ms (Getter): Watchdog feuert. Mit dem Default (90_000) wäre hier noch nichts passiert.
+      await vi.advanceTimersByTimeAsync(1_000)
+      const terminal = await stopP
+      expect(terminal).toEqual({
+        status: 'fehler',
+        art: 'anbieter',
+        message: 'Zeitüberschreitung beim Anbieter.'
+      })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   // --- Regression: Phantom-Stop-Schutz (Dispatcher/Sitzung-Desync bei langem Umschreiben) ---
@@ -730,6 +879,54 @@ describe('createWorkflowRunner', () => {
 
     expect(terminal).toEqual({ status: 'fertig', text: 'endlich da' })
     expect(n).toBe(2)
+  })
+
+  // --- v0.8.0 (retryVersuche): getRetryVersuche (Live-Getter) löst den harten 2er-Default ab ---
+
+  it('retryVersuche (v0.8.0): getRetryVersuche=1 verhindert den Retry, den der Default (2) erlauben würde', async () => {
+    let n = 0
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: {
+          async transcribe() {
+            n++
+            throw Object.assign(new Error('Netzwerkfehler'), { transport: true })
+          }
+        },
+        sleep: async () => {},
+        getRetryVersuche: () => 1
+      })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const terminal = await runner.stop()
+
+    expect(terminal).toMatchObject({ status: 'fehler', art: 'netzwerk' })
+    // Mit dem Default (2) wäre das ein zweiter Versuch gewesen (siehe Test oben) — hier bleibt es bei einem.
+    expect(n).toBe(1)
+  })
+
+  it('retryVersuche (v0.8.0): getRetryVersuche=3 erlaubt einen Retry, den der Default (2) NICHT mehr erlauben würde', async () => {
+    let n = 0
+    const runner = createWorkflowRunner(
+      makeDeps({
+        transcription: {
+          async transcribe() {
+            n++
+            if (n < 3) throw Object.assign(new Error('Netzwerkfehler'), { transport: true })
+            return 'endlich da'
+          }
+        },
+        sleep: async () => {},
+        getRetryVersuche: () => 3
+      })
+    )
+
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const terminal = await runner.stop()
+
+    expect(terminal).toEqual({ status: 'fertig', text: 'endlich da' })
+    expect(n).toBe(3)
   })
 
   // --- P0 (W1-A): discard()-Throw darf die idle-Transition nicht killen ---
@@ -1407,6 +1604,95 @@ describe('createWorkflowRunner', () => {
 
     runner.meldeAufnahmeFehler('zu spät')
     expect(runner.phase).toEqual({ status: 'fertig', text: 'ok' }) // unverändert
+  })
+
+  // --- v0.8.0 (Befund 9): Start-Bestätigungskanal — „Starte …" vs. „Aufnahme …" (siehe pill-status.ts) ---
+
+  it('meldeAufnahmeBestaetigt setzt additiv bestaetigt:true auf der Aufnahme-Phase', () => {
+    const runner = createWorkflowRunner(makeDeps())
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    // Vor der Bestätigung: keine `bestaetigt`-Eigenschaft (die Pille zeigt „Starte …", siehe pill-status.ts).
+    expect(runner.phase).toEqual({ status: 'aufnehmen' })
+
+    runner.meldeAufnahmeBestaetigt()
+    expect(runner.phase).toEqual({ status: 'aufnehmen', bestaetigt: true })
+  })
+
+  it('meldeAufnahmeBestaetigt außerhalb der Aufnahme-Phase ist ein No-Op (Alt-Lauf-Schutz)', async () => {
+    // Eine verspätete Bestätigung, nachdem der Lauf längst 'fertig' ist, darf den Zustand nicht kippen —
+    // gleiches Muster wie meldeAufnahmeFehler.
+    const runner = createWorkflowRunner(makeDeps({ transcription: { async transcribe() { return 'ok' } } }))
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    const terminal = await runner.stop()
+    expect(terminal).toEqual({ status: 'fertig', text: 'ok' })
+
+    runner.meldeAufnahmeBestaetigt()
+    expect(runner.phase).toEqual({ status: 'fertig', text: 'ok' }) // unverändert
+  })
+
+  it('meldeAufnahmeBestaetigt nach abbrechen() (idle) ist ebenfalls ein No-Op', () => {
+    // Ein abgebrochener Lauf geht sofort nach idle; eine danach nachzügelnde Bestätigung des (verworfenen)
+    // Recorder-Fensters darf idle nicht mit einer 'aufnehmen'-Phase überschreiben.
+    const runner = createWorkflowRunner(makeDeps())
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    runner.abbrechen()
+    expect(runner.phase).toEqual({ status: 'idle' })
+
+    runner.meldeAufnahmeBestaetigt()
+    expect(runner.phase).toEqual({ status: 'idle' })
+  })
+
+  // --- Adversariale Review (v0.8.x, Befund 2): Lauf-Bezug für meldeAufnahmeBestaetigt ---
+  // Der bloße phase.status-Guard (Befund 9) unterscheidet NICHT, WELCHER Lauf gemeint ist: eine
+  // verspätete Bestätigung aus einem abgebrochenen Lauf A kann einen bereits wieder in 'aufnehmen'
+  // befindlichen, frischen Lauf B fälschlich bestätigen — obwohl B's Mikrofon real noch gar nicht bereit
+  // ist. `start()` erzeugt dafür pro Aufnahme-Versuch einen frischen, monoton steigenden Lauf-Bezug und
+  // reicht ihn an `recorder.start()` durch (siehe fakeRecorder unten); `meldeAufnahmeBestaetigt` verwirft
+  // eine Bestätigung, deren Bezug nicht mehr dem GERADE erwarteten entspricht.
+
+  it('meldeAufnahmeBestaetigt mit veraltetem Lauf-Bezug (abgebrochener Lauf A) lässt die Phase unverändert', () => {
+    const empfangeneLaeufe: (number | undefined)[] = []
+    const runner = createWorkflowRunner(
+      makeDeps({
+        recorder: {
+          start(_deviceId, lauf) {
+            empfangeneLaeufe.push(lauf)
+          },
+          async stop() {
+            return { audio, durationSeconds: 1.5 }
+          },
+          discard() {}
+        }
+      })
+    )
+
+    // Lauf A: startet, wird sofort wieder abgebrochen (z. B. Nutzer lässt gleich wieder los).
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    runner.abbrechen()
+    // Lauf B: neuer, frischer Aufnahme-Versuch — bekommt einen HÖHEREN Lauf-Bezug als A.
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+    expect(runner.phase).toEqual({ status: 'aufnehmen' })
+
+    const [laufA, laufB] = empfangeneLaeufe
+    expect(laufA).not.toBe(laufB) // Vorbedingung: zwei unterschiedliche, unterscheidbare Bezüge
+
+    // A's Recorder-Fenster löst jetzt (verspätet) SEINE Start-Bestätigung aus — B läuft längst.
+    runner.meldeAufnahmeBestaetigt(laufA)
+    expect(runner.phase).toEqual({ status: 'aufnehmen' }) // unverändert: KEIN bestaetigt:true
+
+    // B's EIGENE (aktuelle) Bestätigung bestätigt normal.
+    runner.meldeAufnahmeBestaetigt(laufB)
+    expect(runner.phase).toEqual({ status: 'aufnehmen', bestaetigt: true })
+  })
+
+  it('meldeAufnahmeBestaetigt ohne Lauf-Bezug (alter Aufrufer/Fake) bleibt rückwärtskompatibel wirksam', () => {
+    // Rückwärtskompatibilität: ein Fake/Aufrufer, der den neuen Bezug nicht kennt (kein zweites Argument),
+    // muss weiterhin bestätigen können — wie vor Befund 2 (nur der phase.status-Guard).
+    const runner = createWorkflowRunner(makeDeps())
+    runner.start({ def: def('transcribe'), chatModell: 'm' })
+
+    runner.meldeAufnahmeBestaetigt(undefined)
+    expect(runner.phase).toEqual({ status: 'aufnehmen', bestaetigt: true })
   })
 
   // Kleine Test-Helferzeile: ein Mikro-Tick, damit hängende Promises einen Zyklus laufen.

@@ -38,8 +38,13 @@ function makeSitzung(opts: MakeOpts = {}) {
     started: 0,
     stopped: 0,
     discarded: 0,
-    start(): void {
+    // Befund 7a (v0.8.0): merkt sich die zuletzt an start() übergebene deviceId — für den Nachweis, dass
+    // die Sitzung `settings.mikrofonDeviceId` durchreicht statt sie den Recorder-Renderer selbst holen
+    // zu lassen.
+    letzteDeviceId: undefined as string | undefined,
+    start(deviceId?: string): void {
       recorder.started++
+      recorder.letzteDeviceId = deviceId
     },
     async stop() {
       recorder.stopped++
@@ -175,6 +180,17 @@ describe('createSitzung', () => {
     expect(calls.anzeigen).toEqual([])
   })
 
+  // Befund 7a (v0.8.0): die Sitzung hat die Einstellungen beim Auslösen bereits geladen — die
+  // gewünschte deviceId geht direkt an recorder.start(), statt sie den Recorder-Renderer per IPC
+  // nachfragen zu lassen.
+  it('reicht settings.mikrofonDeviceId beim Auslösen an recorder.start() weiter', async () => {
+    const { sitzung, recorder } = makeSitzung({ settings: { mikrofonDeviceId: 'mic-9' } })
+
+    await sitzung.starteWorkflow('transcribe', 'hotkey')
+
+    expect(recorder.letzteDeviceId).toBe('mic-9')
+  })
+
   it('manuell: stoppe zeigt den Endtext im Fenster statt einzufügen', async () => {
     const { sitzung, calls } = makeSitzung({ transcript: 'angezeigter text' })
 
@@ -196,14 +212,47 @@ describe('createSitzung', () => {
     expect(calls.anzeigen).toEqual([])
   })
 
-  it('kein API-Key + hotkey: bricht still ab (keine Einstellungen, keine Aufnahme)', async () => {
+  // v0.8.0 (Auftrag 2, Befund 17): bis hierhin brach ein per Hotkey ausgelöstes Diktat OHNE API-Key
+  // WORTLOS ab — der Nutzer drückte die Taste, sprach, und nichts passierte, ohne jede Erklärung
+  // (Kommentar „Hotkey: still abbrechen" in sitzung.ts). Jetzt: eine sichtbare, NICHT-blockierende
+  // Meldung über denselben Weg wie bei manueller Auslösung — aber OHNE das Einstellungsfenster nach
+  // vorn zu holen (das bleibt der manuellen Auslösung vorbehalten, kein Fokus-Diebstahl bei Hotkey).
+  it('kein API-Key + hotkey: meldet sichtbar, holt aber NICHT die Einstellungen nach vorn', async () => {
     const { sitzung, calls, recorder } = makeSitzung({ hasKey: false })
 
     await sitzung.starteWorkflow('transcribe', 'hotkey')
 
-    expect(calls.zeigeEinstellungen).toBe(0)
+    expect(calls.zeigeEinstellungen).toBe(0) // Fokus bleibt unangetastet — das ist die Zusicherung
     expect(recorder.started).toBe(0)
     expect(calls.einfügen).toEqual([])
+    expect(calls.melde).toHaveLength(1)
+    expect(calls.melde[0]!.titel).toBe('Kein API-Key hinterlegt')
+    expect(calls.melde[0]!.koerper).toContain('OpenAI') // Standard-Anbieter der Default-Settings
+  })
+
+  // v0.8.0 (Auftrag 2): derselbe stille Fehler wie der fehlende API-Key — „derselbe Fehler in grün".
+  // Ein verwaister Hotkey (Chord zeigt auf eine gelöschte/unbekannte Workflow-Id) brach bei Hotkey
+  // bislang genauso wortlos ab. manuell bleibt unverändert (zeigt weiter die Einstellungen, KEIN
+  // zusätzliches melde() — das war schon vorher der einzige Signalweg dort und bleibt es).
+  it('unbekannter Workflow + hotkey: meldet sichtbar, holt aber NICHT die Einstellungen nach vorn', async () => {
+    const { sitzung, calls, recorder } = makeSitzung()
+
+    await sitzung.starteWorkflow('nicht-vorhanden', 'hotkey')
+
+    expect(calls.zeigeEinstellungen).toBe(0)
+    expect(recorder.started).toBe(0)
+    expect(calls.melde).toHaveLength(1)
+    expect(calls.melde[0]!.titel).toBe('Workflow nicht gefunden')
+  })
+
+  it('unbekannter Workflow + manuell: zeigt weiterhin die Einstellungen (unverändertes Verhalten)', async () => {
+    const { sitzung, calls, recorder } = makeSitzung()
+
+    await sitzung.starteWorkflow('nicht-vorhanden', 'manuell')
+
+    expect(calls.zeigeEinstellungen).toBe(1)
+    expect(recorder.started).toBe(0)
+    expect(calls.melde).toEqual([])
   })
 
   it('Desync-Schutz: ein zweites stoppe() ohne aktiven Lauf löst keinen Phantom-Stop aus', async () => {
@@ -447,10 +496,17 @@ describe('createSitzung', () => {
     expect(calls.melde[0]!.koerper).toContain('mistral-small-latest')
   })
 
-  it('hotkey: bleibt bei abgewertetem Modell still (keine Notification im Hintergrund)', async () => {
+  // v0.8.0 (Auftrag 2): bis hierhin blieb GENAU dieser Fall bei Hotkey unsichtbar — deshalb konnte
+  // niemand bemerken, dass z. B. bei „nur Mistral konfiguriert" ein anderes Modell lief als im Workflow
+  // gepinnt. Jetzt meldet sich die Abwertung bei JEDER Auslösequelle (Fokus wird dabei nie gestohlen —
+  // `melde()` ist immer schon nicht-blockierend, unabhängig von `quelle`).
+  it('hotkey: warnt jetzt ebenfalls nicht-blockierend bei abgewertetem Modell (v0.8.0)', async () => {
     const { sitzung, calls } = makeSitzung({ settings: NUR_MISTRAL })
     await sitzung.starteWorkflow('improve', 'hotkey')
-    expect(calls.melde).toEqual([])
+    expect(calls.melde).toHaveLength(1)
+    expect(calls.melde[0]!.titel).toBe('Modell ersetzt')
+    expect(calls.melde[0]!.koerper).toContain('mistral-small-latest')
+    expect(calls.zeigeEinstellungen).toBe(0) // weiterhin kein Fokus-Diebstahl bei Hotkey
   })
 
   it('L1: key-loser lokaler Anbieter nimmt auch ohne Key auf (Gate lässt durch)', async () => {

@@ -9,10 +9,10 @@
 ![CI](https://img.shields.io/github/actions/workflow/status/edo-dzell/blitztext-app-windows/release.yml?style=flat-square&label=CI)
 ![Lizenz](https://img.shields.io/badge/Lizenz-MIT-green?style=flat-square)
 ![Plattform](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows11&logoColor=white)
-![Electron](https://img.shields.io/badge/Electron-33-47848F?style=flat-square&logo=electron&logoColor=white)
+![Electron](https://img.shields.io/badge/Electron-43-47848F?style=flat-square&logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-087EA4?style=flat-square&logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strikt-3178C6?style=flat-square&logo=typescript&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-1097%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
+![Tests](https://img.shields.io/badge/Tests-1371%20%C3%97%20Vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)
 
 [**⬇️ Download**](https://github.com/edo-dzell/blitztext-app-windows/releases/latest) ·
 [Vergleich zum Original](#-stark-erweitert-windows-port-vs-macos-original) ·
@@ -57,7 +57,9 @@ flowchart LR
 
 Cloud-Aufrufe laufen ausschließlich über **deinen eigenen API-Key** direkt zum gewählten Anbieter —
 kein eigenes Backend, keine Konten, keine Telemetrie. Schlüssel liegen lokal verschlüsselt
-(Windows DPAPI via Electron `safeStorage`), nie im Klartext.
+(Windows DPAPI via Electron `safeStorage`), nie im Klartext. Lässt sich eine verschlüsselte Datei
+einmal nicht mehr entschlüsseln — etwa nach einem Profilwechsel —, wird sie als `.korrupt`
+beiseitegelegt und gemeldet, statt beim nächsten Diktat überschrieben zu werden.
 
 Beim Einfügen achtet Blitztext auf den Fokus: Wechselst du während der Verarbeitung das Fenster,
 wird der Text **nicht** blind irgendwohin getippt, sondern landet mit einem Hinweis in der
@@ -80,20 +82,22 @@ Idee zur Alltags-App aus:
 | **Sprachen** | ✅ Eingabe- und Ausgabesprache pro Workflow aus 23 Sprachen — auf Deutsch diktieren, z. B. auf Englisch einfügen | — |
 | **Ton & Emojis** | ✅ Pro Workflow regelbar: Ton (formal/neutral/locker) und Emoji-Dichte (aus–viel) — auch bei eigenen und auf statischen Text umgestellten Prompts | — |
 | **Prompt-Editor** | ✅ Prompts anpassen, mit Versions-Historie und Wiederherstellen | — |
-| **Verlauf** | ✅ Alle Diktate mit Kosten, Datum, Sortierung und Löschen — inkl. Prompt-Stand je Eintrag; gewählte Sortierung bleibt über einen Neustart hinweg erhalten | — |
+| **Verlauf** | ✅ Alle Diktate mit Kosten, Datum, Sortierung und Löschen — inkl. Prompt-Stand und **tatsächlich gelaufenem Modell** je Eintrag (nicht dem konfigurierten: wird ein Modell ersetzt, steht das ersetzte dort); gewählte Sortierung bleibt über einen Neustart hinweg erhalten | — |
 | **Statistik** | ✅ Token-Summen und Kosten, mit editierbarer Preistabelle | — |
 | **Design** | ✅ Hell/Dunkel (nach System oder manuell), Tray-Icon folgt dem Theme | — |
-| **Diktier-UX** | ✅ Fokusfreie Status-Pille (bricht lange Fehlermeldungen um, statt sie abzuschneiden), Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar, Mikrofon wählbar, spürbar flüssigerer Diktat-Start | Menubar-Icon |
+| **Diktier-UX** | ✅ Fokusfreie Status-Pille (bricht lange Fehlermeldungen um, statt sie abzuschneiden), Abbrechen jederzeit, Tray-Menü, Hotkeys frei belegbar, Mikrofon wählbar. Das Mikrofon wird beim Start vorgewärmt und bleibt es — auch die **erste** Aufnahme setzt sofort ein. Die Pille zeigt „Starte …“, bis wirklich aufgenommen wird, und bleibt bei Mehrmonitor-Betrieb auf dem Bildschirm, auf dem das Diktat begann | Menubar-Icon |
 | **Live-Feedback** | ✅ Erneuter-Versuch-Kennzeichnung bei Audio-Retry, „dauert länger als üblich"-Hinweis bei langsamen Läufen, dezenter Status-Punkt im Einstellungsfenster während ein Diktat läuft | — |
 | **Sicheres Einfügen** | ✅ Prüft vor dem Einfügen, ob noch dasselbe Fenster im Fokus ist — bei Fokuswechsel wird **nicht** blind getippt, sondern der Text landet in der Zwischenablage mit Hinweis. Steuerzeichen werden gefiltert; Diktate bleiben aus dem Windows-Zwischenablageverlauf | — |
-| **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte). Scheitert der Mikrofon-Zugriff, erscheint der Fehler **sofort** in der Status-Pille statt still zu verpuffen; abgestürzte interne Fenster (Aufnahme/Pille) heilen sich selbst; ein sterbender Einfüge-Helfer kann die App nicht abstürzen lassen (sauberer Zwischenablage-Fallback) | — |
+| **Zuverlässigkeit** | ✅ Schlägt die Transkription fehl (Netz/Anbieter), lässt sich die Aufnahme mit einem Klick erneut verarbeiten — ohne neu zu diktieren (Audio nur flüchtig im RAM, nie auf Platte). Scheitert der Mikrofon-Zugriff, erscheint der Fehler **sofort** in der Status-Pille statt still zu verpuffen; abgestürzte interne Fenster (Aufnahme/Pille) heilen sich selbst; ein sterbender Einfüge-Helfer kann die App nicht abstürzen lassen (sauberer Zwischenablage-Fallback). Wird ein Mikrofon mitten in der Aufnahme abgezogen oder stummgeschaltet, meldet sich das **sofort** statt minutenlang stumm zu bleiben. Und die App schweigt nicht mehr: fehlender API-Key, gelöschter Workflow oder ein ersetztes Modell werden auch bei Hotkey-Auslösung gemeldet | — |
 | **Komfort** | ✅ Autostart mit Windows, Selbstdiagnose (Mikrofon/Key/Anbieter/Hotkey als Ampel), optionaler Update-Hinweis im Tray (kein Auto-Update, keine Telemetrie), ehrlicher Hinweis beim Speichern während einer laufenden Aufnahme, atomar geschriebene Einstellungen (ein Absturz beim Speichern zerstört die `settings.json` nicht; ist sie doch beschädigt, wird sie als `settings.json.korrupt` gerettet statt still auf Werkseinstellungen zurückgesetzt) | — |
-| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* oder stillschweigend Aussagen weglässt statt es originalgetreu umzuschreiben, und weist ehrlich darauf hin statt den Verlust zu verschleiern), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 1097 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
+| **Härtung** | ✅ Prompt-Injection-Schutz + Treue-Detektor (erkennt, wenn das Modell das Diktat *beantwortet* oder stillschweigend Aussagen weglässt statt es originalgetreu umzuschreiben, und weist ehrlich darauf hin statt den Verlust zu verschleiern), Hotkey-Selbstheilung nach Sperrbildschirm/UAC, 1371 automatisierte Tests als CI-Gate | Experimentell, ohne Releases |
 | **Diagnose-Log** | ✅ Lokales, **text-freies** Ereignislog für die Fehlersuche (nie Diktate, Texte oder API-Keys — nur Ereignisse, Dauern, Längen); verlässt nie das Gerät, ~1-MB-Deckel, Debug-Stufe per Schalter, Ordner-öffnen/Löschen in den Einstellungen | — |
-| **Wörterbuch** | ✅ Eigene Begriffe (Namen, Fachwörter) per Chips-Editor hinterlegen, damit die Transkription sie korrekt schreibt — inkl. Budget-Anzeige; ein Begriff lässt sich direkt aus dem Verlauf heraus übernehmen | — |
+| **Wörterbuch** | ✅ Eigene Begriffe (Namen, Fachwörter) per Chips-Editor hinterlegen, damit die Transkription sie korrekt schreibt — inkl. Budget-Anzeige; ein Begriff lässt sich direkt aus dem Verlauf heraus übernehmen. Die Übergabe erfolgt im jeweils **richtigen Feld des Anbieters** (Whisper und Voxtral erwarten Unterschiedliches) | — |
 | **Verlauf: Änderungen zeigen** | ✅ Auf Wunsch ein Wortvergleich zwischen Rohdiktat und umgeschriebenem Text je Verlaufseintrag | — |
 | **Einrichtung** | ✅ Einrichtungs-Assistent führt beim allerersten Start durch Anbieterwahl und API-Key | Manuelle Konfiguration |
-| **Lokale Transkription** | ✅ Eigene Anbieter-Vorlage „Lokal (kein API-Key)“ mit Server-Ampel (zeigt, ob der lokale Endpunkt erreichbar ist) | — |
+| **Lokal-Vorlage & Server-Ampel** | ✅ Eigene Anbieter-Vorlage „Lokal (kein API-Key)“ mit Server-Ampel (zeigt, ob der lokale Endpunkt erreichbar ist) | — |
+| **Alles einstellbar** | ✅ Jede Stellschraube sitzt unter „Einstellungen" — ausschließlich als Schalter oder Auswahlfeld, nichts zum Vertippen: Stille-Erkennung, Netzwerk-Zeitlimit, Wiederholungsversuche, Mindest-Aufnahmedauer, Verlaufs-Obergrenze, Statistik-Kompaktierung, Update-Intervall, Anzeigedauer der Status-Pille, Fokus-Sicherung. Jede Änderung wirkt sofort, ohne Neustart | — |
+| **Gewartete Plattform** | ✅ Electron 43 (Chromium 150) — innerhalb des Sicherheits-Support-Fensters, nicht auf einer abgehängten Version stehen geblieben | — |
 | **Workflows teilen** | ✅ Eigene Workflows als Preset-Datei exportieren und bei anderen Installationen wieder importieren | — |
 
 <sup>Vergleich auf Basis des öffentlichen README des Originals (Stand Juni 2026).</sup>
@@ -215,7 +219,7 @@ Eigene Presets beisteuern? Siehe [`CONTRIBUTING.md`](CONTRIBUTING.md#presets-bei
 
 ### Voraussetzungen
 
-- Node.js 22 (wie in der CI, [release.yml](.github/workflows/release.yml)) oder neuer + npm
+- Node.js 22.12 oder neuer + npm (harte Untergrenze seit Vite 7; die CI nutzt 22, siehe [release.yml](.github/workflows/release.yml))
 - Zielplattform Windows 10/11; Entwicklung auch unter Linux/WSL möglich
 - Ein API-Key eines OpenAI-kompatiblen Anbieters (oder ein lokaler Endpunkt)
 
@@ -238,7 +242,7 @@ npm run package:win  # portable Windows-`.exe` nach release/ bauen (unsigniert, 
 
 ## 🏗️ Architektur
 
-**Stack:** Electron 33 · React 19 · TypeScript · Vite (electron-vite) · Vitest · Tailwind v4
+**Stack:** Electron 43 · React 19 · TypeScript · Vite 7 (electron-vite 5) · Vitest 3 · Tailwind v4
 
 <details>
 <summary><b>Projektstruktur anzeigen</b></summary>

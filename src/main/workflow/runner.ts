@@ -27,11 +27,29 @@ import {
 export interface RecordingResult {
   audio: Blob
   durationSeconds: number
+  /**
+   * v0.7.4: Spitze (`max`) und Grundrauschen (`median`) der Aufnahme als RMS über kurze Fenster, vom
+   * Recorder-Renderer aus dem fertigen Audio berechnet. Speist die Stille-Erkennung gegen
+   * Whisper-Halluzinationen (quality.istStilleAufnahme). Optional: fehlt die Messung (fehlgeschlagene
+   * Analyse), wird nie abgelehnt.
+   */
+  pegel?: { max: number; median: number } | null
 }
 
 /** Mikrofon-Aufnahme. Echte Implementierung (MediaRecorder) ist HITL/Windows; im Test ein Fake. */
 export interface Recorder {
-  start(): void
+  /**
+   * Befund 7a (v0.8.0): `deviceId` wird MITGEGEBEN statt vom Recorder-Renderer per IPC nachgefragt zu
+   * werden (`settings:get`-Roundtrip mitten im Startpfad der Aufnahme) — die Sitzung hat die
+   * Einstellungen an dieser Stelle bereits geladen. Optional: ohne Angabe (alte Aufrufer/Fakes/Tests)
+   * fällt der Recorder-Renderer auf den bisherigen IPC-Pull zurück (kein Verhaltensbruch).
+   *
+   * Befund 2 (adversariale Review, v0.8.x): `lauf` ist der Lauf-Bezug für DIESEN Aufnahme-Versuch — der
+   * Runner erzeugt ihn hier frisch (siehe `start()`), der Recorder-Renderer spiegelt ihn unverändert in
+   * seiner Start-Bestätigung zurück (`onGestartet`). Optional: ohne Angabe (alte Aufrufer/Fakes/Tests)
+   * bleibt der Alt-Lauf-Schutz in `meldeAufnahmeBestaetigt` wirkungslos (kein Verhaltensbruch).
+   */
+  start(deviceId?: string, lauf?: number): void
   stop(): Promise<RecordingResult>
   /** Aufnahme beenden und verwerfen, ohne ein Ergebnis zu liefern (Abbruch). */
   discard(): void
@@ -42,6 +60,23 @@ export interface Recorder {
    * Composition auf `meldeAufnahmeFehler`; Fakes ohne den Kanal lassen ihn weg (kein Verhaltensbruch).
    */
   onFehler?(cb: (message: string) => void): void
+  /**
+   * v0.8.0 (Befund 9): registriert einen dauerhaften Rückruf für die Start-Bestätigung des Renderers
+   * (mediaRecorder.start() lief erfolgreich). Bis dahin zeigt die Pille „Starte …" statt fälschlich
+   * „Aufnahme …" — der Nutzer könnte sonst bei langsamem Gerätestart (Defender-Erstscan, Bluetooth-Mikro)
+   * ins Leere sprechen. Optional: der Runner verdrahtet ihn in der Composition auf
+   * `meldeAufnahmeBestaetigt`. Fakes/Aufrufer ohne diesen Kanal lassen die Verdrahtung weg (kein
+   * Verhaltensbruch der Test-Fakes) — OHNE Composition-Verdrahtung bliebe die Pille dann dauerhaft bei
+   * „Starte …", siehe BERICHT/Integrations-Hinweis (composition-root.ts liegt außerhalb dieses Auftrags).
+   *
+   * Befund 2 (adversariale Review, v0.8.x): der Callback bekommt zusätzlich den Lauf-Bezug (`lauf`)
+   * mit, den `start()` diesem Aufnahme-Versuch mitgegeben hat und den der Recorder-Renderer unverändert
+   * zurückspiegelt — `meldeAufnahmeBestaetigt` nutzt ihn als Alt-Lauf-Schutz (eine verspätete Bestätigung
+   * eines längst abgelösten Laufs darf einen frischen Lauf nicht fälschlich bestätigen). Optional:
+   * `undefined` (alte Aufrufer/Fakes/composition-root.ts — s. o.) lässt den Guard wirkungslos, NICHT
+   * blockierend (kein Verhaltensbruch).
+   */
+  onGestartet?(cb: (lauf?: number) => void): void
 }
 
 interface QualityPort {
@@ -49,6 +84,11 @@ interface QualityPort {
   cleanedTranscript(text: string): string
   // rohtextAus säubert intern und prüft auf Artefakt — kein cleanedTranscript davor nötig.
   rohtextAus(raw: string, recordingSeconds: number): string | null
+  /**
+   * v0.7.4: true, wenn die gemessene Aufnahme still ist (Spitze + Dynamik, siehe quality.ts). Optional,
+   * damit bestehende Test-Fakes ohne diesen Port weiterlaufen (fehlt er, entfällt der Guard).
+   */
+  istStilleAufnahme?(messung: { max: number; median: number } | null | undefined): boolean
 }
 
 export interface WorkflowRunnerDeps {
@@ -86,6 +126,19 @@ export interface WorkflowRunnerDeps {
   /** Backoff-Verzögerung zwischen netzwerk-Retries; injizierbar für Tests (Default echte Verzögerung). */
   sleep?: (ms: number) => Promise<void>
   /**
+   * v0.8.0 (retryVersuche): Live-Getter für die Anzahl der Anbieter-Retry-Versuche je Lauf — Muster wie
+   * `getConfig`/`getBaseUrl` in den Providern. Composition-root reicht ihn als Closure über die
+   * lebende Settings-Kopie durch; wird bei JEDEM Lauf frisch gelesen (kein Runner-Neubau nötig). Ohne
+   * Angabe: 2 (RETRY_VERSUCHE_DEFAULT, bisheriges Verhalten).
+   */
+  getRetryVersuche?: () => number
+  /**
+   * v0.8.0 (netzwerkProfil): Live-Getter für den Anbieter-Watchdog in ms — wirkt NUR im Default-
+   * `starteWatchdog` (ist `starteWatchdog` injiziert, z. B. in Tests, hat dieser Getter keine Wirkung —
+   * bestehende Tests bleiben unverändert). Ohne Angabe: 90_000 (bisheriges Verhalten).
+   */
+  getWatchdogMs?: () => number
+  /**
    * Ereignislog (v0.7.2): TEXT-FREIE Beobachtung der Phasenwechsel und Anbieter-Retries. Optional —
    * fehlt er, wird NOOP_EREIGNISLOG genutzt und nichts geloggt (Verhalten unverändert). Es gehen NIE
    * Roh-/Endtexte hinein, nur Status, FehlerArt, redigierte Fehler-Nachricht und Längen (`zeichen=`).
@@ -115,6 +168,20 @@ export interface RunInput {
   language?: string
   customTerms?: string[]
   rewriteSettings?: RewriteSettings
+  /**
+   * Befund 7a (v0.8.0): die gewünschte Mikrofon-deviceId (aus den Einstellungen, von der Sitzung schon
+   * geladen) — wird 1:1 an `Recorder.start()` durchgereicht. Optional/leer = OS-Standardgerät.
+   */
+  mikrofonDeviceId?: string
+  /**
+   * Befund 10 (v0.8.0): Lauf-Kennung für das Ereignislog — dieselbe laufGeneration, die die Sitzung beim
+   * Auslösen bereits vergibt (KEIN neuer Zähler). `transition()` hängt sie an JEDE Phasen-Log-Zeile
+   * dieses Laufs (workflow.phase), die Debug-Zeilen (workflow.aufnahme/transkribiert/umgeschrieben)
+   * ebenso — damit sich die Zeilen EINES Laufs im Ereignislog wiederfinden lassen, auch wenn mehrere
+   * Läufe interleaven (Retry/Folge-Diktat). Optional: fehlt sie (alte Aufrufer/Tests), bleibt das Feld
+   * im Log einfach weg (kein Verhaltensbruch).
+   */
+  laufKennung?: number
 }
 
 /**
@@ -152,7 +219,12 @@ export type TeilErfolgGrund = 'umschreibfehler' | 'beantwortet' | 'abgeschnitten
 
 export type WorkflowPhase =
   | { status: 'idle' }
-  | { status: 'aufnehmen' }
+  // v0.8.0 (Befund 9): `bestaetigt` markiert additiv, dass der Renderer mediaRecorder.start() bereits
+  // erfolgreich ausgeführt hat (Bestätigungskanal, siehe Recorder.onGestartet). Undefined/false BIS dahin
+  // — die Pille zeigt dann „Starte …" statt fälschlich „Aufnahme …" (pill-status.ts). KEIN neuer Status
+  // (bricht keine bestehenden switch-Exhaustiveness-Checks), gleiches additive Muster wie
+  // istWiederholung/dauertLaenger bei transkribieren/umschreiben.
+  | { status: 'aufnehmen'; bestaetigt?: boolean }
   // A4a: `istWiederholung` markiert additiv einen Lauf, der über erneutVersuchen() (W3-B, gehaltenes
   // Audio) erneut ab Transkription gestartet wurde — Pille/Tray können das sichtbar machen. KEIN neuer
   // Status (bricht keine bestehenden switch-Exhaustiveness-Checks), nur ein optionales Zusatzfeld.
@@ -183,6 +255,22 @@ export interface WorkflowRunner {
    */
   meldeAufnahmeFehler(message: string): void
   /**
+   * v0.8.0 (Befund 9): Bestätigung des Renderers, dass mediaRecorder.start() erfolgreich lief. No-Op
+   * außer in der Phase 'aufnehmen' UND nur, solange dort noch keine Bestätigung vermerkt ist (Alt-Lauf-
+   * Schutz analog zu meldeAufnahmeFehler: eine verspätete Bestätigung aus einem inzwischen abgebrochenen
+   * oder bereits weitergelaufenen Lauf darf den frischen Zustand nicht überschreiben). Setzt additiv
+   * `bestaetigt: true` auf der bestehenden Phase — kein Statuswechsel.
+   *
+   * Befund 2 (adversariale Review, v0.8.x): der `phase.status`-Guard allein unterscheidet NICHT, WELCHER
+   * Lauf gemeint ist — eine verspätete Bestätigung aus einem abgebrochenen Lauf A kann so einen bereits
+   * wieder in 'aufnehmen' befindlichen, frischen Lauf B fälschlich bestätigen (B's Mikrofon ist real noch
+   * gar nicht bereit). `lauf` (optional) ist der Bezug, den `start()` ausgegeben hat; stimmt er nicht mit
+   * dem GERADE erwarteten überein, bleibt die Bestätigung wirkungslos. `undefined` (alte Aufrufer/Fakes,
+   * `composition-root.ts` ohne Weiterreichung) bleibt rückwärtskompatibel: dann greift NUR der bisherige
+   * phase.status-Guard, wie vor diesem Befund.
+   */
+  meldeAufnahmeBestaetigt(lauf?: number): void
+  /**
    * W3-B (Audio-Retry): true, wenn ein Lauf an einem transienten Fehler (netzwerk/anbieter) bzw. einem
    * Teil-Erfolg scheiterte UND das aufgenommene Audio noch flüchtig im Speicher liegt → ein erneuter
    * Versuch ab Transkription ist möglich, OHNE neu zu diktieren.
@@ -196,8 +284,34 @@ export interface WorkflowRunner {
   erneutVersuchen(): Promise<WorkflowPhase>
 }
 
-// Beide Aufnahme-Guards (zu kurz / Artefakt) melden denselben Text wie das macOS-Original.
-const NO_RECORDING_ERROR = 'Keine Aufnahme erkannt.'
+// v0.7.4: eigene Meldung für den Stille-Fall — der Nutzer soll „es war nichts zu hören" von „die
+// Aufnahme kam gar nicht zustande" unterscheiden können (andere Ursache, andere Abhilfe).
+const STILLE_ERROR = 'Es war nichts zu hören — bitte Mikrofon prüfen.'
+// v0.8.0 (Befund B, Feld-Log): bis hierhin meldeten ZWEI ursächlich verschiedene Aufnahme-Fehler
+// denselben Text „Keine Aufnahme erkannt." — im Feld-Log nur per Code-Analyse zu trennen (21 zu kurze
+// Antipper von 6 leeren Transkriptionen). Für den Nutzer ist der Unterschied handlungsleitend: einmal
+// „du hast zu kurz gedrückt" (Taste antippen statt halten), einmal „es kam kein verwertbarer Text an,
+// Ursache unklar" — dieselbe Meldung verschleierte das. Jetzt zwei eigene, ehrliche Meldungen (nach dem
+// Muster von STILLE_ERROR oben, das genau aus diesem Grund eingeführt wurde) + zwei eigene
+// Log-Ereignisse (workflow.zu_kurz / workflow.leere_transkription). Beide behaupten NUR, was sie
+// wissen: „zu kurz" kennt ausschließlich die gemessene Dauer, „leere Transkription" weiß NUR, dass nach
+// einer lang genug gehaltenen Aufnahme kein verwertbarer Text zurückkam — NICHT ob Mikrofon, Stille
+// unterhalb der Pegel-Messung oder ein Modell-Artefakt die Ursache war (das bleibt STILLE_ERROR
+// vorbehalten, die einen tatsächlich GEMESSENEN Stille-Befund voraussetzt).
+const AUFNAHME_ZU_KURZ_ERROR = 'Zu kurz aufgenommen — bitte die Taste länger gedrückt halten.'
+const LEERE_TRANSKRIPTION_ERROR = 'Kein verwertbarer Text erkannt — bitte erneut versuchen.'
+
+/** Pegelwert fürs Log: auf 4 Nachkommastellen gerundet; -1 = keine Messung zustande gekommen. */
+function runde(wert: number | undefined): number {
+  return typeof wert === 'number' ? Math.round(wert * 10000) / 10000 : -1
+}
+// v0.8.0 (Befund B): Aufnahmedauer fürs Log auf 2 Nachkommastellen gerundet — die übrigen Log-Zeilen
+// (workflow.aufnahme/stille_erkannt) runden auf ganze Sekunden, das reicht für workflow.zu_kurz aber
+// NICHT: mindestAufnahmeSekunden-Stufen liegen bei 0,1er-Schritten (s. laufzeit-profile.ts), auf ganze
+// Sekunden gerundet würden praktisch alle zu-kurz-Fälle als „0" erscheinen (nichts unterscheidbar).
+function rundeSekunden(wert: number): number {
+  return Math.round(wert * 100) / 100
+}
 // Aufnahme-Watchdog-Frist (W1-A): großzügig, da der Nutzer im Halten-Modus minutenlang aufnehmen darf.
 // Rein als Backstop gegen einen toten Renderer gedacht, nicht als Aufnahme-Längenlimit.
 const AUFNAHME_WATCHDOG_MS = 10 * 60_000
@@ -251,6 +365,14 @@ export function entferneSteuerzeichen(text: string): string {
     .replace(C1_UND_ZEILENTRENNER, '')
 }
 
+// Befund 10 (v0.8.0): kleines Feld-Fragment mit der Lauf-Kennung (nur wenn gesetzt) — per Spread in
+// jede Log-Zeile der Kette gemischt (workflow.aufnahme/transkribiert/umgeschrieben/stille_erkannt),
+// zusätzlich zu transition() (deckt workflow.phase bereits zentral ab). Gibt `{}` zurück, wenn keine
+// Kennung vorliegt (alte Aufrufer/Tests) — Spread eines leeren Objekts ist ein sicheres No-Op.
+function laufFeld(input: RunInput | null): LogFelder {
+  return input?.laufKennung !== undefined ? { lauf: input.laufKennung } : {}
+}
+
 // v0.7.2: kürzt eine Fehler-MELDUNG fürs Log auf höchstens 200 Zeichen (der Formatierer kürzt zwar
 // ohnehin, aber die Absicht „nur eine kurze Meldung, nie ein langer Text" wird hier am Call-Site sichtbar).
 // Ein Fehlermeldungstext ist erlaubt — NIE ein Roh-/Endtext (der wird an dieser Stelle nie durchgereicht).
@@ -273,6 +395,13 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   // transition() verwirft veraltete Schreiber. `aktuellerLauf` zeigt auf den gerade gültigen Kontext.
   let aktuellerLauf: LaufKontext | null = null
   let laufZaehler = 0
+  // Befund 2 (adversariale Review, v0.8.x): eigener, schmaler Lauf-Bezug NUR für die Phase 'aufnehmen' —
+  // LaufKontext/laufZaehler deckt erst verarbeiteAufnahme() ab (also NACH stop()), die Aufnahme-
+  // Bestätigung braucht ihren Zähler aber schon VOR jedem stop(). Bewusst ein eigenes, schmales Feld
+  // statt LaufKontext samt AbortController hier schon anzulegen (der wird für 'aufnehmen' nicht
+  // gebraucht, abbrechen() nutzt dort discard(), keinen Controller) — gleiches Muster (monoton steigende
+  // id + „nur der aktuelle Wert gilt"), aber ohne die Transkriptions-/Umschreib-Zusatzfelder mitzuschleppen.
+  let aufnahmeLaufId = 0
   // Schmales Flag NUR für den stop()-catch (Vordergrund-Pfad, bekommt bewusst KEINEN LaufKontext): es
   // unterscheidet einen manuellen Abbruch (discard → AbortError, still nach idle) von einem echten
   // Recorder-Fehler. start() setzt es false, abbrechen()/der externe Fehlerkanal setzen es true.
@@ -289,7 +418,9 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   const starteWatchdog =
     deps.starteWatchdog ??
     ((onTimeout: () => void) => {
-      const t = setTimeout(onTimeout, 90_000)
+      // v0.8.0: `getWatchdogMs` wird bei JEDEM Aufruf (= jeder Lauf) frisch gelesen — eine
+      // Netzwerkprofil-Änderung greift damit ab dem nächsten Lauf, ohne den Runner neu zu bauen.
+      const t = setTimeout(onTimeout, deps.getWatchdogMs?.() ?? 90_000)
       return () => clearTimeout(t)
     })
 
@@ -322,9 +453,14 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       aufnahmeAbgebrochen = false
       // W3-B: ein frisches Diktat macht ein zuvor gehaltenes Audio gegenstandslos → verwerfen.
       letzteAufnahme = null
+      // Befund 2: frischer Lauf-Bezug für DIESEN Aufnahme-Versuch — entwertet automatisch die
+      // Bestätigung eines etwaig noch nachzügelnden, älteren Laufs (siehe meldeAufnahmeBestaetigt).
+      aufnahmeLaufId += 1
       // Vordergrund-Pfad: NIE mit lauf guarden — ein Start muss die Aufnahme-Phase immer setzen dürfen.
       transition({ status: 'aufnehmen' })
-      deps.recorder.start()
+      // Befund 7a: deviceId direkt mitgeben (kein IPC-Pull mehr im Startpfad des Recorder-Renderers).
+      // Befund 2: den frischen Lauf-Bezug mitgeben (Recorder-Renderer spiegelt ihn in der Bestätigung).
+      deps.recorder.start(next.mikrofonDeviceId, aufnahmeLaufId)
     },
     abbrechen() {
       // Wirkt in Aufnahme, Transkription und Umschreiben; in Terminal-/Leerlauf-Phasen ein No-Op.
@@ -379,6 +515,20 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       // Vordergrund-Pfad (kein LaufKontext): die Fehler-Phase muss immer gesetzt werden dürfen.
       transition({ status: 'fehler', art: 'aufnahme', message: kuerzeMeldung(message) })
     },
+    meldeAufnahmeBestaetigt(lauf) {
+      // v0.8.0 (Befund 9): Alt-Lauf-Schutz wie meldeAufnahmeFehler — NUR wirksam, solange die Phase noch
+      // 'aufnehmen' ist. Ist der Lauf inzwischen abgebrochen (idle) oder weitergelaufen (transkribieren/
+      // fehler), darf eine verspätete Bestätigung nichts mehr anstoßen.
+      if (phase.status !== 'aufnehmen') return
+      // Befund 2 (adversariale Review): der phase.status-Guard allein reicht nicht — ER unterscheidet
+      // NICHT zwischen dem gerade laufenden und einem abgebrochenen ALTEN Lauf, der zwischenzeitlich
+      // einem frischen Lauf B Platz gemacht hat (B ist ebenfalls in 'aufnehmen'). `lauf === undefined`
+      // (alte Aufrufer/Fakes, siehe Interface-Doku) bleibt rückwärtskompatibel wirkungslos-permissiv —
+      // NUR ein expliziter, NICHT passender Bezug wird verworfen.
+      if (lauf !== undefined && lauf !== aufnahmeLaufId) return
+      // Vordergrund-Pfad (kein LaufKontext): additiv `bestaetigt: true` auf derselben Phase setzen.
+      transition({ status: 'aufnehmen', bestaetigt: true })
+    },
     async stop() {
       // Phantom-Stop-Schutz: stop() ist nur in der Aufnahme-Phase sinnvoll. Wird es ohne laufende
       // Aufnahme aufgerufen (Dispatcher/Sitzung-Desync bei langem Umschreiben: ein verworfener
@@ -432,7 +582,27 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       if (deps.quality.shouldRejectRecording(recording.durationSeconds)) {
         // Aufnahme-Fehler: nichts Brauchbares zum Wiederholen → kein gehaltenes Audio.
         letzteAufnahme = null
-        return transition({ status: 'fehler', art: 'aufnahme', message: NO_RECORDING_ERROR })
+        // v0.8.0 (Befund B): eigenes Ereignis, unterscheidbar von workflow.leere_transkription — nur
+        // die gemessene Dauer, keine weitere Behauptung (die Schwelle selbst kennt dieser Punkt nicht).
+        log.info('workflow.zu_kurz', { ...laufFeld(input), dauerSekunden: rundeSekunden(recording.durationSeconds) })
+        return transition({ status: 'fehler', art: 'aufnahme', message: AUFNAHME_ZU_KURZ_ERROR })
+      }
+      // v0.7.4: Stille-Guard VOR der Transkription. Whisper erfindet auf stillem Audio Floskeln
+      // („Danke.", „Thank you.", „Vielen Dank.") — kurze Ausgaben aus normal langen Aufnahmen, die der
+      // Dauer×Länge-Artefaktfilter danach strukturell nicht mehr fangen kann. Der gemessene Spitzenpegel
+      // entscheidet das VOR dem API-Aufruf: kein erfundener Text im Zielfenster und keine Kosten für
+      // eine Fehlauslösung. Ohne Messwert oder ohne Port greift der Guard nicht (nie eine echte
+      // Aufnahme an fehlender Diagnose scheitern lassen).
+      if (deps.quality.istStilleAufnahme?.(recording.pegel)) {
+        letzteAufnahme = null
+        // Nur Messwerte, keine Audio-Daten — gerundet, damit die Zeile stabil bleibt.
+        log.info('workflow.stille_erkannt', {
+          ...laufFeld(input),
+          pegel: runde(recording.pegel?.max),
+          rauschen: runde(recording.pegel?.median),
+          dauerSekunden: Math.round(recording.durationSeconds)
+        })
+        return transition({ status: 'fehler', art: 'aufnahme', message: STILLE_ERROR })
       }
 
       // W3-B: Audio ab hier flüchtig halten (verwertbare Aufnahme). Ein späterer transienter Fehler /
@@ -441,8 +611,13 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       // v0.7.2 debug: verwertbare Aufnahme steht (nach Watchdog + Qualitäts-Guard). Nur Zahlen: gerundete
       // Aufnahmedauer + Audio-Bytegröße — NIE Audio/Text.
       log.debug('workflow.aufnahme', {
+        ...laufFeld(input),
         dauerSekunden: Math.round(recording.durationSeconds),
-        bytes: recording.audio.size
+        bytes: recording.audio.size,
+        // v0.7.4: Spitze + Grundrauschen (RMS, gerundet) — macht die Stille-Erkennung im Feld
+        // nachprüfbar. Zahlen, kein Audio-Inhalt. -1 = keine Messung zustande gekommen.
+        pegel: runde(recording.pegel?.max),
+        rauschen: runde(recording.pegel?.median)
       })
       // stop() ist immer ein FRISCHER Lauf — istWiederholung bleibt hier default false.
       return verarbeiteAufnahme(recording)
@@ -498,7 +673,8 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
       return klassifiziere(fehler, { istWatchdogTimeout: false }) === 'netzwerk'
     }
     const retryOpts = {
-      versuche: 2,
+      // v0.8.0 (retryVersuche): live pro Lauf aufgelöst (Default 2 = bisheriges Verhalten).
+      versuche: deps.getRetryVersuche?.() ?? 2,
       backoffMs: 300,
       retrybar,
       sleep: deps.sleep,
@@ -535,7 +711,11 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         )
         // v0.7.2 debug: Transkription fertig. Nur Zahlen: Dauer in ms + LÄNGE des Rohtranskripts
         // (`zeichen`), NIE der Transkript-Text selbst.
-        log.debug('workflow.transkribiert', { dauerMs: Date.now() - beginn, zeichen: raw.length })
+        log.debug('workflow.transkribiert', {
+          ...laufFeld(input),
+          dauerMs: Date.now() - beginn,
+          zeichen: raw.length
+        })
         return deps.quality.rohtextAus(raw, recording.durationSeconds)
       } finally {
         stoppeZwischenmeldung()
@@ -570,7 +750,11 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         )
         // v0.7.2 debug: Umschreiben fertig. Nur Zahlen: Dauer in ms + LÄNGE des Modell-Endtexts
         // (`zeichen`), NIE der Endtext selbst.
-        log.debug('workflow.umgeschrieben', { dauerMs: Date.now() - beginn, zeichen: rewritten.text.length })
+        log.debug('workflow.umgeschrieben', {
+          ...laufFeld(input),
+          dauerMs: Date.now() - beginn,
+          zeichen: rewritten.text.length
+        })
         // Token-Limit (W1-D): der Anbieter hat die Antwort bei finish_reason='length' abgeschnitten.
         // Der zurückgegebene Text ist unvollständig — weder als voller Erfolg einfügen noch dem
         // Treue-Detektor zur Prüfung vorlegen (der prüft eine vollständige Bearbeitung). Rohtext retten.
@@ -621,7 +805,13 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         // Retry (dasselbe Audio liefert dasselbe Ergebnis) → Audio verwerfen. v0.7.3 (A1): nur schreiben,
         // wenn der Lauf noch aktuell ist (ein Abbruch/Neustart dazwischen entwertet die Zuweisung).
         if (istAktuell(lauf)) letzteAufnahme = null
-        return transition({ status: 'fehler', art: 'aufnahme', message: NO_RECORDING_ERROR }, lauf)
+        // v0.8.0 (Befund B): eigenes Ereignis, unterscheidbar von workflow.zu_kurz — die Aufnahme war
+        // lang genug, nur die Transkription lieferte nichts Verwertbares (Ursache offen).
+        log.info('workflow.leere_transkription', {
+          ...laufFeld(input),
+          dauerSekunden: rundeSekunden(recording.durationSeconds)
+        })
+        return transition({ status: 'fehler', art: 'aufnahme', message: LEERE_TRANSKRIPTION_ERROR }, lauf)
       }
       letzterRohtext = rohtext // Transkription gelang → bei späterem Umschreib-Fehler Teil-Erfolg
 
@@ -754,6 +944,10 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     // Roh-/Endtexte hinein: nur der Status, bei 'fertig'/'teilErfolg' die LÄNGE (`zeichen=`), bei 'fehler'
     // die FehlerArt + redigierte, gekürzte Meldung. `message` ist ein Fehlermeldungstext (kein Transkript).
     const felder: LogFelder = { status: next.status }
+    // Befund 10: die Lauf-Kennung aus der RunInput (dieselbe laufGeneration, die die Sitzung beim
+    // Auslösen vergeben hat) auf JEDE Phasen-Zeile dieses Laufs — `input` bleibt ab start() bis zum
+    // nächsten Lauf gesetzt, deckt also aufnehmen/transkribieren/umschreiben/fertig/teilErfolg/fehler ab.
+    if (input?.laufKennung !== undefined) felder.lauf = input.laufKennung
     if (next.status === 'fertig') {
       felder.zeichen = next.text.length
     } else if (next.status === 'teilErfolg') {

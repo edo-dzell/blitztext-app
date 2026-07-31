@@ -33,57 +33,114 @@ function istZerstoert(o: { isDestroyed?: () => boolean } | null | undefined): bo
 // dann steht isLoading() bereits auf false und ein once-Listener käme nie. Sonst einmalig auf
 // 'did-finish-load' UND 'did-fail-load' lauschen (Ladefehler zählt als „fertig", damit der Hook nicht
 // ewig wartet); nach dem ersten Ereignis beide Listener entfernen.
-function warteAufEines(fenster: BereitschaftFenster | null | undefined): Promise<void> {
-  return new Promise<void>((resolve) => {
+//
+// v0.7.4: Der Rückgabewert UNTERSCHEIDET jetzt Erfolg von Ladefehler. Vorher liefen beide Ereignisse in
+// denselben Callback und der Aufrufer bekam ausschließlich „fertig" zu sehen — ein gescheitertes
+// pill.html/recorder.html war damit strukturell unsichtbar: das Fenster blieb lebendig (isDestroyed()
+// false), jedes spätere send() lief ins Leere, showInactive() zeigte ein leeres Fenster, und KEIN
+// einziges Log-Ereignis existierte dafür. Genau diese Lücke hat die Fehlersuche „Pille fehlt" blockiert.
+function warteAufEines(fenster: BereitschaftFenster | null | undefined): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     const wc = fenster?.webContents
     if (!wc || istZerstoert(fenster) || istZerstoert(wc)) {
-      resolve()
+      resolve(true)
       return
     }
     // Kein isLoading() (Test-Fake ohne die Methode) → als lebendig-aber-geladen behandeln.
     if (typeof wc.isLoading !== 'function' || !wc.isLoading()) {
-      resolve()
+      resolve(true)
       return
     }
     if (typeof wc.once !== 'function') {
       // Kann nicht lauschen → nicht hängen bleiben, der Timeout im Aufrufer bleibt als Netz.
-      resolve()
+      resolve(true)
       return
     }
-    const fertig = (): void => {
+    const abraeumen = (): void => {
       if (typeof wc.removeListener === 'function') {
-        wc.removeListener('did-finish-load', fertig)
-        wc.removeListener('did-fail-load', fertig)
+        wc.removeListener('did-finish-load', gelungen)
+        wc.removeListener('did-fail-load', gescheitert)
       }
-      resolve()
     }
-    wc.once('did-finish-load', fertig)
-    wc.once('did-fail-load', fertig)
+    const gelungen = (): void => {
+      abraeumen()
+      resolve(true)
+    }
+    const gescheitert = (): void => {
+      abraeumen()
+      resolve(false)
+    }
+    wc.once('did-finish-load', gelungen)
+    wc.once('did-fail-load', gescheitert)
   })
+}
+
+export interface Bereitschaft {
+  /** false = Timeout (der Aufrufer startet den Hook trotzdem als Fallback). */
+  bereit: boolean
+  /** Gemessene Wartezeit für die Diagnose. */
+  dauerMs: number
+  /**
+   * v0.7.4: Indizes der Fenster (bezogen auf das übergebene Array), deren Laden mit 'did-fail-load'
+   * endete. Leer = alles sauber geladen. Bei Timeout leer, weil das Ergebnis dann noch offen ist —
+   * ein späterer Ladefehler wird über `protokolliereLadefehler` erfasst, nicht hier.
+   */
+  ladefehler: number[]
 }
 
 /**
  * Wartet, bis alle übergebenen Fenster fertig geladen sind — oder bis `timeoutMs` erreicht ist.
- * Wirft NIE. `bereit:false` bedeutet Timeout (der Aufrufer startet den Hook trotzdem als Fallback).
- * `dauerMs` = gemessene Wartezeit für die Diagnose.
+ * Wirft NIE.
  */
 export function warteAufFensterBereit(
   fenster: Array<BereitschaftFenster | null | undefined>,
   timeoutMs: number,
   jetzt: () => number = Date.now
-): Promise<{ bereit: boolean; dauerMs: number }> {
+): Promise<Bereitschaft> {
   const start = jetzt()
-  const alleFertig = Promise.all(fenster.map((f) => warteAufEines(f))).then(() => true as const)
+  const alleFertig = Promise.all(fenster.map((f) => warteAufEines(f))).then((ergebnisse) => ({
+    bereit: true,
+    ladefehler: ergebnisse.flatMap((ok, i) => (ok ? [] : [i]))
+  }))
 
   let timer: ReturnType<typeof setTimeout> | undefined
-  const beiTimeout = new Promise<false>((resolve) => {
-    timer = setTimeout(() => resolve(false), timeoutMs)
+  const beiTimeout = new Promise<{ bereit: boolean; ladefehler: number[] }>((resolve) => {
+    timer = setTimeout(() => resolve({ bereit: false, ladefehler: [] }), timeoutMs)
   })
 
   return Promise.race([alleFertig, beiTimeout])
-    .then((bereit) => ({ bereit, dauerMs: jetzt() - start }))
-    .catch(() => ({ bereit: false, dauerMs: jetzt() - start }))
+    .then((r) => ({ ...r, dauerMs: jetzt() - start }))
+    .catch(() => ({ bereit: false, ladefehler: [], dauerMs: jetzt() - start }))
     .finally(() => {
       if (timer !== undefined) clearTimeout(timer)
     })
+}
+
+/**
+ * v0.7.4: Dauerhafter 'did-fail-load'-Wächter für ein app-langlebiges Fenster. `warteAufFensterBereit`
+ * deckt nur das ERSTE Laden beim Start ab; ein Fenster kann auch später scheitern (Reload nach einem
+ * Renderer-Crash, siehe fenster-heilung.ts). Ohne diesen Wächter bliebe das erneut unsichtbar: das
+ * Fenster lebt weiter, `send()` läuft ins Leere, `showInactive()` zeigt eine leere Fläche.
+ * Duck-typed, wirft NIE. Gibt `{entferne()}` zurück (will-quit), idempotent.
+ */
+export function protokolliereLadefehler(
+  fenster: BereitschaftFenster | null | undefined,
+  name: 'recorder' | 'pille',
+  log: { warnung(ereignis: string, felder?: Record<string, string | number | boolean>): void }
+): { entferne(): void } {
+  const wc = fenster?.webContents as
+    | (BereitschaftWebContents & { on?: (e: any, h: any) => unknown })
+    | null
+    | undefined
+  const beiFehler = (): void => log.warnung('fenster.ladefehler', { fenster: name })
+  const gebunden =
+    !!wc && !istZerstoert(fenster) && !istZerstoert(wc) && typeof wc.on === 'function'
+  if (gebunden) wc!.on!('did-fail-load', beiFehler)
+  return {
+    entferne() {
+      if (gebunden && typeof wc!.removeListener === 'function') {
+        wc!.removeListener('did-fail-load', beiFehler)
+      }
+    }
+  }
 }

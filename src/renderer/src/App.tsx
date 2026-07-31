@@ -177,7 +177,11 @@ export default function App() {
             ) : section === 'stats' ? (
               <StatistikView settings={settings} speichern={speichern} />
             ) : (
-              <EinstellungenView settings={settings} speichern={speichern} />
+              <EinstellungenView
+                settings={settings}
+                speichern={speichern}
+                aufStatistik={() => versucheNavigation(() => setSection('stats'))}
+              />
             )}
           </div>
         ) : (
